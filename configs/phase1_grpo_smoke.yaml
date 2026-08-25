@@ -1,0 +1,71 @@
+# Smoke test config: tiny run to verify the GRPO loop doesn't crash
+model:
+  name: "Qwen/Qwen3-VL-8B-Instruct"
+  max_new_tokens: 256
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "verl"
+  group_size: 2
+  max_tool_calls: 5
+  max_turns: 8
+  temperature: 1.0
+  top_p: 0.95
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: false  # disable for smoke test (too few samples)
+  reward_schedule: "static"
+  reward_warmup_steps: 5
+
+reward:
+  pose_weight: 1.0
+  inlier_weight: 0.1
+  tool_cost: 0.02
+  format_weight: 0.1
+  invalid_penalty: 0.2
+  pose_auc_thresholds: [5, 10, 20]
+
+curriculum:
+  enabled: true
+  schedule: "overlap_bins"
+  stages:
+    - {epochs: 1, difficulties: ["easy"]}
+
+training:
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 0
+  total_epochs: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  save_freq: 1
+  eval_freq: 1
+  log_freq: 1
+
+rollout:
+  vllm_gpu: 0
+  training_gpu: 1
+  matcher_gpu: 2
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 1
+  batch_size: 1
+
+data:
+  train_pairs: "data/hard_pairs_train.json"
+  val_pairs: "data/hard_pairs_val.json"
+  matcher: "loftr"
+
+output:
+  checkpoint_dir: "outputs/smoke/checkpoints"
+  results_dir: "outputs/smoke"
+  log_dir: "logs/smoke"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "smoke-test"
+  wandb_enabled: false

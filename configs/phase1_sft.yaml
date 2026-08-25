@@ -1,0 +1,35 @@
+# Phase 1c: SFT warmup config for agentic matching
+# LoRA fine-tuning of Qwen3-VL-8B on curated successful trajectories
+
+model:
+  name: "Qwen/Qwen3-VL-8B-Instruct"
+  max_new_tokens: 512
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  total_epochs: 5
+  batch_size: 2
+  gradient_accumulation_steps: 8  # effective batch size = 16
+  max_grad_norm: 1.0
+  save_freq: 1
+
+data:
+  sft_data: "data/sft_train.jsonl"
+  # Reward threshold for filtering (used by prepare_sft_data.py, not here)
+  reward_threshold: 0.3
+
+output:
+  checkpoint_dir: "outputs/sft/checkpoints"
+  results_dir: "outputs/sft"
+  log_dir: "logs/sft"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase1-sft-qwen3vl-8b"
+  wandb_enabled: false

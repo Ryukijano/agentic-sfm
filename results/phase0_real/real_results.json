@@ -1,0 +1,302 @@
+[
+  {
+    "pair_id": "md_0022_1296",
+    "difficulty": "easy",
+    "overlap": 0.6,
+    "scene": "0022",
+    "direct_matches": 397,
+    "direct_inliers": 348,
+    "direct_inlier_ratio": 0.8765743073047859,
+    "agent_matches": 397,
+    "agent_inliers": 348,
+    "agent_inlier_ratio": 0.8765743073047859,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      955
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      850
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_1266",
+    "difficulty": "easy",
+    "overlap": 0.6,
+    "scene": "0022",
+    "direct_matches": 1506,
+    "direct_inliers": 1496,
+    "direct_inlier_ratio": 0.9933598937583001,
+    "agent_matches": 1506,
+    "agent_inliers": 1496,
+    "agent_inlier_ratio": 0.9933598937583001,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      854
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      857
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_1497",
+    "difficulty": "easy",
+    "overlap": 0.6,
+    "scene": "0022",
+    "direct_matches": 2009,
+    "direct_inliers": 1928,
+    "direct_inlier_ratio": 0.9596814335490294,
+    "agent_matches": 2009,
+    "agent_inliers": 1928,
+    "agent_inlier_ratio": 0.9596814335490294,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      955
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      949
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_1073",
+    "difficulty": "medium",
+    "overlap": 0.4,
+    "scene": "0022",
+    "direct_matches": 883,
+    "direct_inliers": 876,
+    "direct_inlier_ratio": 0.9920724801812004,
+    "agent_matches": 883,
+    "agent_inliers": 876,
+    "agent_inlier_ratio": 0.9920724801812004,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      959
+    ],
+    "crop_b": [
+      0,
+      0,
+      846,
+      1280
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0015_0311",
+    "difficulty": "medium",
+    "overlap": 0.4,
+    "scene": "0015",
+    "direct_matches": 701,
+    "direct_inliers": 685,
+    "direct_inlier_ratio": 0.9771754636233951,
+    "agent_matches": 701,
+    "agent_inliers": 685,
+    "agent_inlier_ratio": 0.9771754636233951,
+    "crop_a": [
+      0,
+      0,
+      1600,
+      1042
+    ],
+    "crop_b": [
+      0,
+      0,
+      1600,
+      1057
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_1142",
+    "difficulty": "medium",
+    "overlap": 0.4,
+    "scene": "0022",
+    "direct_matches": 1045,
+    "direct_inliers": 1031,
+    "direct_inlier_ratio": 0.9866028708133971,
+    "agent_matches": 1045,
+    "agent_inliers": 1031,
+    "agent_inlier_ratio": 0.9866028708133971,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      847
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      960
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0015_0092",
+    "difficulty": "hard",
+    "overlap": 0.2,
+    "scene": "0015",
+    "direct_matches": 509,
+    "direct_inliers": 502,
+    "direct_inlier_ratio": 0.9862475442043221,
+    "agent_matches": 509,
+    "agent_inliers": 502,
+    "agent_inlier_ratio": 0.9862475442043221,
+    "crop_a": [
+      0,
+      0,
+      1600,
+      1059
+    ],
+    "crop_b": [
+      0,
+      0,
+      1600,
+      1057
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0015_0265",
+    "difficulty": "hard",
+    "overlap": 0.2,
+    "scene": "0015",
+    "direct_matches": 1792,
+    "direct_inliers": 1754,
+    "direct_inlier_ratio": 0.9787946428571429,
+    "agent_matches": 1792,
+    "agent_inliers": 1754,
+    "agent_inlier_ratio": 0.9787946428571429,
+    "crop_a": [
+      0,
+      0,
+      1600,
+      1190
+    ],
+    "crop_b": [
+      0,
+      0,
+      1319,
+      975
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_0845",
+    "difficulty": "hard",
+    "overlap": 0.2,
+    "scene": "0022",
+    "direct_matches": 951,
+    "direct_inliers": 887,
+    "direct_inlier_ratio": 0.9327024185068349,
+    "agent_matches": 951,
+    "agent_inliers": 887,
+    "agent_inlier_ratio": 0.9327024185068349,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      951
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      904
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_0836",
+    "difficulty": "extreme",
+    "overlap": 0.2,
+    "scene": "0022",
+    "direct_matches": 244,
+    "direct_inliers": 244,
+    "direct_inlier_ratio": 1.0,
+    "agent_matches": 244,
+    "agent_inliers": 244,
+    "agent_inlier_ratio": 1.0,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      960
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      960
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_0899",
+    "difficulty": "extreme",
+    "overlap": 0.2,
+    "scene": "0022",
+    "direct_matches": 599,
+    "direct_inliers": 579,
+    "direct_inlier_ratio": 0.9666110183639399,
+    "agent_matches": 599,
+    "agent_inliers": 579,
+    "agent_inlier_ratio": 0.9666110183639399,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      836
+    ],
+    "crop_b": [
+      0,
+      0,
+      1280,
+      842
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  },
+  {
+    "pair_id": "md_0022_0728",
+    "difficulty": "extreme",
+    "overlap": 0.2,
+    "scene": "0022",
+    "direct_matches": 1081,
+    "direct_inliers": 1026,
+    "direct_inlier_ratio": 0.9491211840888066,
+    "agent_matches": 1081,
+    "agent_inliers": 1026,
+    "agent_inlier_ratio": 0.9491211840888066,
+    "crop_a": [
+      0,
+      0,
+      1280,
+      951
+    ],
+    "crop_b": [
+      0,
+      0,
+      958,
+      1280
+    ],
+    "agent_response": "{\n  \"crop_a\": [0, 0, 100, 100],\n  \"crop_b\": [0, 0, 100, 100]\n}"
+  }
+]

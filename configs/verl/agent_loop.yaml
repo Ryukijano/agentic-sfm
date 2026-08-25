@@ -1,0 +1,14 @@
+# Custom verl agent loop registry for Agentic-SFM hard-pair matching.
+# This file is loaded by `rollout.agent.agent_loop_config_path`.
+- name: agentic_sfm
+  _target_: agentic_sfm.verl_agent_loop.AgenticSfmAgentLoop
+  tool_server_url: http://localhost:8765
+  max_tool_calls: 10
+  reward_config:
+    tool_cost: 0.02
+    inlier_weight: 0.1
+    pose_weight: 1.0
+    format_weight: 0.1
+    invalid_penalty: 0.2
+  matcher: mast3r
+  match_max_size: 512

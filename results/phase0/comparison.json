@@ -1,0 +1,32 @@
+{
+  "direct_loftr": {
+    "mean_reward": 120.69191463818993,
+    "mean_inliers": 12.4,
+    "mean_inlier_ratio": 0.10881125912912441,
+    "mean_pose_auc": 0.016666666666666666,
+    "easy_pose_auc": 0.03333333333333333,
+    "medium_pose_auc": 0.0,
+    "hard_pose_auc": 0.0,
+    "extreme_pose_auc": 0.0
+  },
+  "direct_mast3r": {
+    "mean_reward": 120.69191463818993,
+    "mean_inliers": 12.4,
+    "mean_inlier_ratio": 0.10881125912912441,
+    "mean_pose_auc": 0.016666666666666666,
+    "easy_pose_auc": 0.03333333333333333,
+    "medium_pose_auc": 0.0,
+    "hard_pose_auc": 0.0,
+    "extreme_pose_auc": 0.0
+  },
+  "agent": {
+    "mean_reward": 89.16238599603355,
+    "mean_inliers": 8.85,
+    "mean_inlier_ratio": 0.08090411588782893,
+    "mean_pose_auc": 0.016666666666666666,
+    "easy_pose_auc": 0.03333333333333333,
+    "medium_pose_auc": 0.0,
+    "hard_pose_auc": 0.0,
+    "extreme_pose_auc": 0.0
+  }
+}

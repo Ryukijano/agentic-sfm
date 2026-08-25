@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs / outputs (results/ is tracked separately)
+logs/
+outputs/
+data/*
+!data/README.md
+*.log
+*.out
+*.err
+
+# Checkpoints & large artifacts
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Local debug / scratch
+=0.3
+Debug*.md
+wandb/
+
+# Weights & Biases
+wandb/
+
+# HuggingFace cache (usually on /scratch)
+.cache/
+
+# pytest
+.pytest_cache/
+
+# OS
+.DS_Store

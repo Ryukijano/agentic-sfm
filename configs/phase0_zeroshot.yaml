@@ -1,0 +1,41 @@
+# Phase 0: Zero-shot crop feasibility evaluation
+# Evaluates whether stock Qwen3-VL-4B proposing crops improves matching
+
+model:
+  name: "Qwen/Qwen3-VL-8B-Instruct"
+  device: "cuda:0"
+  max_new_tokens: 512
+  max_tool_calls: 10
+
+tool_server:
+  host: "0.0.0.0"
+  port: 8765
+  matcher: "loftr"  # start with LoFTR (kornia), switch to mast3r when available
+  max_image_size: 512
+
+data:
+  # MegaDepth scenes with COLMAP reconstructions
+  megadepth_dir: "/scratch/kcwp264/data/megadepth"
+  # Fallback: use a small synthetic dataset if MegaDepth not available
+  synthetic_dir: null
+  output_path: "data/hard_pairs.json"
+  max_pairs_per_scene: 50
+  min_overlap: 0.0
+  val_ratio: 0.2
+
+eval:
+  # Methods to compare
+  methods:
+    - "direct_loftr"      # baseline: direct LoFTR matching
+    - "direct_mast3r"     # baseline: direct MASt3R matching
+    - "agent_zeroshot"    # Qwen3-VL-4B zero-shot tool calling
+  # Subset sizes (for quick feasibility)
+  max_pairs_per_difficulty: 25
+  difficulties: ["easy", "medium", "hard", "extreme"]
+
+output:
+  results_dir: "outputs/phase0"
+  log_dir: "logs/phase0"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  save_episodes: true

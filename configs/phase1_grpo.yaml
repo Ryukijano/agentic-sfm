@@ -1,0 +1,79 @@
+# Phase 1: GRPO RL training for agentic matching
+# Qwen3-VL-8B + LoRA, vllm rollout, verifiable pose rewards
+
+model:
+  name: "Qwen/Qwen3-VL-8B-Instruct"
+  max_new_tokens: 512
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "verl"
+  group_size: 8           # N trajectories per prompt for GRPO
+  max_tool_calls: 10
+  max_turns: 15           # max conversation turns per rollout
+  temperature: 1.0        # sampling temperature for exploration
+  top_p: 0.95
+  # DAPO-style improvements
+  clip_low: 0.2           # lower clip range (standard PPO)
+  clip_high: 0.28         # upper clip range (Clip-Higher prevents entropy collapse)
+  dynamic_sampling: true  # skip groups where all rollouts get same reward (zero gradient)
+  # Dynamic reward scaling: format-heavy early, correctness-heavy later (ToolRL)
+  reward_schedule: "dynamic"  # "static" or "dynamic"
+  reward_warmup_steps: 30    # steps before shifting to correctness-focused
+
+reward:
+  pose_weight: 1.0        # final outcome (must dominate per Fireworks/ToolRL)
+  inlier_weight: 0.1      # dense shaping from match quality
+  tool_cost: 0.02         # per-tool-call step penalty
+  format_weight: 0.1      # format compliance (valid JSON tool calls)
+  invalid_penalty: 0.2    # per-invalid-call penalty
+  pose_auc_thresholds: [5, 10, 20]  # degrees
+
+curriculum:
+  enabled: true
+  schedule: "overlap_bins"
+  # Data distribution: medium=190, hard=189, easy=8, extreme=11
+  # Phase 1a: medium only (warm-up, LoFTR works decently) → Phase 1b: add hard → Phase 1c: add all
+  stages:
+    - {epochs: 10, difficulties: ["easy", "medium"]}
+    - {epochs: 20, difficulties: ["medium", "hard"]}
+    - {epochs: 20, difficulties: ["medium", "hard", "extreme", "easy"]}
+
+training:
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  total_epochs: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 5           # save checkpoint every N epochs
+  eval_freq: 5
+  log_freq: 10
+
+rollout:
+  # GPU allocation on 3x L40S
+  vllm_gpu: 0            # GPU 0: vLLM rollout server
+  training_gpu: 1        # GPU 1: training (FSDP/LoRA)
+  matcher_gpu: 2         # GPU 2: matcher inference server
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 4  # CPU workers for tool execution
+  batch_size: 4           # pairs per batch
+
+data:
+  train_pairs: "data/hard_pairs_train.json"
+  val_pairs: "data/hard_pairs_val.json"
+  matcher: "loftr"       # start with LoFTR, switch to mast3r later
+
+output:
+  checkpoint_dir: "outputs/phase1/checkpoints"
+  results_dir: "outputs/phase1"
+  log_dir: "logs/phase1"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase1-grpo-qwen3vl-8b"

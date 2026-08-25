@@ -1,0 +1,389 @@
+{
+  "method": "agent",
+  "total": 20,
+  "mean_reward": 89.16238599603355,
+  "mean_inliers": 8.85,
+  "mean_inlier_ratio": 0.08090411588782893,
+  "mean_pose_auc": 0.016666666666666666,
+  "mean_rot_error": 42.47000564808441,
+  "mean_trans_error": 84.93803566302718,
+  "easy_count": 10,
+  "easy_mean_reward": 79.23312793228465,
+  "easy_mean_inliers": 8.7,
+  "easy_mean_pose_auc": 0.03333333333333333,
+  "medium_count": 6,
+  "medium_mean_reward": 70.01104791414555,
+  "medium_mean_inliers": 7.0,
+  "medium_mean_pose_auc": 0.0,
+  "hard_count": 3,
+  "hard_mean_reward": 126.24063454550526,
+  "hard_mean_inliers": 12.0,
+  "hard_mean_pose_auc": 0.0,
+  "extreme_count": 1,
+  "extreme_mean_reward": 192.1282494764356,
+  "extreme_mean_inliers": 12.0,
+  "extreme_mean_pose_auc": 0.0,
+  "mean_tool_calls": 3.0,
+  "raw_results": [
+    {
+      "pair_id": "synthetic_0",
+      "difficulty": "easy",
+      "overlap": 0.9316947486012539,
+      "num_tool_calls": 5,
+      "num_matches": 118,
+      "num_inliers": 12,
+      "inlier_ratio": 0.1016949152542373,
+      "reward": 173.50355415878437,
+      "rotation_error": 66.40010336337178,
+      "translation_error": 107.19328130388716,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "crop",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_1",
+      "difficulty": "easy",
+      "overlap": 0.8556556086435939,
+      "num_tool_calls": 3,
+      "num_matches": 103,
+      "num_inliers": 12,
+      "inlier_ratio": 0.11650485436893204,
+      "reward": 130.2376309586711,
+      "rotation_error": 44.19593603226423,
+      "translation_error": 86.09004444096998,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_2",
+      "difficulty": "easy",
+      "overlap": 0.8091272576207029,
+      "num_tool_calls": 7,
+      "num_matches": 113,
+      "num_inliers": 11,
+      "inlier_ratio": 0.09734513274336283,
+      "reward": 25.520412228051413,
+      "rotation_error": 12.158654993980026,
+      "translation_error": 13.158689387463719,
+      "pose_auc": 0.3333333333333333,
+      "tool_sequence": [
+        "match",
+        "doppelganger_check",
+        "crop",
+        "match",
+        "match",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_5",
+      "difficulty": "easy",
+      "overlap": 0.9387565655240364,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_8",
+      "difficulty": "easy",
+      "overlap": 0.9432328289725693,
+      "num_tool_calls": 3,
+      "num_matches": 104,
+      "num_inliers": 11,
+      "inlier_ratio": 0.10576923076923077,
+      "reward": 31.657436776213377,
+      "rotation_error": 24.488383055572175,
+      "translation_error": 7.218476797564278,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_10",
+      "difficulty": "easy",
+      "overlap": 0.7670784191421165,
+      "num_tool_calls": 3,
+      "num_matches": 111,
+      "num_inliers": 13,
+      "inlier_ratio": 0.11711711711711711,
+      "reward": 163.90852647856957,
+      "rotation_error": 21.980537017510315,
+      "translation_error": 141.97627774934753,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_12",
+      "difficulty": "easy",
+      "overlap": 0.7205619469523727,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_13",
+      "difficulty": "easy",
+      "overlap": 0.8142866402491103,
+      "num_tool_calls": 3,
+      "num_matches": 123,
+      "num_inliers": 15,
+      "inlier_ratio": 0.12195121951219512,
+      "reward": 213.88673088518095,
+      "rotation_error": 55.851086314198454,
+      "translation_error": 158.08344944903126,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_17",
+      "difficulty": "easy",
+      "overlap": 0.8965526542324643,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_18",
+      "difficulty": "easy",
+      "overlap": 0.8378003388943766,
+      "num_tool_calls": 3,
+      "num_matches": 113,
+      "num_inliers": 13,
+      "inlier_ratio": 0.11504424778761062,
+      "reward": 53.61698783737579,
+      "rotation_error": 21.17179649562852,
+      "translation_error": 32.493686916968514,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_4",
+      "difficulty": "medium",
+      "overlap": 0.3972342776620397,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_6",
+      "difficulty": "medium",
+      "overlap": 0.42843461648879266,
+      "num_tool_calls": 3,
+      "num_matches": 111,
+      "num_inliers": 14,
+      "inlier_ratio": 0.12612612612612611,
+      "reward": 158.6692365840986,
+      "rotation_error": 32.00097567633237,
+      "translation_error": 126.71564829515361,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_7",
+      "difficulty": "medium",
+      "overlap": 0.5649731930741803,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_14",
+      "difficulty": "medium",
+      "overlap": 0.5788755090681728,
+      "num_tool_calls": 3,
+      "num_matches": 128,
+      "num_inliers": 15,
+      "inlier_ratio": 0.1171875,
+      "reward": 163.29493968193583,
+      "rotation_error": 36.31543831441958,
+      "translation_error": 127.02778261751624,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_15",
+      "difficulty": "medium",
+      "overlap": 0.6492651199394524,
+      "num_tool_calls": 2,
+      "num_matches": 0,
+      "num_inliers": 0,
+      "inlier_ratio": 0.0,
+      "reward": 0.0,
+      "rotation_error": -1,
+      "translation_error": -1,
+      "pose_auc": 0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_16",
+      "difficulty": "medium",
+      "overlap": 0.5887748218802962,
+      "num_tool_calls": 3,
+      "num_matches": 100,
+      "num_inliers": 13,
+      "inlier_ratio": 0.13,
+      "reward": 98.10211121883886,
+      "rotation_error": 41.426201777782325,
+      "translation_error": 56.72290944105654,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_3",
+      "difficulty": "hard",
+      "overlap": 0.15828831457708337,
+      "num_tool_calls": 3,
+      "num_matches": 96,
+      "num_inliers": 12,
+      "inlier_ratio": 0.125,
+      "reward": 62.144757084632175,
+      "rotation_error": 35.88474065711992,
+      "translation_error": 26.307516427512258,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_9",
+      "difficulty": "hard",
+      "overlap": 0.29443602765045934,
+      "num_tool_calls": 3,
+      "num_matches": 118,
+      "num_inliers": 12,
+      "inlier_ratio": 0.1016949152542373,
+      "reward": 210.0872889687551,
+      "rotation_error": 129.44046412307875,
+      "translation_error": 80.69665535415093,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_19",
+      "difficulty": "hard",
+      "overlap": 0.2711465380550491,
+      "num_tool_calls": 3,
+      "num_matches": 102,
+      "num_inliers": 12,
+      "inlier_ratio": 0.11764705882352941,
+      "reward": 106.4898575831285,
+      "rotation_error": 48.7440626456893,
+      "translation_error": 57.79403023155684,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    },
+    {
+      "pair_id": "synthetic_11",
+      "difficulty": "extreme",
+      "overlap": 0.07919531296745237,
+      "num_tool_calls": 3,
+      "num_matches": 96,
+      "num_inliers": 12,
+      "inlier_ratio": 0.125,
+      "reward": 192.1282494764356,
+      "rotation_error": 24.521698606234004,
+      "translation_error": 167.6540508702016,
+      "pose_auc": 0.0,
+      "tool_sequence": [
+        "doppelganger_check",
+        "match",
+        "done"
+      ]
+    }
+  ]
+}

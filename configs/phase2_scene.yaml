@@ -1,0 +1,64 @@
+# Phase 2: Full agentic SfM with COLMAP + doppelganger tools
+# Scene-level episodes with reconstruction-quality rewards
+
+model:
+  name: "Qwen/Qwen3-VL-4B-Instruct"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  checkpoint: "outputs/phase1/checkpoints/best"  # resume from Phase 1
+
+rl:
+  algorithm: "grpo"
+  framework: "verl"
+  group_size: 6
+  max_tool_calls: 20
+  max_turns: 30
+  temperature: 1.0
+  top_p: 0.95
+
+tools:
+  # Full tool set
+  enabled: ["crop", "match", "doppelganger_check", "retrieve", "sfm_run", "inspect"]
+  matchers: ["mast3r", "loftr"]
+  sfm_backend: "colmap"  # or "glomap"
+
+reward:
+  registration_weight: 0.5
+  pose_weight: 1.0
+  tool_cost: 0.05
+  split_penalty: 0.5
+  doppelganger_weight: 0.3
+
+curriculum:
+  enabled: true
+  stages:
+    - {epochs: 10, scenes: ["small"], max_images: 20}
+    - {epochs: 20, scenes: ["small", "medium"], max_images: 50}
+    - {epochs: 20, scenes: ["all"], max_images: 100}
+
+training:
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 200
+  total_epochs: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 5
+  eval_freq: 5
+
+data:
+  # SfM disambiguation datasets
+  sfm_disambiguation_dir: "data/sfm_disambiguation"
+  imc_dir: "data/imc_scenes"
+  doppelganger_dataset: "data/doppelgangers"
+
+output:
+  checkpoint_dir: "outputs/phase2/checkpoints"
+  results_dir: "outputs/phase2"
+  log_dir: "logs/phase2"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-scene-grpo"
