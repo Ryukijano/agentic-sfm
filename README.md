@@ -114,6 +114,8 @@ python tools_server/server.py
 # → http://localhost:8765/health
 ```
 
+Matcher checkpoints (MASt3R / LoFTR / LightGlue) load once per process and are reused across `/match` calls (GPU 2 in the layout above).
+
 ### 2. Phase 0 — zero-shot evaluation
 
 ```bash

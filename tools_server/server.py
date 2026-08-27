@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import cv2
@@ -79,6 +80,26 @@ class InspectRequest(BaseModel):
 
 _IMAGE_STORE: dict[str, str | np.ndarray] = {}
 _RECON_STORE: dict[str, dict[str, Any]] = {}
+
+# Process-lifetime matcher weight cache: (kind, checkpoint_id, device) → model(s).
+# Avoids reloading HF / kornia checkpoints on every /match call.
+_MATCHER_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
+
+
+def _get_or_load_matcher(
+    kind: str, checkpoint_id: str, device: str, loader: Callable[[], Any]
+) -> Any:
+    """Return a cached matcher model, loading it once per (kind, checkpoint, device)."""
+    key = (kind, checkpoint_id, device)
+    if key not in _MATCHER_MODEL_CACHE:
+        logger.info("Loading %s matcher (%s) on %s", kind, checkpoint_id, device)
+        _MATCHER_MODEL_CACHE[key] = loader()
+    return _MATCHER_MODEL_CACHE[key]
+
+
+def clear_matcher_cache() -> None:
+    """Drop cached matcher weights (for tests / explicit reload)."""
+    _MATCHER_MODEL_CACHE.clear()
 
 
 def register_image(image_id: str, path_or_array: str | np.ndarray) -> None:
@@ -172,7 +193,12 @@ def _match_loftr(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[st
     device = "cuda" if torch.cuda.is_available() else "cpu"
     t_a, t_b = t_a.to(device), t_b.to(device)
 
-    matcher = KF.LoFTR(pretrained="outdoor").to(device).eval()
+    matcher = _get_or_load_matcher(
+        "loftr",
+        "outdoor",
+        device,
+        lambda: KF.LoFTR(pretrained="outdoor").to(device).eval(),
+    )
 
     with torch.no_grad():
         input_dict = {"image0": t_a, "image1": t_b}
@@ -216,7 +242,12 @@ def _match_mast3r(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[s
     model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
 
     try:
-        model = AsymmetricMASt3R.from_pretrained(model_name).to(device).eval()
+        model = _get_or_load_matcher(
+            "mast3r",
+            model_name,
+            device,
+            lambda: AsymmetricMASt3R.from_pretrained(model_name).to(device).eval(),
+        )
     except Exception:
         logger.warning("Cannot load MASt3R, falling back to LoFTR")
         return _match_loftr(img_a, img_b, max_size)
@@ -284,9 +315,12 @@ def _match_lightglue(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dic
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Detect + describe with SuperPoint
-    lg = KF.LightGlueMatcher("superpoint").to(device).eval()
-    sp = KF.SuperPoint().to(device).eval()
+    def _load_lightglue():
+        lg_model = KF.LightGlueMatcher("superpoint").to(device).eval()
+        sp_model = KF.SuperPoint().to(device).eval()
+        return lg_model, sp_model
+
+    lg, sp = _get_or_load_matcher("lightglue", "superpoint", device, _load_lightglue)
 
     t_a = _to_tensor(img_a, max_size).to(device)
     t_b = _to_tensor(img_b, max_size).to(device)
