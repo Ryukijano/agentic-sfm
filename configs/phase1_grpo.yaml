@@ -27,11 +27,20 @@ rl:
   # Dynamic reward scaling: format-heavy early, correctness-heavy later (ToolRL)
   reward_schedule: "dynamic"  # "static" or "dynamic"
   reward_warmup_steps: 30    # steps before shifting to correctness-focused
+  # S-GRPO: Conditional Ground-Truth Trajectory Injection (arXiv 2604.16557)
+  # When all rollouts in a group fail, inject the oracle trajectory with max reward.
+  # Replaces the separate oracle-SFT stage — solves cold-start inside the RL loop.
+  sgrpo_cgi: true
 
 reward:
   pose_weight: 1.0        # final outcome (must dominate per Fireworks/ToolRL)
   inlier_weight: 0.1      # dense shaping from match quality
-  tool_cost: 0.02         # per-tool-call step penalty
+  # PyVision-RL accumulative tool reward (ICML 2026):
+  # R_tool = coef * n_valid_calls * 1[outcome_correct]
+  # Replaces the old per-call tool_cost penalty which caused interaction collapse.
+  tool_cost: 0.0          # legacy per-call penalty (disabled — set to 0)
+  accumulative_tool_coef: 0.1  # reward productive tool calls only when pose is correct
+  use_accumulative_tool_reward: true
   format_weight: 0.1      # format compliance (valid JSON tool calls)
   invalid_penalty: 0.2    # per-invalid-call penalty
   pose_auc_thresholds: [5, 10, 20]  # degrees
@@ -39,7 +48,7 @@ reward:
 curriculum:
   enabled: true
   schedule: "overlap_bins"
-  # Data distribution: medium=190, hard=189, easy=8, extreme=11
+  # Data distribution (1500 pairs): medium=898, hard=600, extreme=2
   # Phase 1a: medium only (warm-up, LoFTR works decently) → Phase 1b: add hard → Phase 1c: add all
   stages:
     - {epochs: 10, difficulties: ["medium"]}

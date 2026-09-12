@@ -3,7 +3,12 @@
 Reward components that enter the total (nothing else):
   - pose_reward: AUC@{5°,10°,20°} against GT
   - inlier_reward: ratio + log inlier-count shaping
-  - format_reward / invalid_penalty / tool_cost
+  - format_reward / invalid_penalty
+  - accumulative_tool_reward: PyVision-RL style — reward productive tool calls
+    only when the outcome is correct (prevents interaction collapse)
+
+Replaced the old per-call tool_cost penalty (which caused interaction collapse
+per PyVision-RL, ICML 2026) with an accumulative tool reward.
 """
 
 from __future__ import annotations
@@ -81,12 +86,19 @@ def compute_pair_reward(
     pose_weight: float = 1.0,
     format_weight: float = 0.1,
     invalid_penalty: float = 0.2,
+    accumulative_tool_coef: float = 0.1,
+    use_accumulative_tool_reward: bool = True,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a pair-level matching episode.
 
     Diagnostics (rotation_error_deg, translation_error_deg) are recorded but
     NEVER added into total_reward.
+
+    Accumulative tool reward (PyVision-RL, ICML 2026):
+        R_tool = coef * n_tool_calls * 1[outcome_is_correct]
+    This replaces the old per-call tool_cost penalty which caused interaction
+    collapse (models learn to reduce tool usage to minimize penalty).
     """
     components: dict[str, Any] = {}
 
@@ -117,7 +129,19 @@ def compute_pair_reward(
     else:
         components["pose_reward"] = 0.0
 
-    components["tool_cost"] = -tool_cost * num_tool_calls
+    if use_accumulative_tool_reward:
+        # PyVision-RL: reward tool calls only when outcome is correct.
+        # "Correct" = pose_reward > 0 (at least one AUC threshold passed).
+        outcome_correct = float(components["pose_reward"]) > 0.0
+        components["accumulative_tool_reward"] = (
+            accumulative_tool_coef * num_valid_calls * (1.0 if outcome_correct else 0.0)
+        )
+        components["tool_cost"] = 0.0  # kept for compatibility, no longer penalizes
+    else:
+        # Legacy per-call penalty (causes interaction collapse — not recommended)
+        components["tool_cost"] = -tool_cost * num_tool_calls
+        components["accumulative_tool_reward"] = 0.0
+
     components["total_reward"] = float(
         sum(float(components[k]) for k in REWARD_TOTAL_KEYS if k in components)
     )

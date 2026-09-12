@@ -106,7 +106,9 @@ class VLLMRolloutAgent:
                  pose_weight: float = 1.0, inlier_weight: float = 0.1,
                  tool_cost: float = 0.02, format_weight: float = 0.1,
                  invalid_penalty: float = 0.2, reward_schedule: str = "static",
-                 reward_warmup_steps: int = 30, matcher: str = DEFAULT_MATCHER):
+                 reward_warmup_steps: int = 30, matcher: str = DEFAULT_MATCHER,
+                 accumulative_tool_coef: float = 0.1,
+                 use_accumulative_tool_reward: bool = True):
         self.vllm_url = vllm_url.rstrip("/")
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -122,6 +124,9 @@ class VLLMRolloutAgent:
         self.reward_schedule = reward_schedule
         self.reward_warmup_steps = reward_warmup_steps
         self.matcher = matcher
+        # PyVision-RL accumulative tool reward (prevents interaction collapse)
+        self.accumulative_tool_coef = accumulative_tool_coef
+        self.use_accumulative_tool_reward = use_accumulative_tool_reward
         self._global_step = 0
         self.vllm_model = model_name
         self._lora_loaded = False
@@ -294,9 +299,129 @@ class VLLMRolloutAgent:
             pose_weight=pose_w,
             format_weight=format_w,
             invalid_penalty=self.invalid_penalty,
+            accumulative_tool_coef=self.accumulative_tool_coef,
+            use_accumulative_tool_reward=self.use_accumulative_tool_reward,
         )
         ep.reward = ep.reward_components["total_reward"]
 
+        return ep
+
+    def run_oracle_episode(self, pair_id: str, image_a_path: str, image_b_path: str,
+                           tool_client: ToolClient, gt_pose: dict | None = None,
+                           K_a=None, K_b=None) -> RolloutEpisode:
+        """S-GRPO CGI: generate an oracle trajectory using heuristic crop boxes.
+
+        Tries each ORACLE_CROP_BOX on both images, runs crop_and_match, keeps
+        the best result. Constructs a synthetic episode with the oracle
+        trajectory and max reward (for group-relative advantage injection).
+        """
+        from agentic_sfm.geometry import iter_oracle_crops, keep_best_match, k_for_image
+
+        ep = RolloutEpisode(pair_id=pair_id, image_a=image_a_path, image_b=image_b_path)
+        tool_client.register_image("img_a", image_a_path)
+        tool_client.register_image("img_b", image_b_path)
+
+        img_a_b64 = self._encode_image(image_a_path)
+        img_b_b64 = self._encode_image(image_b_path)
+        ep.images = [img_a_b64, img_b_b64]
+
+        best_match = None
+        best_crop_info: tuple[str, list[float]] | None = None
+
+        for crop_img_id, bbox, other_img_id in iter_oracle_crops():
+            try:
+                tc = ToolCall(
+                    tool="crop_and_match",
+                    args={
+                        "crop_image_id": crop_img_id,
+                        "bbox": bbox,
+                        "match_image_id": other_img_id,
+                        "matcher": self.matcher,
+                    },
+                )
+                match_kwargs = {"matcher": self.matcher}
+                if K_a is not None:
+                    match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
+                if K_b is not None:
+                    match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
+
+                result = execute_sfm_tool(tool_client, tc, match_kwargs)
+                if result and not result.get("error"):
+                    best_match = keep_best_match(best_match, result)
+                    if best_match is result:
+                        best_crop_info = (crop_img_id, bbox)
+            except Exception as e:
+                logger.debug(f"Oracle crop failed for {crop_img_id} {bbox}: {e}")
+                continue
+
+        # Also try full-frame match as baseline
+        try:
+            tc_full = ToolCall(tool="match", args={
+                "image_a_id": "img_a", "image_b_id": "img_b",
+                "matcher": self.matcher,
+            })
+            match_kwargs = {"matcher": self.matcher}
+            if K_a is not None:
+                match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
+            if K_b is not None:
+                match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
+            full_result = execute_sfm_tool(tool_client, tc_full, match_kwargs)
+            best_match = keep_best_match(best_match, full_result)
+            if best_match is full_result:
+                best_crop_info = None  # full-frame is best
+        except Exception:
+            pass
+
+        # Construct synthetic oracle trajectory
+        if best_crop_info:
+            crop_img_id, bbox = best_crop_info
+            oracle_response = json.dumps({
+                "tool": "crop_and_match",
+                "args": {
+                    "crop_image_id": crop_img_id,
+                    "bbox": bbox,
+                    "match_image_id": "img_b" if crop_img_id == "img_a" else "img_a",
+                    "matcher": self.matcher,
+                },
+            })
+        else:
+            oracle_response = json.dumps({
+                "tool": "match",
+                "args": {"image_a_id": "img_a", "image_b_id": "img_b", "matcher": self.matcher},
+            })
+
+        ep.tool_calls = [ToolCall(tool="done", args={})]
+        ep.assistant_responses = [oracle_response, json.dumps({"tool": "done"})]
+        ep.final_match = best_match
+        ep.results = [best_match or {}]
+
+        # Build minimal messages for logprob computation
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image", "image": "placeholder_a"},
+                {"type": "image", "image": "placeholder_b"},
+                {"type": "text", "text": "Match these two images. Call tools to achieve the best matching result, then output {\"tool\": \"done\"}."},
+            ]},
+            {"role": "assistant", "content": oracle_response},
+            {"role": "user", "content": f"Observation: {format_observation(best_match or {})}"},
+            {"role": "assistant", "content": json.dumps({"tool": "done"})},
+        ]
+        ep.messages = messages
+
+        # Compute oracle reward (should be high — this is the expert trajectory)
+        ep.reward_components = compute_pair_reward(
+            ep.final_match or {}, gt_pose=gt_pose,
+            num_tool_calls=1, num_invalid_calls=0, num_valid_calls=1,
+            tool_cost=self.tool_cost,
+            inlier_weight=self.inlier_weight,
+            pose_weight=self.pose_weight,
+            format_weight=self.format_weight,
+            invalid_penalty=self.invalid_penalty,
+            accumulative_tool_coef=self.accumulative_tool_coef,
+            use_accumulative_tool_reward=self.use_accumulative_tool_reward,
+        )
+        ep.reward = ep.reward_components["total_reward"]
         return ep
 
 
@@ -346,6 +471,11 @@ class GRPOTrainer:
         self.tool_cost = config.get("reward", {}).get("tool_cost", 0.02)
         self.format_weight = config.get("reward", {}).get("format_weight", 0.1)
         self.invalid_penalty = config.get("reward", {}).get("invalid_penalty", 0.2)
+        # PyVision-RL accumulative tool reward
+        self.accumulative_tool_coef = config.get("reward", {}).get("accumulative_tool_coef", 0.1)
+        self.use_accumulative_tool_reward = config.get("reward", {}).get("use_accumulative_tool_reward", True)
+        # S-GRPO: Conditional Ground-Truth Trajectory Injection
+        self.sgrpo_cgi = config.get("rl", {}).get("sgrpo_cgi", True)
         self._global_step = 0
 
         self.curriculum_stages = config.get("curriculum", {}).get("stages", [])
@@ -436,8 +566,18 @@ class GRPOTrainer:
         return self.curriculum_stages[-1]["difficulties"]
 
     def collect_rollouts(self, pairs: list, rollout_agent: VLLMRolloutAgent) -> list[RolloutEpisode]:
+        """Collect N rollouts per pair, with S-GRPO CGI injection.
+
+        S-GRPO (arXiv 2604.16557): when all rollouts in a group fail (zero
+        reward or no valid trajectory), inject the oracle trajectory with
+        max reward. This provides a positive learning signal during cold-start
+        without a separate SFT stage.
+        """
         episodes = []
+        cgi_injections = 0
         for pair in pairs:
+            group_episodes = []
+            all_failed = True
             for _ in range(self.group_size):
                 gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
                 ep = rollout_agent.run_episode(
@@ -449,7 +589,32 @@ class GRPOTrainer:
                     K_a=pair.K_a,
                     K_b=pair.K_b,
                 )
-                episodes.append(ep)
+                group_episodes.append(ep)
+                if ep.reward > 0:
+                    all_failed = False
+
+            # S-GRPO CGI: if all rollouts failed, inject oracle trajectory
+            if self.sgrpo_cgi and all_failed and group_episodes:
+                gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
+                oracle_ep = rollout_agent.run_oracle_episode(
+                    pair_id=pair.pair_id,
+                    image_a_path=pair.image_a,
+                    image_b_path=pair.image_b,
+                    tool_client=self.tool_client,
+                    gt_pose=gt_pose,
+                    K_a=pair.K_a,
+                    K_b=pair.K_b,
+                )
+                if oracle_ep.reward > 0:
+                    # Replace the worst rollout with the oracle trajectory
+                    group_episodes[0] = oracle_ep
+                    cgi_injections += 1
+                    logger.debug(f"  S-GRPO CGI: injected oracle for {pair.pair_id} (reward={oracle_ep.reward:.3f})")
+
+            episodes.extend(group_episodes)
+
+        if cgi_injections > 0:
+            logger.info(f"  S-GRPO CGI: injected {cgi_injections} oracle trajectories ({cgi_injections}/{len(pairs)} pairs)")
         return episodes
 
     def compute_advantages(self, episodes: list[RolloutEpisode]) -> list[float]:
@@ -830,6 +995,8 @@ class GRPOTrainer:
             reward_schedule=self.reward_schedule,
             reward_warmup_steps=self.reward_warmup_steps,
             matcher=self.matcher,
+            accumulative_tool_coef=self.accumulative_tool_coef,
+            use_accumulative_tool_reward=self.use_accumulative_tool_reward,
         )
         if self.sft_adapter and os.path.isdir(self.sft_adapter):
             self._reload_vllm_lora(Path(self.sft_adapter), rollout_agent)

@@ -35,6 +35,7 @@ REWARD_TOTAL_KEYS = (
     "inlier_reward",
     "pose_reward",
     "tool_cost",
+    "accumulative_tool_reward",
 )
 
 

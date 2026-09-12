@@ -111,8 +111,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-per-bin", type=int, default=200,
-                        help="Max pairs per difficulty bin (cap)")
+    parser.add_argument("--max-per-bin", type=int, default=0,
+                        help="Max pairs per difficulty bin (0 = no cap)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -139,13 +139,16 @@ def main():
     for diff, pairs_list in by_diff.items():
         logger.info(f"  {diff}: {len(pairs_list)} pairs")
 
-    # Cap per bin if needed
+    # Cap per bin if needed (0 = no cap)
     rng = np.random.default_rng(args.seed)
     capped_pairs = []
     for diff in ["easy", "medium", "hard", "extreme"]:
         pairs_list = by_diff.get(diff, [])
         rng.shuffle(pairs_list)
-        capped_pairs.extend(pairs_list[:args.max_per_bin])
+        if args.max_per_bin > 0:
+            capped_pairs.extend(pairs_list[:args.max_per_bin])
+        else:
+            capped_pairs.extend(pairs_list)
 
     logger.info(f"After capping: {len(capped_pairs)} pairs")
 

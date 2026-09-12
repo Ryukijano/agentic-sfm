@@ -81,13 +81,16 @@ class TestRewards:
             match_result, gt_pose, num_tool_calls=2, num_valid_calls=2
         )
         assert reward["total_reward"] > 0
-        assert reward["tool_cost"] < 0
+        # Accumulative tool reward: positive when outcome is correct (PyVision-RL)
+        assert reward["accumulative_tool_reward"] > 0
+        assert reward["tool_cost"] == 0.0  # legacy per-call penalty disabled
         assert reward["pose_reward"] == pytest.approx(1.0)
         # Identity pose: errors ~0 must NOT inflate the total.
         assert reward["total_reward"] < 2.0
         assert abs(reward["total_reward"] - (
             reward["format_reward"] + reward["invalid_penalty"]
             + reward["inlier_reward"] + reward["pose_reward"] + reward["tool_cost"]
+            + reward["accumulative_tool_reward"]
         )) < 1e-6
 
     def test_pair_reward_large_error_not_in_total(self):
@@ -118,6 +121,7 @@ class TestRewards:
         assert abs(reward["total_reward"] - (
             reward["format_reward"] + reward["invalid_penalty"]
             + reward["inlier_reward"] + reward["pose_reward"] + reward["tool_cost"]
+            + reward["accumulative_tool_reward"]
         )) < 1e-6
 
     def test_pair_reward_ignores_unknown_kwargs(self):
