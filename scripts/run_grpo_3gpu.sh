@@ -2,7 +2,7 @@
 # =============================================================================
 # Agentic-SFM GRPO Training — 3-GPU interactive launcher
 #
-# GPU 0: vLLM rollout server (Qwen3-VL-8B)
+# GPU 0: vLLM rollout server (Qwen3-VL-2B-Instruct)
 # GPU 1: Training (LoRA policy gradient)
 # GPU 2: Tool server (LoFTR matcher + crop + doppelganger)
 #
@@ -30,9 +30,8 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "${AGENTIC_ENV_PATH}" ]; then
 fi
 
 cd "$(dirname "$0")/.."
+source /scratch/kcwp264/.aire_scratch_env.sh
 export PYTHONPATH="${PWD}/src:${PYTHONPATH:-}"
-export HF_HOME="/scratch/kcwp264/.cache/huggingface"
-export TORCH_HOME="/scratch/kcwp264/.cache/torch"
 
 # --- Load CUDA toolkit (needed by vLLM flashinfer JIT) ---
 module load cuda/12.6.2 2>/dev/null || true
@@ -73,10 +72,15 @@ sleep 2
 echo ""
 echo ">>> Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-8B-Instruct" \
+    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --enable-lora \
+    --max-loras 1 \
+    --max-lora-rank 32 \
     --port 8000 \
     --gpu-memory-utilization 0.85 \
-    --max-model-len 16384 \
+    --max-model-len 8192 \
+    --limit-mm-per-prompt '{"image":6,"video":0}' \
+    --mm-processor-kwargs '{"max_pixels":1003520,"min_pixels":3136}' \
     --trust-remote-code \
     --dtype bfloat16 \
     --api-key EMPTY \

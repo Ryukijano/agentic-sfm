@@ -4,13 +4,13 @@
 # 3x NVIDIA L40S (Ada, 48 GB) on a single AIRE GPU node.
 #
 # GPU layout:
-#   GPU 0: vLLM rollout server (Qwen3-VL-8B inference)
+#   GPU 0: vLLM rollout server (Qwen3-VL-2B-Instruct inference)
 #   GPU 1: Training (LoRA gradient updates)
 #   GPU 2: Matcher inference (tool server)
 #
 # Prerequisites:
 #   - Phase 0 completed (hard_pairs.json built)
-#   - vllm 0.10.0+cu126 installed in agentic-sfm env
+#   - vLLM >= 0.17 in agentic-sfm env (Qwen3-VL-2B-Instruct; 0.11 cannot load it)
 #
 # Submit:
 #   sbatch jobs/phase1-grpo.slurm
@@ -32,6 +32,7 @@ set -eo pipefail
 # ---------------------------------------------------------------------------
 # 1. Environment
 # ---------------------------------------------------------------------------
+source /scratch/kcwp264/.aire_scratch_env.sh
 module load miniforge/24.7.1 || true
 module load cuda/12.6.2 || true
 
@@ -88,14 +89,20 @@ done
 # ---------------------------------------------------------------------------
 echo "[INFO] Starting vLLM rollout server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen3-VL-8B-Instruct \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --enable-lora \
+  --max-loras 1 \
+  --max-lora-rank 32 \
   --port 8000 \
   --tensor-parallel-size 1 \
   --trust-remote-code \
   --dtype bfloat16 \
-  --max-model-len 4096 \
+  --max-model-len 8192 \
   --gpu-memory-utilization 0.85 \
-  --limit-mm-per-prompt image=2 \
+  --limit-mm-per-prompt '{"image":6,"video":0}' \
+  --mm-processor-kwargs '{"max_pixels":1003520,"min_pixels":3136}' \
+  --api-key EMPTY \
+  --enforce-eager \
   &
 VLLM_PID=$!
 sleep 10

@@ -3,14 +3,16 @@
 #SBATCH --gres=gpu:l40s:3
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
 #SBATCH --time=24:00:00
 #SBATCH --job-name=verl-grpo-3gpu
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
 set -e
+
+source /scratch/kcwp264/.aire_scratch_env.sh
 
 PROJECT_DIR=/scratch/kcwp264/agentic-sfm
 CONDA_ENV=/scratch/kcwp264/.conda_envs/agentic-sfm

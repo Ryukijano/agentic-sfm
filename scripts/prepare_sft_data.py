@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,66 @@ def filter_trajectories(
     return deduped
 
 
+def _used_crop(traj: dict) -> bool:
+    return any(
+        tc.get("tool") in ("crop", "crop_and_match")
+        for tc in traj.get("tool_calls") or []
+    )
+
+
+def _traj_inliers(traj: dict) -> float:
+    fm = traj.get("final_match") or {}
+    return float(fm.get("num_inliers") or 0)
+
+
+def filter_beats_fullframe(all_trajs: list[dict], successful: list[dict]) -> list[dict]:
+    """Keep successes that beat a no-crop (full-frame) baseline for that pair."""
+    by_pair: dict[str, list[dict]] = {}
+    for t in all_trajs:
+        by_pair.setdefault(t["pair_id"], []).append(t)
+
+    kept: list[dict] = []
+    skipped = 0
+    for t in successful:
+        peers = by_pair.get(t["pair_id"], [])
+        baselines = [_traj_inliers(p) for p in peers if not _used_crop(p)]
+        if not baselines:
+            kept.append(t)
+            continue
+        baseline = max(baselines)
+        if _traj_inliers(t) > baseline:
+            kept.append(t)
+        else:
+            skipped += 1
+    logger.info(
+        "Beats-fullframe filter: kept %d / %d (dropped %d at or below full-frame inliers)",
+        len(kept), len(successful), skipped,
+    )
+    return kept
+
+
+def _crop_paths_from_traj(traj: dict) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    blobs = list(traj.get("results") or [])
+    fm = traj.get("final_match")
+    if isinstance(fm, dict):
+        blobs.append(fm)
+    for result in blobs:
+        candidates = [result]
+        nested = result.get("crop") if isinstance(result, dict) else None
+        if isinstance(nested, dict):
+            candidates.append(nested)
+        for blob in candidates:
+            if not isinstance(blob, dict):
+                continue
+            path = blob.get("path")
+            if path and os.path.exists(path) and path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
+
+
 def trajectory_to_sft_example(traj: dict) -> dict:
     """Convert a trajectory to an SFT training example.
 
@@ -77,22 +138,27 @@ def trajectory_to_sft_example(traj: dict) -> dict:
     # Ensure messages have the right format for the processor
     # The messages should already be in chat format from the rollout
     # We just need to clean up any image placeholders
+    crop_paths = _crop_paths_from_traj(traj)
+    extra_allowed = len(crop_paths)
+    pair_images_seen = 0
     cleaned_messages = []
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
 
         if isinstance(content, list):
-            # Multi-modal message (user with images)
             parts = []
             for item in content:
-                if item.get("type") == "image":
-                    parts.append({"type": "image"})
+                if item.get("type") in ("image", "image_url"):
+                    if pair_images_seen < 2:
+                        parts.append({"type": "image"})
+                        pair_images_seen += 1
+                    elif extra_allowed > 0:
+                        parts.append({"type": "image"})
+                        extra_allowed -= 1
+                    # else drop unmatched crop placeholders so SFT token counts match
                 elif item.get("type") == "text":
                     parts.append({"type": "text", "text": item.get("text", "")})
-                elif item.get("type") == "image_url":
-                    # Skip image_url — will be replaced by actual images during training
-                    parts.append({"type": "image"})
             cleaned_messages.append({"role": role, "content": parts})
         else:
             cleaned_messages.append({"role": role, "content": content})
@@ -101,6 +167,7 @@ def trajectory_to_sft_example(traj: dict) -> dict:
         "pair_id": traj["pair_id"],
         "image_a": traj["image_a"],
         "image_b": traj["image_b"],
+        "crop_image_paths": crop_paths,
         "messages": cleaned_messages,
         "reward": traj.get("reward", 0.0),
         "reward_components": traj.get("reward_components", {}),
@@ -123,6 +190,18 @@ def main():
                         help="Include near-miss trajectories (inlier_ratio > 0.1 but low pose)")
     parser.add_argument("--near-miss-threshold", type=float, default=0.1,
                         help="Inlier ratio threshold for near-miss inclusion")
+    parser.add_argument(
+        "--prefer-beats-fullframe",
+        action="store_true",
+        default=True,
+        help="Keep only successes that beat a no-crop baseline for that pair",
+    )
+    parser.add_argument(
+        "--no-prefer-beats-fullframe",
+        action="store_false",
+        dest="prefer_beats_fullframe",
+        help="Disable the full-frame baseline filter",
+    )
     args = parser.parse_args()
 
     # Load trajectories
@@ -155,6 +234,9 @@ def main():
             near_miss = near_miss[:remaining]
         logger.info(f"Added {len(near_miss)} near-miss trajectories (inlier_ratio > {args.near_miss_threshold})")
         successful.extend(near_miss)
+
+    if args.prefer_beats_fullframe:
+        successful = filter_beats_fullframe(trajectories, successful)
 
     # Convert to SFT format
     sft_examples = [trajectory_to_sft_example(t) for t in successful]

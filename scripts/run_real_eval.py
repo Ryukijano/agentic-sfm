@@ -2,13 +2,16 @@
 """Run real zero-shot evaluation on MegaDepth-1500 pairs.
 
 1. Direct LoFTR matching (baseline)
-2. Qwen3-VL-8B agent with crop+match tool calling
+2. Qwen3-VL-2B-Instruct agent with crop+match tool calling
 3. Save results + match visualizations (SuperGlue-style)
 """
+import argparse
 import json
 import os
 import sys
+import tempfile
 import time
+import uuid
 import numpy as np
 import cv2
 import torch
@@ -42,23 +45,22 @@ class LoFTRMatcher:
 
         if crop_a:
             x, y, w, h = crop_a
-            img_a = img_a[y:y+h, x:x+w]
+            img_a = img_a[y:y + h, x:x + w]
         if crop_b:
             x, y, w, h = crop_b
-            img_b = img_b[y:y+h, x:x+w]
+            img_b = img_b[y:y + h, x:x + w]
 
-        # Resize to max 640
-        for img in [img_a, img_b]:
-            pass
         h_a, w_a = img_a.shape
         h_b, w_b = img_b.shape
         max_dim = 640
+        scale_a = 1.0
+        scale_b = 1.0
         if max(h_a, w_a) > max_dim:
-            scale = max_dim / max(h_a, w_a)
-            img_a = cv2.resize(img_a, (int(w_a*scale), int(h_a*scale)))
+            scale_a = max_dim / max(h_a, w_a)
+            img_a = cv2.resize(img_a, (int(w_a * scale_a), int(h_a * scale_a)))
         if max(h_b, w_b) > max_dim:
-            scale = max_dim / max(h_b, w_b)
-            img_b = cv2.resize(img_b, (int(w_b*scale), int(h_b*scale)))
+            scale_b = max_dim / max(h_b, w_b)
+            img_b = cv2.resize(img_b, (int(w_b * scale_b), int(h_b * scale_b)))
 
         t_a = torch.from_numpy(img_a).float()[None, None] / 255.0
         t_b = torch.from_numpy(img_b).float()[None, None] / 255.0
@@ -67,8 +69,8 @@ class LoFTRMatcher:
             input_dict = {"image0": t_a.to(self.device), "image1": t_b.to(self.device)}
             result = self.matcher(input_dict)
 
-        mkpts_a = result["keypoints0"].cpu().numpy()
-        mkpts_b = result["keypoints1"].cpu().numpy()
+        mkpts_a = result["keypoints0"].cpu().numpy() / max(scale_a, 1e-8)
+        mkpts_b = result["keypoints1"].cpu().numpy() / max(scale_b, 1e-8)
         confidence = result["confidence"].cpu().numpy()
 
         return {
@@ -82,34 +84,24 @@ class LoFTRMatcher:
 
 
 # ── RANSAC inlier counting ───────────────────────────────────────────────
-def count_inliers(match_result, K_a, K_b, gt_R, gt_t, threshold=4.0):
-    """Count RANSAC inliers using essential matrix from GT pose."""
-    mkpts_a = match_result["mkpts_a"]
-    mkpts_b = match_result["mkpts_b"]
+def count_inliers(match_result, K_a, K_b, gt_R, gt_t, threshold=1.0):
+    """MAGSAC inliers via essential matrix with (optional) GT K."""
+    from agentic_sfm.geometry import estimate_relative_pose
 
-    if len(mkpts_a) < 5:
-        return 0, 0.0
+    mkpts_a = np.asarray(match_result.get("mkpts_a", match_result.get("keypoints_a", [])))
+    mkpts_b = np.asarray(match_result.get("mkpts_b", match_result.get("keypoints_b", [])))
+    if mkpts_a.size == 0 or len(mkpts_a) < 8:
+        pose = match_result.get("pose")
+        n = int(match_result.get("num_inliers") or 0)
+        r = float(match_result.get("inlier_ratio") or 0.0)
+        return n, r, pose
 
-    K_a = np.array(K_a)
-    K_b = np.array(K_b)
-
-    # Scale keypoints back to original image coordinates if cropped
-    # (for now assume no crop)
-    # Compute essential matrix from GT pose
-    E = K_b.T @ np.cross(gt_t, np.eye(3)) @ gt_R @ K_a
-
-    # Use cv2.findFundamentalMat with RANSAC
-    F, mask = cv2.findFundamentalMat(
-        mkpts_a.astype(np.float64), mkpts_b.astype(np.float64),
-        cv2.USAC_MAGSAC, threshold, 0.999, 10000
+    size_a = match_result.get("img_a_size") or (int(mkpts_a[:, 0].max()) + 1, int(mkpts_a[:, 1].max()) + 1)
+    size_b = match_result.get("img_b_size") or (int(mkpts_b[:, 0].max()) + 1, int(mkpts_b[:, 1].max()) + 1)
+    pose_result = estimate_relative_pose(
+        mkpts_a, mkpts_b, tuple(size_a), tuple(size_b), K_a=K_a, K_b=K_b, threshold=threshold,
     )
-
-    if mask is None:
-        return 0, 0.0
-
-    inliers = int(mask.sum())
-    inlier_ratio = inliers / len(mkpts_a) if len(mkpts_a) > 0 else 0.0
-    return inliers, inlier_ratio
+    return pose_result["num_inliers"], pose_result["inlier_ratio"], pose_result.get("pose")
 
 
 # ── Visualization (SuperGlue-style) ──────────────────────────────────────
@@ -225,129 +217,198 @@ def visualize_matches(img_a_path, img_b_path, match_result, inlier_mask=None,
     return combined
 
 
-# ── Agent (Qwen3-VL) ────────────────────────────────────────────────────
-class SimpleAgent:
-    """Qwen3-VL agent that decides crops for matching."""
+# ── Agent tools (same crop/match contract as training) ───────────────────
+class LocalToolClient:
+    """In-process crop/match so eval does not require a running tool server."""
 
-    def __init__(self, device="cuda:0"):
-        from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+    def __init__(self, matcher: LoFTRMatcher, tmp_dir: Path):
+        self.matcher = matcher
+        self.tmp_dir = tmp_dir
+        self.registry: dict[str, str] = {}
+        self.arrays: dict[str, np.ndarray] = {}
+        self.crop_meta: dict[str, dict] = {}
 
-        model_name = "Qwen/Qwen3-VL-8B-Instruct"
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
+    def register_image(self, image_id, path):
+        self.registry[image_id] = str(path)
+        img = cv2.imread(str(path))
+        if img is None:
+            raise FileNotFoundError(path)
+        self.arrays[image_id] = img
+        self.crop_meta[image_id] = {"origin_xy": [0, 0]}
+        return {"status": "ok"}
+
+    def crop(self, image_id, bbox):
+        img = self.arrays[image_id]
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = bbox
+        px1, py1 = int(x1 * w), int(y1 * h)
+        px2, py2 = int(x2 * w), int(y2 * h)
+        px1, px2 = max(0, px1), min(w, px2)
+        py1, py2 = max(0, py1), min(h, py2)
+        cropped = img[py1:py2, px1:px2]
+        new_id = f"{image_id}_crop_{uuid.uuid4().hex[:8]}"
+        path = str(self.tmp_dir / f"{new_id}.jpg")
+        cv2.imwrite(path, cropped)
+        self.registry[new_id] = path
+        self.arrays[new_id] = cropped
+        parent = self.crop_meta.get(image_id, {})
+        ox = int(parent.get("origin_xy", [0, 0])[0]) + px1
+        oy = int(parent.get("origin_xy", [0, 0])[1]) + py1
+        self.crop_meta[new_id] = {"origin_xy": [ox, oy]}
+        return {
+            "cropped_image_id": new_id,
+            "crop_id": new_id,
+            "path": path,
+            "origin_xy": [ox, oy],
+            "crop_size": [px2 - px1, py2 - py1],
+            "size": [px2 - px1, py2 - py1],
+        }
+
+    def match(self, image_a, image_b, matcher="loftr", max_size=512, K_a=None, K_b=None):
+        from agentic_sfm.geometry import estimate_relative_pose, k_for_image
+
+        path_a = self.registry.get(image_a, image_a)
+        path_b = self.registry.get(image_b, image_b)
+        result = self.matcher.match(path_a, path_b)
+        img_a = self.arrays.get(image_a)
+        img_b = self.arrays.get(image_b)
+        if img_a is None or img_b is None:
+            return {"error": f"unregistered {image_a}/{image_b}", "num_inliers": 0, "inlier_ratio": 0.0}
+        h_a, w_a = img_a.shape[:2]
+        h_b, w_b = img_b.shape[:2]
+        Ka = k_for_image(K_a, self.crop_meta.get(image_a, {}).get("origin_xy"), (w_a, h_a))
+        Kb = k_for_image(K_b, self.crop_meta.get(image_b, {}).get("origin_xy"), (w_b, h_b))
+        pose_result = estimate_relative_pose(
+            result["mkpts_a"], result["mkpts_b"], (w_a, h_a), (w_b, h_b), K_a=Ka, K_b=Kb,
         )
+        return {
+            "num_matches": result["n_matches"],
+            "num_inliers": pose_result["num_inliers"],
+            "inlier_ratio": pose_result["inlier_ratio"],
+            "pose": pose_result["pose"],
+            "mkpts_a": result["mkpts_a"],
+            "mkpts_b": result["mkpts_b"],
+            "confidence": result["confidence"],
+            "img_a_size": (w_a, h_a),
+            "img_b_size": (w_b, h_b),
+            "n_matches": result["n_matches"],
+        }
 
-        print(f"Loading {model_name} with 4-bit quantization...")
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.device = device
-        print("Model loaded.")
+    def doppelganger_check(self, image_a, image_b):
+        return {"is_doppelganger": False, "score": 0.0}
 
-    def decide_crop(self, img_a_path, img_b_path):
-        """Ask the VLM to suggest crop regions for better matching."""
-        img_a = Image.open(img_a_path).convert("RGB")
-        img_b = Image.open(img_b_path).convert("RGB")
 
-        # Resize for VLM input
-        img_a.thumbnail((448, 448))
-        img_b.thumbnail((448, 448))
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img_a},
-                    {"type": "image", "image": img_b},
-                    {"type": "text", "text": (
-                        "You are looking at two images of the same scene from different viewpoints. "
-                        "To improve feature matching, suggest a crop region for each image that "
-                        "focuses on the overlapping area. "
-                        "Respond in JSON format:\n"
-                        '{"crop_a": [x, y, width, height], "crop_b": [x, y, width, height]}\n'
-                        "where coordinates are in the original image space (0-100 percentage). "
-                        "If no crop is needed, return full image bounds."
-                    )}
-                ],
-            }
-        ]
-
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(
-            text=[text], images=[img_a, img_b],
-            padding=True, return_tensors="pt"
-        ).to(self.model.device)
-
-        with torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=256,
-                do_sample=False,
-                temperature=1.0,
-            )
-
-        response = self.processor.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return self._parse_crop_response(response, img_a_path, img_b_path)
-
-    def _parse_crop_response(self, response, img_a_path, img_b_path):
-        """Parse crop suggestion from model response."""
-        import re
-        # Try to find JSON in response
-        json_match = re.search(r'\{[^}]+\}', response)
-        crop_a = None
-        crop_b = None
-
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                if "crop_a" in data:
-                    crop_a = self._percent_to_pixels(data["crop_a"], img_a_path)
-                if "crop_b" in data:
-                    crop_b = self._percent_to_pixels(data["crop_b"], img_b_path)
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        return crop_a, crop_b, response
-
-    def _percent_to_pixels(self, crop_pct, img_path):
-        """Convert percentage crop to pixel coordinates."""
-        img = Image.open(img_path)
-        w, h = img.size
-        if len(crop_pct) == 4:
-            x_pct, y_pct, w_pct, h_pct = crop_pct
-            x = int(x_pct / 100.0 * w)
-            y = int(y_pct / 100.0 * h)
-            cw = int(w_pct / 100.0 * w)
-            ch = int(h_pct / 100.0 * h)
-            return (x, y, cw, ch)
+def _as_k(value):
+    if value is None:
         return None
+    arr = np.array(value, dtype=np.float64)
+    if arr.size == 0 or not np.isfinite(arr).all():
+        return None
+    return arr.reshape(3, 3)
+
+
+def _origin_to_xywh(origin_xy, crop_size):
+    if not origin_xy or not crop_size:
+        return None
+    x, y = int(origin_xy[0]), int(origin_xy[1])
+    w, h = int(crop_size[0]), int(crop_size[1])
+    return (x, y, w, h)
+
+
+def _crop_boxes_from_episode(episode):
+    crop_a = crop_b = None
+    for result in episode.results or []:
+        blobs = [result]
+        if isinstance(result.get("crop"), dict):
+            blobs.append(result["crop"])
+        for blob in blobs:
+            origin = blob.get("origin_xy")
+            size = blob.get("crop_size") or blob.get("size")
+            box = _origin_to_xywh(origin, size)
+            cid = str(blob.get("cropped_image_id") or blob.get("crop_id") or "")
+            if box is None:
+                continue
+            if "img_b" in cid:
+                crop_b = box
+            else:
+                crop_a = box
+    return crop_a, crop_b
+
+
+def _match_dict_for_viz(match_result, fallback=None):
+    if match_result and "mkpts_a" in match_result:
+        return match_result
+    if match_result and "keypoints_a" in match_result:
+        mk_a = np.asarray(match_result["keypoints_a"])
+        mk_b = np.asarray(match_result["keypoints_b"])
+        return {
+            "mkpts_a": mk_a,
+            "mkpts_b": mk_b,
+            "confidence": np.ones(len(mk_a)),
+            "img_a_size": match_result.get("img_a_size", (1, 1)),
+            "img_b_size": match_result.get("img_b_size", (1, 1)),
+            "n_matches": len(mk_a),
+        }
+    return fallback
+
+
+def _magsac_mask(mkpts_a, mkpts_b):
+    if len(mkpts_a) < 5:
+        return np.ones(len(mkpts_a), dtype=bool)
+    _, mask = cv2.findFundamentalMat(
+        mkpts_a.astype(np.float64), mkpts_b.astype(np.float64),
+        cv2.USAC_MAGSAC, 4.0, 0.999,
+    )
+    return mask.ravel().astype(bool) if mask is not None else np.ones(len(mkpts_a), dtype=bool)
+
+
+def _pose_auc(pred_pose, gt_R, gt_t):
+    if not pred_pose:
+        return 0.0
+    from agentic_sfm.rewards.pose_rewards import compute_pose_error, pose_auc_score
+
+    return pose_auc_score(compute_pose_error(
+        np.array(pred_pose["R"]), np.array(pred_pose["t"]), gt_R, gt_t,
+    ))
 
 
 # ── Main evaluation ──────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="Real MegaDepth eval with tool-call agent")
+    parser.add_argument("--tool-server-url", type=str, default="http://localhost:8765")
+    parser.add_argument("--max-pairs", type=int, default=MAX_PAIRS)
+    args = parser.parse_args()
+
     with open(DATA_PATH) as f:
         all_pairs = json.load(f)
 
-    # Select subset: 3 per difficulty
     selected = []
+    per_diff = max(1, args.max_pairs // 4)
     for diff in ["easy", "medium", "hard", "extreme"]:
         diff_pairs = [p for p in all_pairs if p["difficulty"] == diff]
-        selected.extend(diff_pairs[:3])
+        selected.extend(diff_pairs[:per_diff])
 
-    print(f"Evaluating {len(selected)} pairs ({3} per difficulty)")
+    print(f"Evaluating {len(selected)} pairs ({per_diff} per difficulty)")
 
-    # Initialize LoFTR
     print("Loading LoFTR matcher...")
     matcher = LoFTRMatcher(device=DEVICE)
 
-    # Initialize agent
-    print("Loading Qwen3-VL-8B agent...")
-    agent = SimpleAgent(device=DEVICE)
+    from agentic_sfm.agent.policy import AgenticSfMAgent
+    from agentic_sfm.tools.client import ToolClient
+
+    print("Loading Qwen3-VL-2B-Instruct agent (training tool-call schema)...")
+    agent = AgenticSfMAgent(device=DEVICE, do_sample=True, temperature=1.0)
+
+    tool_client = None
+    try:
+        remote = ToolClient(args.tool_server_url)
+        remote.health()
+        tool_client = remote
+        print(f"Using tool server at {args.tool_server_url}")
+    except Exception:
+        tmp = Path(tempfile.mkdtemp(prefix="asfm_eval_"))
+        tool_client = LocalToolClient(matcher, tmp)
+        print(f"No tool server; using in-process LoFTR at {tmp}")
 
     results = []
 
@@ -360,74 +421,78 @@ def main():
         img_b_path = p["image_b"]
         gt_R = np.array(p["gt_R"])
         gt_t = np.array(p["gt_t"])
-        K_a = np.array(p["K_a"])
-        K_b = np.array(p["K_b"])
+        K_a = _as_k(p.get("K_a"))
+        K_b = _as_k(p.get("K_b"))
+        K_a_list = K_a.tolist() if K_a is not None else None
+        K_b_list = K_b.tolist() if K_b is not None else None
 
-        # ── Direct LoFTR (baseline) ──
         print("  Direct LoFTR matching...")
         direct_result = matcher.match(img_a_path, img_b_path)
-        direct_inliers, direct_ratio = count_inliers(direct_result, K_a, K_b, gt_R, gt_t)
+        direct_inliers, direct_ratio, direct_pose = count_inliers(
+            direct_result, K_a, K_b, gt_R, gt_t,
+        )
+        direct_mask = _magsac_mask(direct_result["mkpts_a"], direct_result["mkpts_b"])
+        print(
+            f"  Direct: {direct_result['n_matches']} matches, "
+            f"{direct_inliers} inliers ({direct_ratio:.1%})"
+        )
 
-        # RANSAC mask for visualization
-        mkpts_a = direct_result["mkpts_a"]
-        mkpts_b = direct_result["mkpts_b"]
-        if len(mkpts_a) >= 5:
-            _, direct_mask = cv2.findFundamentalMat(
-                mkpts_a.astype(np.float64), mkpts_b.astype(np.float64),
-                cv2.USAC_MAGSAC, 4.0, 0.999
-            )
-            direct_mask = direct_mask.ravel().astype(bool) if direct_mask is not None else np.ones(len(mkpts_a), dtype=bool)
-        else:
-            direct_mask = np.ones(len(mkpts_a), dtype=bool)
-
-        print(f"  Direct: {direct_result['n_matches']} matches, {direct_inliers} inliers ({direct_ratio:.1%})")
-
-        # Visualize direct matching
         viz_path = VIZ_DIR / f"{pair_id}_direct.png"
         visualize_matches(
             img_a_path, img_b_path, direct_result,
             inlier_mask=direct_mask,
             output_path=viz_path,
-            title=f"Direct LoFTR | {diff}"
+            title=f"Direct LoFTR | {diff}",
         )
 
-        # ── Agent + LoFTR ──
-        print("  Agent crop decision...")
-        crop_a, crop_b, agent_response = agent.decide_crop(img_a_path, img_b_path)
-
-        if crop_a or crop_b:
-            print(f"  Crop A: {crop_a}")
-            print(f"  Crop B: {crop_b}")
-            agent_result = matcher.match(img_a_path, img_b_path, crop_a=crop_a, crop_b=crop_b)
-        else:
-            print("  No crop suggested, using full images")
-            agent_result = direct_result
-
-        agent_inliers, agent_ratio = count_inliers(agent_result, K_a, K_b, gt_R, gt_t)
-
-        # RANSAC mask for agent
-        mkpts_a2 = agent_result["mkpts_a"]
-        mkpts_b2 = agent_result["mkpts_b"]
-        if len(mkpts_a2) >= 5:
-            _, agent_mask = cv2.findFundamentalMat(
-                mkpts_a2.astype(np.float64), mkpts_b2.astype(np.float64),
-                cv2.USAC_MAGSAC, 4.0, 0.999
+        print("  Agent episode (crop/match/done)...")
+        tool_client.register_image("img_a", img_a_path)
+        tool_client.register_image("img_b", img_b_path)
+        episode = agent.run_episode(
+            pair_id=pair_id,
+            image_a_path=img_a_path,
+            image_b_path=img_b_path,
+            tool_client=tool_client,
+            gt_pose={"R": gt_R.tolist(), "t": gt_t.tolist()},
+            K_a=K_a_list,
+            K_b=K_b_list,
+        )
+        agent_match = episode.final_match or {}
+        agent_result = _match_dict_for_viz(agent_match, fallback=direct_result)
+        agent_inliers = int(agent_match.get("num_inliers") or 0)
+        agent_ratio = float(agent_match.get("inlier_ratio") or 0.0)
+        if agent_inliers == 0 and "mkpts_a" in agent_result:
+            agent_inliers, agent_ratio, pose = count_inliers(
+                agent_result, K_a, K_b, gt_R, gt_t,
             )
-            agent_mask = agent_mask.ravel().astype(bool) if agent_mask is not None else np.ones(len(mkpts_a2), dtype=bool)
+            if pose is not None:
+                agent_match = {**agent_match, "pose": pose, "num_inliers": agent_inliers, "inlier_ratio": agent_ratio}
+
+        crop_a, crop_b = _crop_boxes_from_episode(episode)
+        mk_a = np.asarray(agent_result.get("mkpts_a", []))
+        mk_b = np.asarray(agent_result.get("mkpts_b", []))
+        agent_mask = _magsac_mask(mk_a, mk_b) if len(mk_a) else None
+        n_matches = int(agent_match.get("num_matches") or agent_result.get("n_matches") or len(mk_a))
+        print(f"  Agent: {n_matches} matches, {agent_inliers} inliers ({agent_ratio:.1%})")
+        if crop_a or crop_b:
+            print(f"  Crop A: {crop_a}  Crop B: {crop_b}")
         else:
-            agent_mask = np.ones(len(mkpts_a2), dtype=bool)
+            print("  No crop recorded (full-frame match or parse miss)")
 
-        print(f"  Agent: {agent_result['n_matches']} matches, {agent_inliers} inliers ({agent_ratio:.1%})")
-
-        # Visualize agent matching
         viz_path_agent = VIZ_DIR / f"{pair_id}_agent.png"
         visualize_matches(
             img_a_path, img_b_path, agent_result,
             inlier_mask=agent_mask,
             output_path=viz_path_agent,
             title=f"Agent+LoFTR | {diff}",
-            crop_a=crop_a, crop_b=crop_b
+            crop_a=crop_a, crop_b=crop_b,
         )
+
+        agent_response = ""
+        if episode.tool_calls:
+            agent_response = json.dumps(
+                [{"tool": tc.tool, "args": tc.args} for tc in episode.tool_calls]
+            )
 
         results.append({
             "pair_id": pair_id,
@@ -437,29 +502,35 @@ def main():
             "direct_matches": direct_result["n_matches"],
             "direct_inliers": direct_inliers,
             "direct_inlier_ratio": direct_ratio,
-            "agent_matches": agent_result["n_matches"],
+            "direct_pose_auc": _pose_auc(direct_pose, gt_R, gt_t),
+            "agent_matches": n_matches,
             "agent_inliers": agent_inliers,
             "agent_inlier_ratio": agent_ratio,
+            "agent_pose_auc": _pose_auc(agent_match.get("pose"), gt_R, gt_t),
+            "agent_reward": episode.reward,
             "crop_a": crop_a,
             "crop_b": crop_b,
             "agent_response": agent_response[:500],
         })
 
-    # Save results
     results_path = OUTPUT_DIR / "real_results.json"
     with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=str)
     print(f"\nResults saved to {results_path}")
     print(f"Visualizations saved to {VIZ_DIR}")
 
-    # Print summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     for r in results:
-        print(f"{r['pair_id']:20s} | {r['difficulty']:8s} | "
-              f"Direct: {r['direct_inliers']:3d}/{r['direct_matches']:3d} ({r['direct_inlier_ratio']:.1%}) | "
-              f"Agent: {r['agent_inliers']:3d}/{r['agent_matches']:3d} ({r['agent_inlier_ratio']:.1%})")
+        print(
+            f"{r['pair_id']:20s} | {r['difficulty']:8s} | "
+            f"Direct: {r['direct_inliers']:3d}/{r['direct_matches']:3d} "
+            f"({r['direct_inlier_ratio']:.1%} auc={r['direct_pose_auc']:.2f}) | "
+            f"Agent: {r['agent_inliers']:3d}/{r['agent_matches']:3d} "
+            f"({r['agent_inlier_ratio']:.1%} auc={r['agent_pose_auc']:.2f} "
+            f"R={r['agent_reward']:.3f})"
+        )
 
 
 if __name__ == "__main__":

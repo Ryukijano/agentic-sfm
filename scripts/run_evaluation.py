@@ -65,7 +65,13 @@ def evaluate_direct_matching(
         tool_client.register_image("img_b", pair.image_b)
 
         try:
-            match_result = tool_client.match("img_a", "img_b", matcher)
+            match_result = tool_client.match(
+                "img_a",
+                "img_b",
+                matcher,
+                K_a=pair.K_a.tolist() if pair.K_a is not None else None,
+                K_b=pair.K_b.tolist() if pair.K_b is not None else None,
+            )
             gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
 
             if gt_pose and match_result.get("pose"):
@@ -115,6 +121,8 @@ def evaluate_agent(
             image_b_path=pair.image_b,
             tool_client=tool_client,
             gt_pose=gt_pose,
+            K_a=pair.K_a.tolist() if pair.K_a is not None else None,
+            K_b=pair.K_b.tolist() if pair.K_b is not None else None,
         )
 
         components = ep.reward_components
@@ -235,6 +243,7 @@ def main():
             invalid_penalty=config.get("reward", {}).get("invalid_penalty", 0.2),
             reward_schedule="static",
             reward_warmup_steps=0,
+            matcher=config.get("data", {}).get("matcher", "loftr"),
         )
 
         result = evaluate_agent(dataset, rollout_agent, tool_client, args.max_pairs)

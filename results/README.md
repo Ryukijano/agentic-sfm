@@ -25,7 +25,7 @@ results/
 | Direct MASt3R | 12.4 | 0.109 | 0.017 |
 | Zero-shot agent | 8.9 | 0.081 | 0.017 |
 
-**Takeaway:** Stock Qwen3-VL zero-shot cropping does not yet beat direct matching on hard pairs — motivating Phase 1 GRPO training.
+**Takeaway:** Stock Qwen3-VL-2B-Instruct / prior Qwen3-VL zero-shot cropping does not yet beat direct matching on hard pairs — motivating Phase 1 GRPO training.
 
 ## Real MegaDepth eval (`phase0_real/real_results.json`)
 

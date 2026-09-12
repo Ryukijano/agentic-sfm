@@ -1,0 +1,63 @@
+# Pilot GRPO: 5 epochs, medium-only, after oracle SFT warmup.
+# No zero-shot — load SFT adapter from outputs/sft/checkpoints/epoch_5.
+
+model:
+  name: "Qwen/Qwen3-VL-2B-Instruct"
+  max_new_tokens: 512
+  sft_adapter: "outputs/sft/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  group_size: 4
+  max_tool_calls: 10
+  temperature: 1.0
+  top_p: 0.95
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 10
+
+reward:
+  pose_weight: 1.0
+  inlier_weight: 0.1
+  tool_cost: 0.02
+  format_weight: 0.1
+  invalid_penalty: 0.2
+
+curriculum:
+  enabled: true
+  stages:
+    - {epochs: 5, difficulties: ["medium"]}
+
+training:
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 20
+  total_epochs: 5
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  save_freq: 1
+  eval_freq: 1
+  log_freq: 1
+
+rollout:
+  batch_size: 2
+
+data:
+  train_pairs: "data/hard_pairs_train.json"
+  val_pairs: "data/hard_pairs_val.json"
+  matcher: "loftr"
+
+output:
+  checkpoint_dir: "outputs/phase1_pilot/checkpoints"
+  results_dir: "outputs/phase1_pilot"
+  log_dir: "logs/phase1_pilot"
+  wandb_project: "agentic-sfm"
+  wandb_run_name: "phase1-grpo-pilot-sft"
+  wandb_enabled: false

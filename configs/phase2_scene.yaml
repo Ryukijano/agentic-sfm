@@ -2,11 +2,11 @@
 # Scene-level episodes with reconstruction-quality rewards
 
 model:
-  name: "Qwen/Qwen3-VL-4B-Instruct"
+  name: "Qwen/Qwen3-VL-2B-Instruct"
   lora:
     rank: 32
     alpha: 64
-    dropout: 0.05
+    dropout: 0.0
     target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
   checkpoint: "outputs/phase1/checkpoints/best"  # resume from Phase 1
 

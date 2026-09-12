@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from agentic_sfm.constants import DEFAULT_MATCHER
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,12 +44,25 @@ class ToolClient:
         return r.json()
 
     def match(
-        self, image_a: str, image_b: str, matcher: str = "mast3r", max_size: int = 512
+        self,
+        image_a: str,
+        image_b: str,
+        matcher: str = DEFAULT_MATCHER,
+        max_size: int = 512,
+        K_a: list | None = None,
+        K_b: list | None = None,
     ) -> dict[str, Any]:
-        r = self.client.post(
-            "/match",
-            json={"image_a": image_a, "image_b": image_b, "matcher": matcher, "max_size": max_size},
-        )
+        payload: dict[str, Any] = {
+            "image_a": image_a,
+            "image_b": image_b,
+            "matcher": matcher,
+            "max_size": max_size,
+        }
+        if K_a is not None:
+            payload["K_a"] = K_a
+        if K_b is not None:
+            payload["K_b"] = K_b
+        r = self.client.post("/match", json=payload)
         r.raise_for_status()
         return r.json()
 

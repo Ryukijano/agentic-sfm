@@ -1,0 +1,25 @@
+# Hybrid AIRE stack for agentic-sfm.
+#
+# Outer env: conda (Miniforge) at /scratch/kcwp264/.conda_envs/agentic-sfm
+# Inner GPU wheels: pip/uv inside that prefix (vLLM does not ship on conda-forge).
+# Do not replace this with a standalone .venv — Slurm jobs hardcode the conda prefix.
+#
+# Create once on a GPU node, then upgrade policy deps with:
+#   sbatch jobs/upgrade_qwen35_stack.slurm
+
+name: agentic-sfm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch>=2.8
+      - torchvision>=0.20
+      - transformers>=5.0
+      - vllm>=0.17
+      - peft>=0.13
+      - accelerate>=1.0
+      - kornia>=0.7
+      - opencv-python-headless>=4.10
+      - pycolmap>=0.6

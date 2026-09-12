@@ -16,11 +16,18 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import sys
+
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 import cv2
 import numpy as np
@@ -49,8 +56,10 @@ class RegisterRequest(BaseModel):
 class MatchRequest(BaseModel):
     image_a: str
     image_b: str
-    matcher: str = "mast3r"
+    matcher: str = "loftr"
     max_size: int = 512
+    K_a: list[float] | list[list[float]] | None = None
+    K_b: list[float] | list[list[float]] | None = None
 
 
 class DoppelgangerRequest(BaseModel):
@@ -79,6 +88,55 @@ class InspectRequest(BaseModel):
 
 _IMAGE_STORE: dict[str, str | np.ndarray] = {}
 _RECON_STORE: dict[str, dict[str, Any]] = {}
+_CROP_META: dict[str, dict[str, Any]] = {}
+
+# Matcher weights are large; instantiate once per process (GRPO calls match every step).
+_LOFTR = None
+_MAST3R = None
+_LIGHTGLUE = None
+_SUPERPOINT = None
+
+
+def _torch_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _get_loftr():
+    global _LOFTR
+    if _LOFTR is not None:
+        return _LOFTR
+    import kornia.feature as KF
+
+    device = _torch_device()
+    _LOFTR = KF.LoFTR(pretrained="outdoor").to(device).eval()
+    logger.info("Cached LoFTR on %s", device)
+    return _LOFTR
+
+
+def _get_mast3r():
+    global _MAST3R
+    if _MAST3R is not None:
+        return _MAST3R
+    from mast3r.model import AsymmetricMASt3R
+
+    device = _torch_device()
+    model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
+    _MAST3R = AsymmetricMASt3R.from_pretrained(model_name).to(device).eval()
+    logger.info("Cached MASt3R on %s", device)
+    return _MAST3R
+
+
+def _get_lightglue():
+    global _LIGHTGLUE, _SUPERPOINT
+    if _LIGHTGLUE is not None and _SUPERPOINT is not None:
+        return _LIGHTGLUE, _SUPERPOINT
+    import kornia.feature as KF
+
+    device = _torch_device()
+    _LIGHTGLUE = KF.LightGlueMatcher("superpoint").to(device).eval()
+    _SUPERPOINT = KF.SuperPoint().to(device).eval()
+    logger.info("Cached LightGlue + SuperPoint on %s", device)
+    return _LIGHTGLUE, _SUPERPOINT
 
 
 def register_image(image_id: str, path_or_array: str | np.ndarray) -> None:
@@ -123,34 +181,63 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
     cropped = img[py1:py2, px1:px2]
     new_id = f"{image_id}_crop_{uuid.uuid4().hex[:8]}"
     _IMAGE_STORE[new_id] = cropped
+    parent = _CROP_META.get(image_id, {})
+    ox = int(parent.get("origin_xy", [0, 0])[0]) + px1
+    oy = int(parent.get("origin_xy", [0, 0])[1]) + py1
+    _CROP_META[new_id] = {"origin_xy": [ox, oy]}
+    crop_path = str(Path(tempfile.gettempdir()) / f"{new_id}.jpg")
+    try:
+        Image.fromarray(cropped).save(crop_path)
+    except Exception:
+        crop_path = None
     return {
         "cropped_image_id": new_id,
+        "crop_id": new_id,
+        "origin_xy": [ox, oy],
         "crop_size": [px2 - px1, py2 - py1],
+        "path": crop_path,
         "image_b64": image_to_base64(cropped, max_size=512),
     }
 
 
 def tool_match(
-    image_a: str, image_b: str, matcher: str = "mast3r", max_size: int = 512
+    image_a: str,
+    image_b: str,
+    matcher: str = "loftr",
+    max_size: int = 512,
+    K_a: list | None = None,
+    K_b: list | None = None,
 ) -> dict[str, Any]:
     """Match two images and estimate relative pose."""
+    from agentic_sfm.geometry import k_for_image
+
     img_a = get_image(image_a)
     img_b = get_image(image_b)
+    h_a, w_a = img_a.shape[:2]
+    h_b, w_b = img_b.shape[:2]
+    Ka = k_for_image(K_a, _CROP_META.get(image_a, {}).get("origin_xy"), (w_a, h_a))
+    Kb = k_for_image(K_b, _CROP_META.get(image_b, {}).get("origin_xy"), (w_b, h_b))
+    kwargs = {"K_a": Ka, "K_b": Kb}
 
     if matcher == "loftr":
-        return _match_loftr(img_a, img_b, max_size)
+        return _match_loftr(img_a, img_b, max_size, **kwargs)
     elif matcher == "lightglue":
-        return _match_lightglue(img_a, img_b, max_size)
+        return _match_lightglue(img_a, img_b, max_size, **kwargs)
     else:
-        return _match_mast3r(img_a, img_b, max_size)
+        return _match_mast3r(img_a, img_b, max_size, **kwargs)
 
 
-def _match_loftr(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[str, Any]:
+def _match_loftr(
+    img_a: np.ndarray, img_b: np.ndarray, max_size: int,
+    K_a=None, K_b=None,
+) -> dict[str, Any]:
     """Match using LoFTR (kornia)."""
     try:
-        import kornia.feature as KF
+        matcher = _get_loftr()
     except ImportError:
         return {"error": "kornia not available", "matcher": "loftr"}
+    except Exception as e:
+        return {"error": f"LoFTR load failed: {e}", "matcher": "loftr"}
 
     h_a, w_a = img_a.shape[:2]
     h_b, w_b = img_b.shape[:2]
@@ -169,10 +256,8 @@ def _match_loftr(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[st
     t_a = torch.from_numpy(img_a_r).float().unsqueeze(0).unsqueeze(0) / 255.0
     t_b = torch.from_numpy(img_b_r).float().unsqueeze(0).unsqueeze(0) / 255.0
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _torch_device()
     t_a, t_b = t_a.to(device), t_b.to(device)
-
-    matcher = KF.LoFTR(pretrained="outdoor").to(device).eval()
 
     with torch.no_grad():
         input_dict = {"image0": t_a, "image1": t_b}
@@ -182,12 +267,13 @@ def _match_loftr(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[st
     mkpts_b = correspondences["keypoints1"].cpu().numpy()
     confidence = correspondences["confidence"].cpu().numpy()
 
-    # Scale back
+    # Scale back to original pixels
     mkpts_a = mkpts_a / scale_a
     mkpts_b = mkpts_b / scale_b
 
-    # Estimate pose with RANSAC
-    pose_result = _estimate_pose_ransac(mkpts_a, mkpts_b, (w_a, h_a), (w_b, h_b))
+    pose_result = _estimate_pose_ransac(
+        mkpts_a, mkpts_b, (w_a, h_a), (w_b, h_b), K_a=K_a, K_b=K_b
+    )
 
     return {
         "matcher": "loftr",
@@ -200,26 +286,24 @@ def _match_loftr(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[st
     }
 
 
-def _match_mast3r(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[str, Any]:
+def _match_mast3r(
+    img_a: np.ndarray, img_b: np.ndarray, max_size: int,
+    K_a=None, K_b=None,
+) -> dict[str, Any]:
     """Match using MASt3R."""
     try:
-        from mast3r.model import AsymmetricMASt3R
         from mast3r.fast_nn import fast_reciprocal_NNs
         from dust3r.inference import inference
         from dust3r.utils.image import load_images
+        model = _get_mast3r()
     except ImportError:
-        # Fallback to LoFTR
         logger.warning("MASt3R not available, falling back to LoFTR")
-        return _match_loftr(img_a, img_b, max_size)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-
-    try:
-        model = AsymmetricMASt3R.from_pretrained(model_name).to(device).eval()
+        return _match_loftr(img_a, img_b, max_size, K_a=K_a, K_b=K_b)
     except Exception:
         logger.warning("Cannot load MASt3R, falling back to LoFTR")
-        return _match_loftr(img_a, img_b, max_size)
+        return _match_loftr(img_a, img_b, max_size, K_a=K_a, K_b=K_b)
+
+    device = _torch_device()
 
     # Save to temp files for dust3r loader
     import tempfile
@@ -253,12 +337,19 @@ def _match_mast3r(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[s
             (matches_im1[:, 0] >= 3) & (matches_im1[:, 0] < int(W1) - 3) &
             (matches_im1[:, 1] >= 3) & (matches_im1[:, 1] < int(H1) - 3)
         )
-        matches_im0 = matches_im0[valid]
-        matches_im1 = matches_im1[valid]
+        matches_im0 = matches_im0[valid].astype(np.float64)
+        matches_im1 = matches_im1[valid].astype(np.float64)
+        # dust3r resizes to max_size; map keypoints back to original pixels for GT K.
+        h_orig, w_orig = img_a.shape[:2]
+        h_orig_b, w_orig_b = img_b.shape[:2]
+        matches_im0[:, 0] *= w_orig / max(float(W0), 1.0)
+        matches_im0[:, 1] *= h_orig / max(float(H0), 1.0)
+        matches_im1[:, 0] *= w_orig_b / max(float(W1), 1.0)
+        matches_im1[:, 1] *= h_orig_b / max(float(H1), 1.0)
 
         pose_result = _estimate_pose_ransac(
-            matches_im0.astype(np.float64), matches_im1.astype(np.float64),
-            (W0, H0), (W1, H1),
+            matches_im0, matches_im1, (w_orig, h_orig), (w_orig_b, h_orig_b),
+            K_a=K_a, K_b=K_b,
         )
 
         return {
@@ -275,18 +366,19 @@ def _match_mast3r(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[s
         os.unlink(tmp_b)
 
 
-def _match_lightglue(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[str, Any]:
+def _match_lightglue(
+    img_a: np.ndarray, img_b: np.ndarray, max_size: int,
+    K_a=None, K_b=None,
+) -> dict[str, Any]:
     """Match using LightGlue (kornia)."""
     try:
-        import kornia.feature as KF
+        lg, sp = _get_lightglue()
     except ImportError:
         return {"error": "kornia not available", "matcher": "lightglue"}
+    except Exception as e:
+        return {"error": f"LightGlue load failed: {e}", "matcher": "lightglue"}
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Detect + describe with SuperPoint
-    lg = KF.LightGlueMatcher("superpoint").to(device).eval()
-    sp = KF.SuperPoint().to(device).eval()
+    device = _torch_device()
 
     t_a = _to_tensor(img_a, max_size).to(device)
     t_b = _to_tensor(img_b, max_size).to(device)
@@ -306,7 +398,9 @@ def _match_lightglue(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dic
     mkpts_a = mkpts_a * scale_a
     mkpts_b = mkpts_b * scale_b
 
-    pose_result = _estimate_pose_ransac(mkpts_a, mkpts_b, (w_a, h_a), (w_b, h_b))
+    pose_result = _estimate_pose_ransac(
+        mkpts_a, mkpts_b, (w_a, h_a), (w_b, h_b), K_a=K_a, K_b=K_b
+    )
 
     return {
         "matcher": "lightglue",
@@ -327,38 +421,17 @@ def _to_tensor(img: np.ndarray, max_size: int) -> torch.Tensor:
 
 
 def _estimate_pose_ransac(
-    pts_a: np.ndarray, pts_b: np.ndarray, size_a: tuple, size_b: tuple
+    pts_a: np.ndarray,
+    pts_b: np.ndarray,
+    size_a: tuple,
+    size_b: tuple,
+    K_a=None,
+    K_b=None,
 ) -> dict[str, Any]:
-    """Estimate relative pose via essential matrix + RANSAC."""
-    if len(pts_a) < 8:
-        return {"num_inliers": 0, "inlier_ratio": 0.0, "pose": None}
+    """Estimate relative pose via MAGSAC essential matrix + GT/guessed K."""
+    from agentic_sfm.geometry import estimate_relative_pose
 
-    # Default intrinsics (normalized)
-    K = np.array([
-        [max(size_a) * 0.7, 0, size_a[0] / 2],
-        [0, max(size_a) * 0.7, size_a[1] / 2],
-        [0, 0, 1],
-    ])
-
-    E, mask = cv2.findEssentialMat(
-        pts_a, pts_b, K, method=cv2.RANSAC, threshold=1.0, prob=0.999
-    )
-    if E is None:
-        return {"num_inliers": 0, "inlier_ratio": 0.0, "pose": None}
-
-    num_inliers = int(mask.sum())
-    inlier_ratio = num_inliers / len(pts_a)
-
-    _, R, t, _ = cv2.recoverPose(E, pts_a, pts_b, K, mask=mask)
-
-    return {
-        "num_inliers": num_inliers,
-        "inlier_ratio": inlier_ratio,
-        "pose": {
-            "R": R.tolist(),
-            "t": t.flatten().tolist(),
-        },
-    }
+    return estimate_relative_pose(pts_a, pts_b, size_a, size_b, K_a=K_a, K_b=K_b)
 
 
 def tool_doppelganger_check(image_a: str, image_b: str) -> dict[str, Any]:
@@ -472,7 +545,7 @@ def crop(req: CropRequest):
 
 @app.post("/match")
 def match(req: MatchRequest):
-    return tool_match(req.image_a, req.image_b, req.matcher, req.max_size)
+    return tool_match(req.image_a, req.image_b, req.matcher, req.max_size, req.K_a, req.K_b)
 
 
 @app.post("/doppelganger_check")

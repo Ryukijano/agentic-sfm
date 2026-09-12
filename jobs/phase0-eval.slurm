@@ -4,7 +4,7 @@
 # 3x NVIDIA L40S (Ada, 48 GB) on a single AIRE GPU node.
 #
 # GPU layout:
-#   GPU 0: Qwen3-VL-4B inference
+#   GPU 0: Qwen3-VL-2B-Instruct inference
 #   GPU 1: LoFTR/MASt3R matcher (tool server)
 #   GPU 2: reserved (Phase 1 will use for training)
 #
@@ -28,6 +28,7 @@ set -eo pipefail
 # ---------------------------------------------------------------------------
 # 1. Environment
 # ---------------------------------------------------------------------------
+source /scratch/kcwp264/.aire_scratch_env.sh
 module load miniforge/24.7.1 || true
 module load cuda/12.6.2 || true
 

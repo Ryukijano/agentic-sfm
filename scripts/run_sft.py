@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Phase 1c: SFT (Supervised Fine-Tuning) warmup for agentic SfM.
 
-LoRA fine-tuning of Qwen3-VL-8B on curated successful trajectories.
+LoRA fine-tuning of Qwen3-VL-2B-Instruct on curated successful trajectories.
 Trains with cross-entropy loss on assistant tokens only.
 
 Usage:
@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from agentic_sfm.agent.policy import apply_policy_chat_template, load_policy_processor_and_model
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -47,8 +49,36 @@ def load_sft_data(path: str) -> list[dict]:
     return examples
 
 
+def _count_image_slots(messages: list[dict]) -> int:
+    n = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            n += sum(1 for item in content if item.get("type") == "image")
+    return n
+
+
+def _load_example_images(ex: dict) -> list:
+    """Pair images plus any crop frames stored on the SFT example."""
+    images = [
+        Image.open(ex["image_a"]).convert("RGB"),
+        Image.open(ex["image_b"]).convert("RGB"),
+    ]
+    for path in ex.get("crop_image_paths") or []:
+        try:
+            images.append(Image.open(path).convert("RGB"))
+        except Exception:
+            continue
+    n_slots = _count_image_slots(ex.get("messages") or [])
+    if n_slots > 0:
+        while len(images) < n_slots:
+            images.append(images[-1])
+        images = images[:n_slots]
+    return images
+
+
 class SFTTrainer:
-    """Supervised fine-tuning with LoRA on Qwen3-VL."""
+    """Supervised fine-tuning with LoRA on Qwen3-VL-2B-Instruct."""
 
     def __init__(self, config: dict, output_dir: str = "outputs/sft"):
         self.config = config
@@ -94,11 +124,11 @@ class SFTTrainer:
             return
 
         from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        from agentic_sfm.constants import DEFAULT_LORA_TARGET_MODULES
 
         logger.info(f"Loading {self.model_name} on {self.device}...")
-        self._processor = AutoProcessor.from_pretrained(self.model_name)
-        self._model = AutoModelForImageTextToText.from_pretrained(
+        self._processor, self._model = load_policy_processor_and_model(
             self.model_name,
             torch_dtype=torch.bfloat16,
             device_map=self.device,
@@ -108,7 +138,7 @@ class SFTTrainer:
             r=self.lora_config["rank"],
             lora_alpha=self.lora_config["alpha"],
             lora_dropout=self.lora_config["dropout"],
-            target_modules=self.lora_config["target_modules"],
+            target_modules=self.lora_config.get("target_modules") or DEFAULT_LORA_TARGET_MODULES,
             task_type="CAUSAL_LM",
         )
         self._model = get_peft_model(self._model, lora_cfg)
@@ -123,9 +153,18 @@ class SFTTrainer:
 
     def _compute_assistant_mask(self, messages: list[dict], images: list,
                                   processor) -> list[bool]:
-        """Build boolean mask over tokenized conversation: True for assistant tokens."""
-        full_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        full_ids = processor(text=[full_text], images=images, return_tensors="pt")["input_ids"][0]
+        """Build boolean mask over tokenized conversation: True for assistant tokens.
+
+        Slice images to the prefix being tokenized so crop frames are not
+        counted before they appear in the chat (same as GRPO).
+        """
+        def _imgs_for(msgs: list[dict]) -> list | None:
+            n_slots = _count_image_slots(msgs)
+            sliced = images[: min(n_slots, len(images))]
+            return sliced or None
+
+        full_text = apply_policy_chat_template(processor, messages, tokenize=False, add_generation_prompt=False)
+        full_ids = processor(text=[full_text], images=_imgs_for(messages), return_tensors="pt")["input_ids"][0]
         n_tokens = len(full_ids)
         mask = [False] * n_tokens
 
@@ -133,16 +172,20 @@ class SFTTrainer:
             if msg.get("role") != "assistant":
                 continue
             try:
-                prefix_text = processor.apply_chat_template(
-                    messages[:k], tokenize=False, add_generation_prompt=True
+                prefix_text = apply_policy_chat_template(
+                    processor, messages[:k], tokenize=False, add_generation_prompt=True
                 )
-                prefix_ids = processor(text=[prefix_text], images=images, return_tensors="pt")["input_ids"][0]
+                prefix_ids = processor(
+                    text=[prefix_text], images=_imgs_for(messages[:k]), return_tensors="pt"
+                )["input_ids"][0]
                 start = len(prefix_ids)
 
-                through_text = processor.apply_chat_template(
-                    messages[:k+1], tokenize=False, add_generation_prompt=False
+                through_text = apply_policy_chat_template(
+                    processor, messages[:k+1], tokenize=False, add_generation_prompt=False
                 )
-                through_ids = processor(text=[through_text], images=images, return_tensors="pt")["input_ids"][0]
+                through_ids = processor(
+                    text=[through_text], images=_imgs_for(messages[:k+1]), return_tensors="pt"
+                )["input_ids"][0]
                 end = len(through_ids)
 
                 for i in range(start, min(end, n_tokens)):
@@ -165,13 +208,10 @@ class SFTTrainer:
             messages = ex["messages"]
             try:
                 # Load images
-                images = [
-                    Image.open(ex["image_a"]).convert("RGB"),
-                    Image.open(ex["image_b"]).convert("RGB"),
-                ]
+                images = _load_example_images(ex)
 
-                text = self._processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False
+                text = apply_policy_chat_template(
+                    self._processor, messages, tokenize=False, add_generation_prompt=False
                 )
                 inputs = self._processor(
                     text=[text], images=images, return_tensors="pt", padding=True
@@ -192,13 +232,9 @@ class SFTTrainer:
                 if assistant_mask.sum() == 0:
                     continue
 
-                # Cross-entropy loss on assistant tokens only
+                # Cross-entropy on assistant tokens: logps already gathered at targets.
                 masked_logps = per_token_logps[0][assistant_mask]
-                masked_targets = target_ids[0][assistant_mask]
-                loss = F.nll_loss(
-                    masked_logps.unsqueeze(0),
-                    masked_targets.unsqueeze(0),
-                )
+                loss = -masked_logps.mean()
 
                 loss = loss / self.grad_accum
                 loss.backward()
@@ -302,6 +338,10 @@ def main():
 
     config = load_config(args.config)
     os.chdir(Path(args.config).parent.parent)
+
+    from agentic_sfm.constants import assert_qwen35_runtime
+
+    assert_qwen35_runtime()
 
     sft_data_path = args.sft_data or config["data"].get("sft_data", "data/sft_train.jsonl")
 

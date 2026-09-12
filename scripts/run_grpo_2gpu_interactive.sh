@@ -45,7 +45,10 @@ sleep 2
 # Start vLLM server on GPU 0 (same settings as successful smoke test)
 echo "Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-8B-Instruct" \
+    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --enable-lora \
+    --max-loras 1 \
+    --max-lora-rank 32 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
     --max-model-len 8192 \

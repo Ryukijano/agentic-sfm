@@ -24,6 +24,8 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutp
 from verl.utils.chat_template import extract_system_prompt_and_generation
 
 from agentic_sfm.agent.policy import parse_tool_call, format_observation, ToolCall
+from agentic_sfm.constants import DEFAULT_MATCHER
+from agentic_sfm.geometry import crop_image_id, crop_pil_from_result, keep_best_match
 from agentic_sfm.rewards.pose_rewards import compute_pair_reward
 
 logger = logging.getLogger(__name__)
@@ -66,13 +68,22 @@ class AsyncToolClient:
         self,
         image_a: str,
         image_b: str,
-        matcher: str = "mast3r",
+        matcher: str = DEFAULT_MATCHER,
         max_size: int = 512,
+        K_a: list | None = None,
+        K_b: list | None = None,
     ) -> dict[str, Any]:
-        return await self._post(
-            "/match",
-            {"image_a": image_a, "image_b": image_b, "matcher": matcher, "max_size": max_size},
-        )
+        payload: dict[str, Any] = {
+            "image_a": image_a,
+            "image_b": image_b,
+            "matcher": matcher,
+            "max_size": max_size,
+        }
+        if K_a is not None:
+            payload["K_a"] = K_a
+        if K_b is not None:
+            payload["K_b"] = K_b
+        return await self._post("/match", payload)
 
     async def doppelganger_check(self, image_a: str, image_b: str) -> dict[str, Any]:
         return await self._post("/doppelganger_check", {"image_a": image_a, "image_b": image_b})
@@ -121,12 +132,16 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         **kwargs: Any,
     ) -> None:
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config)
+        # Qwen3-VL-Instruct has no thinking mode; tool-call JSON owns the budget.
+        chat_kwargs = dict(getattr(self, "apply_chat_template_kwargs", {}) or {})
+        chat_kwargs.setdefault("enable_thinking", False)
+        self.apply_chat_template_kwargs = chat_kwargs
 
         self.tool_server_url: str = kwargs.get("tool_server_url", "http://localhost:8765")
         self.max_tool_calls: int = kwargs.get("max_tool_calls", 10)
         rc = kwargs.get("reward_config") or {}
         self.reward_config: dict[str, Any] = dict(rc) if not isinstance(rc, dict) else rc
-        self.matcher: str = kwargs.get("matcher", "mast3r")
+        self.matcher: str = kwargs.get("matcher", DEFAULT_MATCHER)
         self.match_max_size: int = kwargs.get("match_max_size", 512)
 
         # Generate the "assistant" generation prompt tokens once so we can
@@ -165,6 +180,8 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         gt_pose: Optional[dict[str, Any]] = None
         if "gt_R" in extra_info and "gt_t" in extra_info:
             gt_pose = {"R": extra_info["gt_R"], "t": extra_info["gt_t"]}
+        K_a = extra_info.get("K_a")
+        K_b = extra_info.get("K_b")
 
         tool_client = AsyncToolClient(self.tool_server_url)
         try:
@@ -228,8 +245,21 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             if tc is None:
                 num_invalid_calls += 1
                 logger.warning("[%s] Turn %d produced invalid tool call: %r", pair_id, turn, assistant_text)
-                terminated = True
-                break
+                retry = 'Please call a tool using JSON format: {"tool": "...", "args": {...}}'
+                try:
+                    obs_ids = await self.loop.run_in_executor(
+                        None,
+                        lambda t=retry: self.tokenizer.encode(t, add_special_tokens=False),
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Failed to tokenise retry prompt: %s", pair_id, exc)
+                    obs_ids = []
+                all_ids += list(obs_ids)
+                response_mask += [0] * len(obs_ids)
+                if self._gen_prompt_ids:
+                    all_ids += self._gen_prompt_ids
+                    response_mask += [0] * len(self._gen_prompt_ids)
+                continue
 
             if tc.tool == "done":
                 terminated = True
@@ -237,52 +267,100 @@ class AgenticSfmAgentLoop(AgentLoopBase):
 
             # Execute the tool and store the result.
             try:
-                result = await self._execute_tool(tool_client, tc)
+                result = await self._execute_tool(tool_client, tc, K_a=K_a, K_b=K_b)
             except Exception as exc:
                 logger.warning("[%s] Tool execution failed for %s: %s", pair_id, tc.tool, exc)
                 result = {"error": str(exc)}
 
-            if tc.tool in ("match", "crop_and_match"):
-                final_match_result = result
+            if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
+                kept = keep_best_match(final_match_result or None, result)
+                final_match_result = kept or result
             elif "match_result" in result:
-                final_match_result = result["match_result"]
+                kept = keep_best_match(final_match_result or None, result["match_result"])
+                final_match_result = kept or result["match_result"]
 
             num_valid_calls += 1
 
-            # Format observation as a user message and tokenise it.  We strip
-            # the system prompt because the conversation history already
-            # contains it; we do not add a generation prompt here either.
+            # Format observation. Crops must insert image placeholder tokens so
+            # vLLM's image_data stays 1:1 with the prompt (text-only encode
+            # leaves the VLM blind to the crop).
             obs_text = format_observation(result)
-            obs_message = {"role": "user", "content": f"Observation: {obs_text}"}
-            try:
-                obs_ids = await self.loop.run_in_executor(
-                    None,
-                    lambda: self.tokenizer.encode(
-                        f"Observation: {obs_text}", add_special_tokens=False
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("[%s] Failed to tokenise observation: %s", pair_id, exc)
-                obs_ids = []
+            crop_im = crop_pil_from_result(result)
+            added_gen_prompt = False
+            if crop_im is not None:
+                images = list(images or [])
+                images.append(crop_im)
+                multi_modal_data["images"] = images
+                obs_messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": crop_im},
+                        {"type": "text", "text": f"Observation: {obs_text}"},
+                    ],
+                }]
+                try:
+                    # apply_chat_template already appends the generation prompt.
+                    obs_ids = await self.apply_chat_template(
+                        obs_messages,
+                        images=[crop_im],
+                        videos=None,
+                        audios=None,
+                        mm_processor_kwargs=mm_processor_kwargs,
+                        remove_system_prompt=False,
+                    )
+                    added_gen_prompt = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to tokenise crop observation: %s", pair_id, exc)
+                    try:
+                        obs_ids = await self.loop.run_in_executor(
+                            None,
+                            lambda t=f"Observation: {obs_text}": self.tokenizer.encode(
+                                t, add_special_tokens=False
+                            ),
+                        )
+                    except Exception:
+                        obs_ids = []
+                    added_gen_prompt = False
+            else:
+                try:
+                    obs_ids = await self.loop.run_in_executor(
+                        None,
+                        lambda t=f"Observation: {obs_text}": self.tokenizer.encode(
+                            t, add_special_tokens=False
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Failed to tokenise observation: %s", pair_id, exc)
+                    obs_ids = []
 
             all_ids += list(obs_ids)
             response_mask += [0] * len(obs_ids)
 
-            # Add the assistant generation prompt for the next turn.
-            if self._gen_prompt_ids:
+            if not added_gen_prompt and self._gen_prompt_ids:
                 all_ids += self._gen_prompt_ids
                 response_mask += [0] * len(self._gen_prompt_ids)
 
         generate_time = time.time() - start_time
 
         # Compute reward from the final match result and the ground-truth pose.
+        reward_kwargs = {
+            k: v
+            for k, v in self.reward_config.items()
+            if k in {
+                "tool_cost",
+                "inlier_weight",
+                "pose_weight",
+                "format_weight",
+                "invalid_penalty",
+            }
+        }
         reward_components = compute_pair_reward(
             final_match_result,
             gt_pose=gt_pose,
             num_tool_calls=num_tool_calls,
             num_invalid_calls=num_invalid_calls,
             num_valid_calls=num_valid_calls,
-            **self.reward_config,
+            **reward_kwargs,
         )
         total_reward = float(reward_components.get("total_reward", 0.0))
 
@@ -317,7 +395,13 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             mm_processor_kwargs=mm_processor_kwargs,
         )
 
-    async def _execute_tool(self, tool_client: AsyncToolClient, tc: ToolCall) -> dict[str, Any]:
+    async def _execute_tool(
+        self,
+        tool_client: AsyncToolClient,
+        tc: ToolCall,
+        K_a: list | None = None,
+        K_b: list | None = None,
+    ) -> dict[str, Any]:
         """Dispatch a parsed tool call to the tool server."""
         args = tc.args
 
@@ -326,7 +410,9 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             image_b = args.get("image_b", "img_b")
             matcher = args.get("matcher", self.matcher)
             max_size = args.get("max_size", self.match_max_size)
-            return await tool_client.match(image_a, image_b, matcher=matcher, max_size=max_size)
+            return await tool_client.match(
+                image_a, image_b, matcher=matcher, max_size=max_size, K_a=K_a, K_b=K_b
+            )
 
         if tc.tool == "crop":
             image_id = args.get("image_id", "img_a")
@@ -336,17 +422,22 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             return await tool_client.crop(image_id, bbox)
 
         if tc.tool == "crop_and_match":
-            # Convenience compound operation: crop img_a and then match against img_b.
-            crop_image_id = args.get("image_id", "img_a")
+            src_id = args.get("image_id", "img_a")
             bbox = args.get("bbox")
             image_b = args.get("image_b", "img_b")
             if bbox is None:
                 raise ValueError("crop_and_match requires 'bbox'")
-            crop_res = await tool_client.crop(crop_image_id, bbox)
-            cropped_id = crop_res.get("cropped_image_id", crop_image_id)
+            crop_res = await tool_client.crop(src_id, bbox)
+            cropped_id = crop_image_id(crop_res) or src_id
             matcher = args.get("matcher", self.matcher)
             max_size = args.get("max_size", self.match_max_size)
-            return await tool_client.match(cropped_id, image_b, matcher=matcher, max_size=max_size)
+            match_res = await tool_client.match(
+                cropped_id, image_b, matcher=matcher, max_size=max_size, K_a=K_a, K_b=K_b
+            )
+            match_res["crop"] = crop_res
+            if crop_image_id(crop_res):
+                match_res["cropped_image_id"] = crop_image_id(crop_res)
+            return match_res
 
         if tc.tool == "doppelganger_check":
             image_a = args.get("image_a", "img_a")

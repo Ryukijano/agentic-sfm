@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 
 from agentic_sfm.agent.policy import AgenticSfMAgent, Episode
+from agentic_sfm.constants import DEFAULT_MATCHER
 from agentic_sfm.data.hard_pairs import HardPairDataset, ImagePair
 from agentic_sfm.rewards.pose_rewards import (
     compute_pair_reward,
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 def evaluate_direct_matching(
     dataset: HardPairDataset,
     tool_client: ToolClient,
-    matcher: str = "mast3r",
+    matcher: str = DEFAULT_MATCHER,
 ) -> dict[str, Any]:
     """Baseline: direct matching without any cropping.
 
@@ -36,11 +37,17 @@ def evaluate_direct_matching(
         tool_client.register_image("img_a", pair.image_a)
         tool_client.register_image("img_b", pair.image_b)
 
-        match_result = tool_client.match("img_a", "img_b", matcher=matcher)
+        match_result = tool_client.match(
+            "img_a",
+            "img_b",
+            matcher=matcher,
+            K_a=pair.K_a.tolist() if pair.K_a is not None else None,
+            K_b=pair.K_b.tolist() if pair.K_b is not None else None,
+        )
         gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
 
         reward_components = compute_pair_reward(
-            match_result, gt_pose=gt_pose, num_tool_calls=1
+            match_result, gt_pose=gt_pose, num_tool_calls=1, num_valid_calls=1
         )
 
         results.append({
@@ -76,6 +83,8 @@ def evaluate_agent(
             image_b_path=pair.image_b,
             tool_client=tool_client,
             gt_pose=gt_pose,
+            K_a=pair.K_a.tolist() if pair.K_a is not None else None,
+            K_b=pair.K_b.tolist() if pair.K_b is not None else None,
         )
 
         results.append({

@@ -21,11 +21,15 @@ Each entry includes image paths, overlap score, difficulty bin, and ground-truth
 
 ## Difficulty bins
 
-| Bin | Overlap | Count (train) |
+Builder (`src/agentic_sfm/data/hard_pairs.py`) labels by overlap ω:
+
+| Bin | Overlap ω | Count (current train JSON) |
 |-----|---------|--------------:|
-| easy | > 0.5 | 8 |
-| medium | 0.3–0.5 | 190 |
-| hard | 0.1–0.3 | 189 |
-| extreme | < 0.1 | 11 |
+| easy | > 0.7 | 8 |
+| medium | 0.3 < ω ≤ 0.7 | 190 |
+| hard | 0.1 < ω ≤ 0.3 | 189 |
+| extreme | ω ≤ 0.1 | 11 |
+
+Existing JSON files keep the `difficulty` field stored at build time. Rebuild to re-bin.
 
 See `results/figures/agentic_sfm_hardpairs_distribution.png` for the full distribution plot.

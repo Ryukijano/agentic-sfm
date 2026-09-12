@@ -26,11 +26,10 @@ LOG_DIR="/scratch/kcwp264/logs/agentic-sfm"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
 # Environment
-export PATH="/scratch/kcwp264/.conda_envs/agentic-sfm/bin:$PATH"
-export CONDA_PREFIX="/scratch/kcwp264/.conda_envs/agentic-sfm"
+source /scratch/kcwp264/.aire_scratch_env.sh
+source "${PROJECT_ROOT}/scripts/agentic_sfm_env.sh"
 module load cuda/12.6.2 2>/dev/null || true
 export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
-export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
@@ -53,11 +52,14 @@ cd "${PROJECT_ROOT}"
 # Start vLLM server on GPU 0
 echo "Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-8B-Instruct" \
+    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --enable-lora \
+    --max-loras 1 \
+    --max-lora-rank 32 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
     --max-model-len 6144 \
-    --limit-mm-per-prompt '{"image":2,"video":0}' \
+    --limit-mm-per-prompt '{"image":6,"video":0}' \
     --mm-processor-kwargs '{"max_pixels":1003520,"min_pixels":3136}' \
     --mm-processor-cache-gb 0 \
     --trust-remote-code \
@@ -91,11 +93,8 @@ done
 
 # Start tool server on GPU 1 (shared with training — matcher uses minimal VRAM)
 echo "Starting tool server on GPU 1..."
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH="${PROJECT_ROOT}/src" python -m uvicorn \
-    agentic_sfm.tools.server:app \
-    --host 0.0.0.0 \
-    --port 8765 \
-    --workers 1 &
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH="${PROJECT_ROOT}/src" python \
+    "${PROJECT_ROOT}/tools_server/server.py" &
 TOOL_PID=$!
 
 # Wait for tool server

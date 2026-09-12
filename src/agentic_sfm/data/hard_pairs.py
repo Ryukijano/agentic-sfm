@@ -173,6 +173,69 @@ class HardPairDataset:
         return cls(pairs)
 
 
+def _maybe_call(value):
+    return value() if callable(value) else value
+
+
+def colmap_rotation_translation(image) -> tuple[np.ndarray, np.ndarray]:
+    """World-to-camera R, t from a pycolmap Image (API varies by version)."""
+    cfw = getattr(image, "cam_from_world", None)
+    if cfw is None:
+        return np.eye(3), np.zeros(3)
+
+    rot = getattr(cfw, "rotation", None)
+    trans = getattr(cfw, "translation", None)
+    if rot is not None:
+        rot = _maybe_call(rot)
+        mat = getattr(rot, "matrix", rot)
+        R = np.asarray(_maybe_call(mat), dtype=np.float64).reshape(3, 3)
+        t = np.asarray(_maybe_call(trans), dtype=np.float64).reshape(3)
+        return R, t
+
+    mat = getattr(cfw, "matrix", None)
+    if mat is not None:
+        T = np.asarray(_maybe_call(mat), dtype=np.float64)
+        return T[:3, :3].copy(), T[:3, 3].copy()
+    return np.eye(3), np.zeros(3)
+
+
+def colmap_K(recon, image) -> np.ndarray | None:
+    """3x3 intrinsics from the COLMAP camera attached to ``image``."""
+    cameras = getattr(recon, "cameras", None)
+    cam_id = getattr(image, "camera_id", None)
+    if cameras is None or cam_id is None:
+        return None
+    try:
+        cam = cameras[cam_id]
+    except Exception:
+        return None
+
+    calib = getattr(cam, "calibration_matrix", None)
+    if calib is not None:
+        try:
+            K = np.asarray(_maybe_call(calib), dtype=np.float64).reshape(3, 3)
+            if np.isfinite(K).all() and K[0, 0] > 0:
+                return K
+        except Exception:
+            pass
+
+    params = np.asarray(getattr(cam, "params", []), dtype=np.float64).reshape(-1)
+    if params.size >= 4:
+        fx, fy, cx, cy = (float(x) for x in params[:4])
+        return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    if params.size >= 3:
+        f, cx, cy = (float(x) for x in params[:3])
+        return np.array([[f, 0.0, cx], [0.0, f, cy], [0.0, 0.0, 1.0]])
+
+    w = int(getattr(cam, "width", 0) or 0)
+    h = int(getattr(cam, "height", 0) or 0)
+    if w > 0 and h > 0:
+        from agentic_sfm.geometry import camera_matrix
+
+        return camera_matrix((w, h), None)
+    return None
+
+
 def build_megadepth_pairs(
     megadepth_dir: str,
     scenes: list[str] | None = None,
@@ -230,12 +293,8 @@ def build_megadepth_pairs(
                 if overlap < min_overlap:
                     continue
 
-                # Relative pose
-                R_a = img_a.cam_from_world.rotation().matrix if hasattr(img_a.cam_from_world, 'rotation') else np.eye(3)
-                t_a = img_a.cam_from_world.translation if hasattr(img_a.cam_from_world, 'translation') else np.zeros(3)
-                R_b = img_b.cam_from_world.rotation().matrix if hasattr(img_b.cam_from_world, 'rotation') else np.eye(3)
-                t_b = img_b.cam_from_world.translation if hasattr(img_b.cam_from_world, 'translation') else np.zeros(3)
-
+                R_a, t_a = colmap_rotation_translation(img_a)
+                R_b, t_b = colmap_rotation_translation(img_b)
                 R_rel = R_b @ R_a.T
                 t_rel = t_b - R_rel @ t_a
 
@@ -245,6 +304,8 @@ def build_megadepth_pairs(
                     image_b=str(images_dir / img_b.name),
                     gt_R=R_rel,
                     gt_t=t_rel.reshape(3),
+                    K_a=colmap_K(recon, img_a),
+                    K_b=colmap_K(recon, img_b),
                     overlap_score=overlap,
                     difficulty=difficulty_bin(overlap),
                     dataset="megadepth",

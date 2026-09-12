@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1a: Collect zero-shot trajectories from stock Qwen3-VL-8B.
+"""Phase 1a: Collect zero-shot trajectories from stock Qwen3-VL-2B-Instruct.
 
 Runs the stock model (no LoRA) on all training pairs with temperature=1.0
 and group_size=N to collect diverse trajectories for SFT warmup data.
@@ -115,6 +115,7 @@ def main():
         invalid_penalty=config.get("reward", {}).get("invalid_penalty", 0.2),
         reward_schedule="static",  # no dynamic scaling during collection
         reward_warmup_steps=0,
+        matcher=config.get("data", {}).get("matcher", "loftr"),
     )
 
     # Collect trajectories
@@ -136,6 +137,8 @@ def main():
                     image_b_path=pair.image_b,
                     tool_client=tool_client,
                     gt_pose=gt_pose,
+                    K_a=pair.K_a.tolist() if pair.K_a is not None else None,
+                    K_b=pair.K_b.tolist() if pair.K_b is not None else None,
                 )
 
                 ep_dict = episode_to_dict(ep)

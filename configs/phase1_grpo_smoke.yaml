@@ -1,12 +1,12 @@
 # Smoke test config: tiny run to verify the GRPO loop doesn't crash
 model:
-  name: "Qwen/Qwen3-VL-8B-Instruct"
+  name: "Qwen/Qwen3-VL-2B-Instruct"
   max_new_tokens: 256
   lora:
     rank: 8
     alpha: 16
-    dropout: 0.05
-    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    dropout: 0.0  # GRPO: dropout would make eval/train logprob ratio noise
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 rl:
   algorithm: "grpo"

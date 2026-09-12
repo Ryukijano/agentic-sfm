@@ -5,7 +5,10 @@ from agentic_sfm.agent.policy import (
     Episode,
     ToolCall,
     SYSTEM_PROMPT,
+    apply_policy_chat_template,
+    execute_sfm_tool,
     format_observation,
+    load_policy_processor_and_model,
     parse_tool_call,
 )
 
@@ -14,6 +17,9 @@ __all__ = [
     "Episode",
     "ToolCall",
     "SYSTEM_PROMPT",
+    "apply_policy_chat_template",
+    "execute_sfm_tool",
     "format_observation",
+    "load_policy_processor_and_model",
     "parse_tool_call",
 ]

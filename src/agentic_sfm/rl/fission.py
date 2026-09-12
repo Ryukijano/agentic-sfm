@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from agentic_sfm.constants import DEFAULT_MATCHER
+
 logger = logging.getLogger(__name__)
 
 
@@ -174,6 +176,9 @@ class FissionGRPO:
                     corrective_messages,
                     gt_pose,
                     original_reward=ep.reward,
+                    seed_images=list(ep.images) if ep.images else None,
+                    K_a=getattr(ep, "K_a", None),
+                    K_b=getattr(ep, "K_b", None),
                 )
                 if recovery_ep is not None:
                     recovery_episodes.append(recovery_ep)
@@ -192,10 +197,16 @@ class FissionGRPO:
         corrective_messages: list[dict],
         gt_pose: dict | None,
         original_reward: float,
+        seed_images: list | None = None,
+        K_a=None,
+        K_b=None,
     ):
         """Run a single recovery rollout from the corrective context."""
+        import os
+
+        from agentic_sfm.agent.policy import execute_sfm_tool, format_observation, parse_tool_call
+        from agentic_sfm.geometry import keep_best_match
         from scripts.run_grpo import RolloutEpisode
-        from agentic_sfm.agent.policy import parse_tool_call, format_observation
 
         ep = RolloutEpisode(
             pair_id=pair_id,
@@ -203,24 +214,33 @@ class FissionGRPO:
             image_b=image_b,
         )
 
-        # Re-encode images
-        img_a_b64 = self.agent._encode_image(image_a)
-        img_b_b64 = self.agent._encode_image(image_b)
-        ep.images = [img_a_b64, img_b_b64]
+        if seed_images:
+            image_b64s = list(seed_images)
+        else:
+            image_b64s = [
+                self.agent._encode_image(image_a),
+                self.agent._encode_image(image_b),
+            ]
+        ep.images = image_b64s
 
-        # Start from corrective context
+        match_kwargs: dict[str, Any] = {
+            "matcher": getattr(self.agent, "matcher", DEFAULT_MATCHER)
+        }
+        if K_a is not None:
+            match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
+        if K_b is not None:
+            match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
+        ep.K_a = match_kwargs.get("K_a")
+        ep.K_b = match_kwargs.get("K_b")
+
         messages = list(corrective_messages)
         ep.messages = messages
 
-        # Register images with tool server
         self.tool_client.register_image("img_a", image_a)
         self.tool_client.register_image("img_b", image_b)
 
-        # Run recovery rollout with limited steps
-        for step in range(self.config.max_recovery_steps):
-            texts, token_lps = self.agent._vllm_chat(
-                messages, [img_a_b64, img_b_b64], n=1
-            )
+        for _step in range(self.config.max_recovery_steps):
+            texts, token_lps = self.agent._vllm_chat(messages, image_b64s, n=1)
             response = texts[0]
 
             ep.assistant_responses.append(response)
@@ -244,49 +264,50 @@ class FissionGRPO:
                 break
 
             try:
-                if tc.tool == "crop":
-                    result = self.tool_client.crop(tc.args["image_id"], tc.args["bbox"])
-                elif tc.tool == "match":
-                    result = self.tool_client.match(
-                        tc.args["image_a"], tc.args["image_b"],
-                        tc.args.get("matcher", "loftr")
-                    )
-                    ep.final_match = result
-                elif tc.tool == "doppelganger_check":
-                    result = self.tool_client.doppelganger_check(
-                        tc.args["image_a"], tc.args["image_b"]
-                    )
-                else:
-                    result = {"error": f"Unknown tool: {tc.tool}"}
+                result = execute_sfm_tool(self.tool_client, tc, match_kwargs)
             except Exception as e:
                 result = {"error": str(e)}
 
             ep.results.append(result)
+            if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
+                ep.final_match = keep_best_match(ep.final_match, result)
+
             messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": f"Observation: {format_observation(result)}"})
+            obs_text = f"Observation: {format_observation(result)}"
+            obs_content: list | str = obs_text
+            crop_b64 = result.get("image_b64") or (result.get("crop") or {}).get("image_b64")
+            crop_path = result.get("path") or (result.get("crop") or {}).get("path")
+            if not crop_b64 and crop_path and os.path.exists(crop_path):
+                crop_b64 = self.agent._encode_image(crop_path)
+            if crop_b64:
+                image_b64s.append(crop_b64)
+                ep.images = image_b64s
+                obs_content = [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
+                    {"type": "text", "text": obs_text},
+                ]
+            messages.append({"role": "user", "content": obs_content})
 
         ep.messages = messages
 
-        # Compute reward for recovery episode
-        if ep.final_match:
-            from agentic_sfm.rewards.pose_rewards import compute_pair_reward
-            num_valid = len(ep.tool_calls)
-            num_invalid = sum(
-                1 for r in ep.results
-                if "error" in r and "Unknown tool" not in str(r.get("error", ""))
-            )
-            ep.reward_components = compute_pair_reward(
-                ep.final_match, gt_pose=gt_pose,
-                num_tool_calls=len(ep.tool_calls),
-                num_invalid_calls=num_invalid,
-                num_valid_calls=num_valid,
-                tool_cost=self.agent.tool_cost,
-                inlier_weight=self.agent.inlier_weight,
-                pose_weight=self.agent.pose_weight,
-                format_weight=self.agent.format_weight,
-                invalid_penalty=self.agent.invalid_penalty,
-            )
-            ep.reward = ep.reward_components["total_reward"]
+        from agentic_sfm.rewards.pose_rewards import compute_pair_reward
+        num_valid = len(ep.tool_calls)
+        num_invalid = sum(
+            1 for r in ep.results
+            if "error" in r and "Unknown tool" not in str(r.get("error", ""))
+        )
+        ep.reward_components = compute_pair_reward(
+            ep.final_match or {}, gt_pose=gt_pose,
+            num_tool_calls=len(ep.tool_calls) + num_invalid,
+            num_invalid_calls=num_invalid,
+            num_valid_calls=num_valid,
+            tool_cost=self.agent.tool_cost,
+            inlier_weight=self.agent.inlier_weight,
+            pose_weight=self.agent.pose_weight,
+            format_weight=self.agent.format_weight,
+            invalid_penalty=self.agent.invalid_penalty,
+        )
+        ep.reward = ep.reward_components["total_reward"]
 
         # Store original reward for advantage computation
         ep.reward_components["original_reward"] = original_reward

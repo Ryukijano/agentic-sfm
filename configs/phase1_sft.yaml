@@ -1,8 +1,8 @@
 # Phase 1c: SFT warmup config for agentic matching
-# LoRA fine-tuning of Qwen3-VL-8B on curated successful trajectories
+# LoRA fine-tuning of Qwen3-VL-2B-Instruct on curated successful trajectories
 
 model:
-  name: "Qwen/Qwen3-VL-8B-Instruct"
+  name: "Qwen/Qwen3-VL-2B-Instruct"
   max_new_tokens: 512
   lora:
     rank: 32
@@ -31,5 +31,5 @@ output:
   log_dir: "logs/sft"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase1-sft-qwen3vl-8b"
+  wandb_run_name: "phase1-sft-qwen3vl-2b"
   wandb_enabled: false

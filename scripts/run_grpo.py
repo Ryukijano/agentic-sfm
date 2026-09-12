@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """Phase 1: GRPO RL training for agentic matching.
 
-Trains Qwen3-VL-8B with LoRA using GRPO (Group Relative Policy Optimization)
+Trains Qwen3-VL-2B-Instruct with LoRA using GRPO (Group Relative Policy Optimization)
 to learn crop/match tool-calling policies for hard image pairs.
 
 Architecture:
   - vLLM server (GPU 0): fast rollout sampling for episode generation
-  - Training model (GPU 1): LoRA-adapted Qwen3-VL for policy gradient updates
-  - Tool server (GPU 2): matcher inference (LoFTR/MASt3R)
+  - Training model (GPU 1): LoRA-adapted Qwen 4B VLM for policy gradient updates
+    - Tool server (GPU 2): matcher inference (LoFTR/MASt3R)
 
 GRPO: For each prompt, sample N trajectories via vLLM, compute group-relative
 advantages, update LoRA policy with clipped objective (PPO-style).
@@ -43,10 +43,14 @@ from agentic_sfm.agent.policy import (
     Episode,
     SYSTEM_PROMPT,
     ToolCall,
+    apply_policy_chat_template,
+    execute_sfm_tool,
     format_observation,
     parse_tool_call,
 )
+from agentic_sfm.constants import DEFAULT_MATCHER, DEFAULT_POLICY_MODEL
 from agentic_sfm.data.hard_pairs import HardPairDataset
+from agentic_sfm.geometry import keep_best_match
 from agentic_sfm.rewards.pose_rewards import compute_pair_reward
 from agentic_sfm.tools.client import ToolClient
 
@@ -60,6 +64,18 @@ logger = logging.getLogger(__name__)
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _n_images_in_messages(messages: list[dict[str, Any]]) -> int:
+    n = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if item.get("type") in ("image", "image_url"):
+                n += 1
+    return n
 
 
 @dataclass
@@ -78,6 +94,8 @@ class RolloutEpisode:
     vllm_token_logprobs: list[list[float]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     images: list[Any] = field(default_factory=list)
+    K_a: Any = None
+    K_b: Any = None
 
 
 class VLLMRolloutAgent:
@@ -88,7 +106,7 @@ class VLLMRolloutAgent:
                  pose_weight: float = 1.0, inlier_weight: float = 0.1,
                  tool_cost: float = 0.02, format_weight: float = 0.1,
                  invalid_penalty: float = 0.2, reward_schedule: str = "static",
-                 reward_warmup_steps: int = 30):
+                 reward_warmup_steps: int = 30, matcher: str = DEFAULT_MATCHER):
         self.vllm_url = vllm_url.rstrip("/")
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -103,7 +121,10 @@ class VLLMRolloutAgent:
         self.invalid_penalty = invalid_penalty
         self.reward_schedule = reward_schedule
         self.reward_warmup_steps = reward_warmup_steps
+        self.matcher = matcher
         self._global_step = 0
+        self.vllm_model = model_name
+        self._lora_loaded = False
 
     def _encode_image(self, image_path: str) -> str:
         img = Image.open(image_path).convert("RGB")
@@ -135,21 +156,31 @@ class VLLMRolloutAgent:
                         parts.append({"type": "text", "text": item["text"]})
                     elif item.get("type") == "image_url":
                         parts.append(item)
-                        img_idx += 1
                 oai_messages.append({"role": msg["role"], "content": parts})
             else:
                 oai_messages.append(msg)
 
         try:
-            resp = client.chat.completions.create(
-                model=self.model_name,
-                messages=oai_messages,
-                max_tokens=self.max_new_tokens,
-                temperature=temp,
-                top_p=self.top_p,
-                n=n,
-                logprobs=True,
-            )
+            try:
+                resp = client.chat.completions.create(
+                    model=self.vllm_model,
+                    messages=oai_messages,
+                    max_tokens=self.max_new_tokens,
+                    temperature=temp,
+                    top_p=self.top_p,
+                    n=n,
+                    logprobs=True,
+                )
+            except TypeError:
+                resp = client.chat.completions.create(
+                    model=self.vllm_model,
+                    messages=oai_messages,
+                    max_tokens=self.max_new_tokens,
+                    temperature=temp,
+                    top_p=self.top_p,
+                    n=n,
+                    logprobs=True,
+                )
             texts = []
             all_logprobs = []
             for choice in resp.choices:
@@ -165,7 +196,8 @@ class VLLMRolloutAgent:
             return [""] * n, [None] * n
 
     def run_episode(self, pair_id: str, image_a_path: str, image_b_path: str,
-                    tool_client: ToolClient, gt_pose: dict | None = None) -> RolloutEpisode:
+                    tool_client: ToolClient, gt_pose: dict | None = None,
+                    K_a=None, K_b=None) -> RolloutEpisode:
         ep = RolloutEpisode(pair_id=pair_id, image_a=image_a_path, image_b=image_b_path)
 
         tool_client.register_image("img_a", image_a_path)
@@ -173,7 +205,15 @@ class VLLMRolloutAgent:
 
         img_a_b64 = self._encode_image(image_a_path)
         img_b_b64 = self._encode_image(image_b_path)
-        ep.images = [img_a_b64, img_b_b64]
+        image_b64s = [img_a_b64, img_b_b64]
+        ep.images = image_b64s
+        match_kwargs = {"matcher": self.matcher}
+        if K_a is not None:
+            match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
+        if K_b is not None:
+            match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
+        ep.K_a = match_kwargs.get("K_a")
+        ep.K_b = match_kwargs.get("K_b")
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -185,8 +225,9 @@ class VLLMRolloutAgent:
         ]
         ep.messages = messages
 
+        num_invalid = 0
         for step in range(self.max_tool_calls):
-            texts, token_lps = self._vllm_chat(messages, [img_a_b64, img_b_b64], n=1)
+            texts, token_lps = self._vllm_chat(messages, image_b64s, n=1)
             response = texts[0]
             logger.info(f"[{pair_id}] Step {step}: {response[:200]}")
 
@@ -198,6 +239,7 @@ class VLLMRolloutAgent:
 
             tc = parse_tool_call(response)
             if tc is None:
+                num_invalid += 1
                 messages.append({"role": "assistant", "content": response})
                 messages.append({"role": "user", "content": "Please call a tool using JSON format: {\"tool\": \"...\", \"args\": {...}}"})
                 continue
@@ -208,51 +250,52 @@ class VLLMRolloutAgent:
                 break
 
             try:
-                if tc.tool == "crop":
-                    result = tool_client.crop(tc.args["image_id"], tc.args["bbox"])
-                elif tc.tool == "match":
-                    result = tool_client.match(tc.args["image_a"], tc.args["image_b"], tc.args.get("matcher", "loftr"))
-                    ep.final_match = result
-                elif tc.tool == "doppelganger_check":
-                    result = tool_client.doppelganger_check(tc.args["image_a"], tc.args["image_b"])
-                else:
-                    result = {"error": f"Unknown tool: {tc.tool}"}
+                result = execute_sfm_tool(tool_client, tc, match_kwargs)
             except Exception as e:
                 result = {"error": str(e)}
 
             ep.results.append(result)
+            if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
+                ep.final_match = keep_best_match(ep.final_match, result)
+
             messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": f"Observation: {format_observation(result)}"})
+            obs_text = f"Observation: {format_observation(result)}"
+            obs_content: list | str = obs_text
+            crop_b64 = result.get("image_b64") or (result.get("crop") or {}).get("image_b64")
+            crop_path = result.get("path") or (result.get("crop") or {}).get("path")
+            if not crop_b64 and crop_path and os.path.exists(crop_path):
+                crop_b64 = self._encode_image(crop_path)
+            if crop_b64:
+                image_b64s.append(crop_b64)
+                ep.images = image_b64s
+                obs_content = [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
+                    {"type": "text", "text": obs_text},
+                ]
+            messages.append({"role": "user", "content": obs_content})
 
         ep.messages = messages
 
-        if ep.final_match:
-            # Count valid vs invalid tool calls
-            num_valid = len(ep.tool_calls)
-            num_invalid = sum(1 for r in ep.results if "error" in r and "Unknown tool" not in str(r.get("error", "")))
-            # Apply dynamic reward scaling if configured
-            pose_w = self.pose_weight
-            format_w = self.format_weight
-            if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
-                # Early training: emphasize format, de-emphasize correctness
-                pose_w = pose_w * (1.0 / 3.0)
-                format_w = format_w * 1.0
-            elif self.reward_schedule == "dynamic":
-                # Later training: full correctness, reduced format
-                format_w = format_w * 0.5
+        num_valid = len(ep.tool_calls)
+        pose_w = self.pose_weight
+        format_w = self.format_weight
+        if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
+            pose_w = pose_w * (1.0 / 3.0)
+        elif self.reward_schedule == "dynamic":
+            format_w = format_w * 0.5
 
-            ep.reward_components = compute_pair_reward(
-                ep.final_match, gt_pose=gt_pose,
-                num_tool_calls=len(ep.tool_calls),
-                num_invalid_calls=num_invalid,
-                num_valid_calls=num_valid,
-                tool_cost=self.tool_cost,
-                inlier_weight=self.inlier_weight,
-                pose_weight=pose_w,
-                format_weight=format_w,
-                invalid_penalty=self.invalid_penalty,
-            )
-            ep.reward = ep.reward_components["total_reward"]
+        ep.reward_components = compute_pair_reward(
+            ep.final_match or {}, gt_pose=gt_pose,
+            num_tool_calls=len(ep.tool_calls) + num_invalid,
+            num_invalid_calls=num_invalid,
+            num_valid_calls=num_valid,
+            tool_cost=self.tool_cost,
+            inlier_weight=self.inlier_weight,
+            pose_weight=pose_w,
+            format_weight=format_w,
+            invalid_penalty=self.invalid_penalty,
+        )
+        ep.reward = ep.reward_components["total_reward"]
 
         return ep
 
@@ -307,14 +350,17 @@ class GRPOTrainer:
 
         self.curriculum_stages = config.get("curriculum", {}).get("stages", [])
 
+        self.matcher = config.get("data", {}).get("matcher", DEFAULT_MATCHER)
+
         train_path = config["data"].get("train_pairs", "data/hard_pairs_train.json")
         val_path = config["data"].get("val_pairs", "data/hard_pairs_val.json")
         self.train_dataset = HardPairDataset.load(train_path) if os.path.exists(train_path) else HardPairDataset()
         self.val_dataset = HardPairDataset.load(val_path) if os.path.exists(val_path) else HardPairDataset()
         logger.info(f"Train: {len(self.train_dataset)} pairs | Val: {len(self.val_dataset)} pairs")
 
-        self.model_name = config["model"]["name"]
+        self.model_name = config["model"].get("name", DEFAULT_POLICY_MODEL)
         self.lora_config = config["model"]["lora"]
+        self.sft_adapter = config["model"].get("sft_adapter")
         # Use cuda:0 if CUDA_VISIBLE_DEVICES is set (only 1 GPU visible)
         # Otherwise use the configured training GPU (default cuda:1)
         if os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -349,11 +395,12 @@ class GRPOTrainer:
             return
 
         from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        from agentic_sfm.agent.policy import load_policy_processor_and_model
+        from agentic_sfm.constants import DEFAULT_LORA_TARGET_MODULES
 
         logger.info(f"Loading training model {self.model_name} on {self.training_device}...")
-        self._processor = AutoProcessor.from_pretrained(self.model_name)
-        self._model = AutoModelForImageTextToText.from_pretrained(
+        self._processor, self._model = load_policy_processor_and_model(
             self.model_name,
             torch_dtype=torch.bfloat16,
             device_map=self.training_device,
@@ -363,10 +410,15 @@ class GRPOTrainer:
             r=self.lora_config["rank"],
             lora_alpha=self.lora_config["alpha"],
             lora_dropout=self.lora_config["dropout"],
-            target_modules=self.lora_config["target_modules"],
+            target_modules=self.lora_config.get("target_modules") or DEFAULT_LORA_TARGET_MODULES,
             task_type="CAUSAL_LM",
         )
-        self._model = get_peft_model(self._model, lora_cfg)
+        if self.sft_adapter and os.path.isdir(self.sft_adapter):
+            logger.info(f"Loading SFT adapter warmup from {self.sft_adapter}")
+            from peft import PeftModel
+            self._model = PeftModel.from_pretrained(self._model, self.sft_adapter, is_trainable=True)
+        else:
+            self._model = get_peft_model(self._model, lora_cfg)
         self._model.print_trainable_parameters()
 
         trainable = [p for p in self._model.parameters() if p.requires_grad]
@@ -394,6 +446,8 @@ class GRPOTrainer:
                     image_b_path=pair.image_b,
                     tool_client=self.tool_client,
                     gt_pose=gt_pose,
+                    K_a=pair.K_a,
+                    K_b=pair.K_b,
                 )
                 episodes.append(ep)
         return episodes
@@ -441,8 +495,18 @@ class GRPOTrainer:
         with add_generation_prompt=False to get the end. Tokens in [start, end)
         are assistant tokens.
         """
-        full_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        full_ids = processor(text=[full_text], images=images, return_tensors="pt")["input_ids"][0]
+        def _imgs_for(msgs: list[dict[str, Any]]) -> list[Image.Image] | None:
+            n = min(_n_images_in_messages(msgs), len(images))
+            sliced = images[:n]
+            return sliced or None
+
+        full_text = apply_policy_chat_template(
+            processor,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        full_ids = processor(text=[full_text], images=_imgs_for(messages), return_tensors="pt")["input_ids"][0]
         n_tokens = len(full_ids)
         mask = [False] * n_tokens
 
@@ -450,16 +514,26 @@ class GRPOTrainer:
             if msg.get("role") != "assistant":
                 continue
             try:
-                prefix_text = processor.apply_chat_template(
-                    messages[:k], tokenize=False, add_generation_prompt=True
+                prefix_text = apply_policy_chat_template(
+                    processor,
+                    messages[:k],
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
-                prefix_ids = processor(text=[prefix_text], images=images, return_tensors="pt")["input_ids"][0]
+                prefix_ids = processor(
+                    text=[prefix_text], images=_imgs_for(messages[:k]), return_tensors="pt"
+                )["input_ids"][0]
                 start = len(prefix_ids)
 
-                through_text = processor.apply_chat_template(
-                    messages[:k+1], tokenize=False, add_generation_prompt=False
+                through_text = apply_policy_chat_template(
+                    processor,
+                    messages[:k + 1],
+                    tokenize=False,
+                    add_generation_prompt=False,
                 )
-                through_ids = processor(text=[through_text], images=images, return_tensors="pt")["input_ids"][0]
+                through_ids = processor(
+                    text=[through_text], images=_imgs_for(messages[:k + 1]), return_tensors="pt"
+                )["input_ids"][0]
                 end = len(through_ids)
 
                 for i in range(start, min(end, n_tokens)):
@@ -468,6 +542,52 @@ class GRPOTrainer:
                 logger.warning(f"Mask computation failed for msg {k}: {e}")
 
         return mask
+
+    def _episode_pil_images(self, ep: RolloutEpisode) -> list[Image.Image]:
+        """Decode rollout images (pair + crops) so logprobs see the same pixels as vLLM."""
+        images: list[Image.Image] = []
+        for item in ep.images or []:
+            if isinstance(item, Image.Image):
+                images.append(item.convert("RGB"))
+                continue
+            if not isinstance(item, str):
+                continue
+            try:
+                raw = base64.b64decode(item)
+                images.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+            except Exception:
+                continue
+        if len(images) < 2:
+            images = [
+                Image.open(ep.image_a).convert("RGB"),
+                Image.open(ep.image_b).convert("RGB"),
+            ]
+        return images
+
+    def _policy_messages_and_images(
+        self, ep: RolloutEpisode
+    ) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+        """Rewrite vLLM image_url / placeholders to PIL ``type=image`` for the LoRA model."""
+        images = self._episode_pil_images(ep)
+        idx = 0
+        out: list[dict[str, Any]] = []
+        used: list[Image.Image] = []
+        for msg in ep.messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                out.append(msg)
+                continue
+            new_content: list[dict[str, Any]] = []
+            for item in content:
+                if item.get("type") in ("image", "image_url"):
+                    if idx < len(images):
+                        used.append(images[idx])
+                        new_content.append({"type": "image", "image": images[idx]})
+                        idx += 1
+                    continue
+                new_content.append(item)
+            out.append({**msg, "content": new_content})
+        return out, used or images[:2]
 
     def compute_logprobs(self, episodes: list[RolloutEpisode], 
                           requires_grad: bool = False) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -485,15 +605,18 @@ class GRPOTrainer:
                 continue
 
             try:
-                text = self._processor.apply_chat_template(
-                    ep.messages, tokenize=False, add_generation_prompt=False
+                messages, images = self._policy_messages_and_images(ep)
+                text = apply_policy_chat_template(
+                    self._processor,
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
                 )
-                images = [Image.open(ep.image_a).convert("RGB"), Image.open(ep.image_b).convert("RGB")]
                 inputs = self._processor(
                     text=[text], images=images, return_tensors="pt", padding=True
                 ).to(self.training_device)
 
-                mask = self._compute_assistant_mask(ep.messages, images, self._processor)
+                mask = self._compute_assistant_mask(messages, images, self._processor)
                 mask_tensor = torch.tensor(mask, device=self.training_device, dtype=torch.bool)
 
                 ctx_manager = torch.enable_grad() if requires_grad else torch.no_grad()
@@ -550,22 +673,14 @@ class GRPOTrainer:
             logger.warning("All episodes have zero reward — skipping update.")
             return stats
 
+        # Token-level GRPO on the LoRA model (same tokenizer both sides).
+        # Mixing vLLM token logprobs with Transformers tokens is invalid.
+        # old = eval/no-grad (rollout-time weights); new = train/grad.
         self._load_training_model()
+        self._model.eval()
+        old_results = self.compute_logprobs(episodes, requires_grad=False)
         self._model.train()
-
-        # Compute old log-probs from vLLM (stored during rollout)
-        # Fall back to computing from model if vLLM logprobs unavailable
-        old_logps_data = []
-        for ep in episodes:
-            if ep.vllm_token_logprobs:
-                # Sum per-token logprobs across all assistant turns
-                total = sum(sum(turn_lps) for turn_lps in ep.vllm_token_logprobs if turn_lps)
-                old_logps_data.append(total)
-            else:
-                old_logps_data.append(None)
-
-        # Compute current policy log-probs with gradient
-        logprob_results = self.compute_logprobs(episodes, requires_grad=True)
+        new_results = self.compute_logprobs(episodes, requires_grad=True)
 
         total_loss = torch.tensor(0.0, device=self.training_device, dtype=torch.float32)
         valid_count = 0
@@ -574,28 +689,25 @@ class GRPOTrainer:
             if not ep.messages or not ep.assistant_responses:
                 continue
 
-            token_logps, assistant_mask = logprob_results[i]
-            if assistant_mask.numel() == 0 or assistant_mask.sum() == 0:
+            new_logps, new_mask = new_results[i]
+            old_logps, old_mask = old_results[i]
+            if new_logps.ndim == 0 or new_mask.numel() == 0:
+                continue
+            if old_logps.ndim == 0 or old_mask.numel() == 0:
                 continue
 
             try:
-                # Sum log-probs only over assistant tokens
-                masked_logps = token_logps[assistant_mask]
-                new_logp = masked_logps.sum()
+                n = min(new_logps.shape[0], new_mask.shape[0], old_logps.shape[0], old_mask.shape[0])
+                mask = new_mask[:n] & old_mask[:n]
+                if int(mask.sum()) == 0:
+                    continue
 
-                # Old log-prob: from vLLM or from non-grad model pass
-                if old_logps_data[i] is not None:
-                    old_logp = torch.tensor(old_logps_data[i], device=self.training_device, dtype=torch.float32)
-                else:
-                    # Fallback: compute without grad (will be ~same as new for first step)
-                    with torch.no_grad():
-                        old_logp = masked_logps.detach().sum()
-
-                # DAPO-style Clip-Higher: asymmetric clipping
-                ratio = torch.exp(new_logp - old_logp)
+                new_tok = new_logps[:n][mask].to(torch.float32)
+                old_tok = old_logps[:n][mask].to(torch.float32).detach()
+                ratio = torch.exp(new_tok - old_tok)
                 clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high)
-                adv_tensor = torch.tensor(adv, device=self.training_device, dtype=torch.float32)
-                loss = -torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor)
+                adv_tensor = torch.tensor(adv, device=ratio.device, dtype=ratio.dtype)
+                loss = -torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor).mean()
 
                 # Scale by 1/grad_accum for gradient accumulation
                 loss = loss / self.grad_accum
@@ -634,6 +746,7 @@ class GRPOTrainer:
             ep = rollout_agent.run_episode(
                 pair_id=pair.pair_id, image_a_path=pair.image_a, image_b_path=pair.image_b,
                 tool_client=self.tool_client, gt_pose=gt_pose,
+                K_a=pair.K_a, K_b=pair.K_b,
             )
             episodes.append(ep)
         rewards = [ep.reward for ep in episodes]
@@ -650,14 +763,54 @@ class GRPOTrainer:
             self._wandb.log({f"eval/{k}": v for k, v in stats.items()})
         return stats
 
-    def save_lora_checkpoint(self, epoch: int):
-        ckpt_path = self.ckpt_dir / f"epoch_{epoch}"
+    def save_lora_checkpoint(self, epoch: int | str, rollout_agent: VLLMRolloutAgent | None = None):
+        tag = epoch if isinstance(epoch, str) else f"epoch_{epoch}"
+        ckpt_path = self.ckpt_dir / tag
         ckpt_path.mkdir(parents=True, exist_ok=True)
         if self._model is not None:
             self._model.save_pretrained(str(ckpt_path))
             logger.info(f"  Saved LoRA checkpoint: {ckpt_path}")
+            if rollout_agent is not None:
+                self._reload_vllm_lora(ckpt_path, rollout_agent)
         else:
             logger.warning("  No model loaded — skipping checkpoint save.")
+
+    def _reload_vllm_lora(self, ckpt_path: Path, rollout_agent: VLLMRolloutAgent) -> None:
+        """Hot-load the latest LoRA into vLLM so the next rollouts are on-policy."""
+        import urllib.error
+        import urllib.request
+
+        adapter = "agentic-sfm-policy"
+        base = rollout_agent.vllm_url.rstrip("/")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer EMPTY",
+        }
+        path = str(ckpt_path.resolve())
+
+        def _post(route: str, payload: dict, timeout: int = 120) -> None:
+            req = urllib.request.Request(
+                f"{base}{route}",
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+
+        if rollout_agent._lora_loaded:
+            try:
+                _post("/v1/unload_lora_adapter", {"lora_name": adapter}, timeout=60)
+            except Exception as e:
+                logger.warning(f"vLLM unload LoRA ({adapter}): {e}")
+
+        try:
+            _post("/v1/load_lora_adapter", {"lora_name": adapter, "lora_path": path})
+            rollout_agent.vllm_model = adapter
+            rollout_agent._lora_loaded = True
+            logger.info(f"vLLM serving LoRA adapter {adapter} from {path}")
+        except Exception as e:
+            logger.warning(f"vLLM load LoRA failed (rollouts stay on {rollout_agent.vllm_model}): {e}")
 
     def train(self):
         """Main GRPO training loop with gradient accumulation."""
@@ -676,7 +829,10 @@ class GRPOTrainer:
             invalid_penalty=self.invalid_penalty,
             reward_schedule=self.reward_schedule,
             reward_warmup_steps=self.reward_warmup_steps,
+            matcher=self.matcher,
         )
+        if self.sft_adapter and os.path.isdir(self.sft_adapter):
+            self._reload_vllm_lora(Path(self.sft_adapter), rollout_agent)
 
         global_step = 0
 
@@ -740,10 +896,12 @@ class GRPOTrainer:
                 logger.info(f"  Eval: reward={eval_stats['mean_reward']:.3f}, "
                           f"success_rate={eval_stats.get('success_rate', 0.0):.3f}")
 
+            # Always dump `latest` so vLLM rollouts track the LoRA policy.
+            self.save_lora_checkpoint("latest", rollout_agent)
             if (epoch + 1) % self.save_freq == 0:
-                self.save_lora_checkpoint(epoch + 1)
+                self.save_lora_checkpoint(epoch + 1, rollout_agent)
 
-        self.save_lora_checkpoint(self.total_epochs)
+        self.save_lora_checkpoint(self.total_epochs, rollout_agent)
         if self._wandb:
             self._wandb.finish()
         logger.info("Training complete.")
@@ -759,6 +917,10 @@ def main():
 
     config = load_config(args.config)
     os.chdir(Path(args.config).parent.parent)
+
+    from agentic_sfm.constants import assert_qwen35_runtime
+
+    assert_qwen35_runtime()
 
     tool_client = ToolClient(args.tool_server_url)
     try:
