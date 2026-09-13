@@ -45,6 +45,7 @@ export HF_HOME="/scratch/kcwp264/.cache/huggingface"
 export TORCH_HOME="/scratch/kcwp264/.cache/torch"
 export VLLM_CACHE_ROOT="/scratch/kcwp264/.cache/vllm"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_DIR}" "${FLASHINFER_JIT_DIR}" "${XDG_CACHE_HOME}" "${VLLM_CACHE_ROOT}"
 
 cd "${PROJECT_ROOT}"

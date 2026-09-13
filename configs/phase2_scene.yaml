@@ -3,41 +3,62 @@
 
 model:
   name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  # Resume from Phase 1 checkpoint (or SFT adapter if Phase 1 not done)
+  checkpoint: "outputs/phase1/checkpoints/best"
+  sft_adapter: "outputs/sft/checkpoints/epoch_5"  # fallback
   lora:
     rank: 32
     alpha: 64
     dropout: 0.0
     target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
-  checkpoint: "outputs/phase1/checkpoints/best"  # resume from Phase 1
 
 rl:
   algorithm: "grpo"
-  framework: "verl"
-  group_size: 6
-  max_tool_calls: 20
-  max_turns: 30
+  framework: "custom"
+  group_size: 6           # N trajectories per scene
+  max_tool_calls: 20      # more tools per episode than Phase 1
+  max_turns: 30           # more turns for multi-step pipeline
   temperature: 1.0
   top_p: 0.95
+  # DAPO-style improvements
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  # S-GRPO CGI: inject oracle trajectory when all rollouts fail
+  sgrpo_cgi: true
+  # Dynamic reward scaling
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 20
 
 tools:
-  # Full tool set
   enabled: ["crop", "match", "doppelganger_check", "retrieve", "sfm_run", "inspect"]
-  matchers: ["mast3r", "loftr"]
-  sfm_backend: "colmap"  # or "glomap"
+  matchers: ["loftr"]      # start with LoFTR, add mast3r later
+  sfm_backend: "colmap"
 
 reward:
-  registration_weight: 0.5
-  pose_weight: 1.0
-  tool_cost: 0.05
-  split_penalty: 0.5
-  doppelganger_weight: 0.3
+  # Scene-level rewards
+  registration_weight: 0.5   # fraction of images registered
+  pose_weight: 1.0           # mean pose error (1 - err/20)
+  split_penalty: 0.5         # penalty when 0 images registered
+  doppelganger_weight: 0.3   # reward for filtering doppelgangers
+  # Accumulative tool reward (replaces per-call penalty)
+  tool_cost: 0.0             # legacy (disabled)
+  accumulative_tool_coef: 0.1
+  use_accumulative_tool_reward: true
+  format_weight: 0.1
+  invalid_penalty: 0.2
+  # NTEP process rewards — opt-in
+  use_ntep_rewards: false
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
 
 curriculum:
   enabled: true
   stages:
-    - {epochs: 10, scenes: ["small"], max_images: 20}
-    - {epochs: 20, scenes: ["small", "medium"], max_images: 50}
-    - {epochs: 20, scenes: ["all"], max_images: 100}
+    - {epochs: 10, max_images: 10, scenes: ["0015"]}           # small scene warmup
+    - {epochs: 20, max_images: 20, scenes: ["0015", "0022"]}   # add second scene
+    - {epochs: 20, max_images: 50, scenes: null}               # all scenes
 
 training:
   lr: 5.0e-6
@@ -48,11 +69,25 @@ training:
   max_grad_norm: 1.0
   save_freq: 5
   eval_freq: 5
+  log_freq: 10
+
+rollout:
+  vllm_gpu: 0
+  training_gpu: 1
+  matcher_gpu: 2            # also runs COLMAP (pycolmap)
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 4
+  batch_size: 2             # scenes per batch (fewer than pairs — more expensive)
 
 data:
-  # SfM disambiguation datasets
-  sfm_disambiguation_dir: "data/sfm_disambiguation"
-  imc_dir: "data/imc_scenes"
+  # Scene data from MegaDepth scene_info
+  scene_info_dir: "/scratch/kcwp264/data/megadepth/scene_info_full/scene_info"
+  image_root: "/scratch/kcwp264/data/megadepth/megadepth_test_1500"
+  max_images_per_scene: 20   # images per scene episode (curriculum increases this)
+  min_images_per_scene: 5
+  matcher: "loftr"
+  # Phase 2 datasets (for doppelganger training)
   doppelganger_dataset: "data/doppelgangers"
 
 output:
@@ -61,4 +96,4 @@ output:
   log_dir: "logs/phase2"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase2-scene-grpo"
+  wandb_run_name: "phase2-scene-grpo-qwen35-2b"

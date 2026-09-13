@@ -12,6 +12,7 @@ from agentic_sfm.rl.rc_grpo import (
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
     run_scene_episode,
+    run_scene_oracle_episode,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "LOW_REWARD_TOKEN",
     "SceneRolloutEpisode",
     "run_scene_episode",
+    "run_scene_oracle_episode",
 ]

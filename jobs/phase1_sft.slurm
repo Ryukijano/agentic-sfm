@@ -33,6 +33,7 @@ export TRITON_CACHE_DIR="/scratch/kcwp264/.triton_cache"
 export WANDB_DIR="/scratch/kcwp264/wandb"
 export WANDB_CACHE_DIR="/scratch/kcwp264/.cache/wandb"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 mkdir -p "${TRITON_CACHE_DIR}" "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
 
 cd "${PROJECT_ROOT}"

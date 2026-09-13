@@ -28,6 +28,7 @@ export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export HF_HOME="/scratch/kcwp264/.cache/huggingface"
 export TORCH_HOME="/scratch/kcwp264/.cache/torch"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 cd "${PROJECT_ROOT}"
 

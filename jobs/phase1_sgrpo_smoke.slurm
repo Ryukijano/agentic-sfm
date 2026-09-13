@@ -68,6 +68,7 @@ export VLLM_CACHE_ROOT="/scratch/kcwp264/.cache/vllm"
 export WANDB_DIR=/scratch/kcwp264/wandb
 export WANDB_CACHE_DIR=/scratch/kcwp264/.cache/wandb
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-24}
 mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_DIR}" "${FLASHINFER_JIT_DIR}" "${XDG_CACHE_HOME}" "${VLLM_CACHE_ROOT}"
 

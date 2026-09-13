@@ -57,6 +57,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export HF_HOME="/scratch/kcwp264/.cache/huggingface"
 export TORCH_HOME="/scratch/kcwp264/.cache/torch"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 echo "Python: $(which python)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true

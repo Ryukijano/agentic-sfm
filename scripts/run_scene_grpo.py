@@ -188,6 +188,7 @@ def main():
         for scene in scene_dataset.scenes:
             # Sample group_size rollouts per scene
             scene_episodes = []
+            all_failed = True
             for g in range(group_size):
                 ep = run_scene_episode(
                     agent=rollout_agent,
@@ -200,6 +201,46 @@ def main():
                     image_root=data_cfg.get("image_root", ""),
                 )
                 scene_episodes.append(ep)
+                if ep.reward > 0:
+                    all_failed = False
+
+            # S-GRPO CGI: inject oracle trajectory when all rollouts fail
+            if config["rl"].get("sgrpo_cgi", True) and all_failed and scene_episodes:
+                from agentic_sfm.rl.scene_episode import run_scene_oracle_episode
+                import numpy as np
+                from pathlib import Path
+
+                # Load overlap matrix for oracle pair selection
+                om = None
+                indices = None
+                si_path = Path(data_cfg.get("scene_info_dir", "")) / f"{scene['scene_id']}.npz"
+                if si_path.exists():
+                    d = np.load(str(si_path), allow_pickle=True)
+                    om = d["overlap_matrix"]
+                    # Map image_paths to indices in the full scene
+                    all_paths = [str(p) for p in d["image_paths"]]
+                    indices = [all_paths.index(p) for p in scene["image_paths"] if p in all_paths]
+
+                failed_max = max(e.reward for e in scene_episodes)
+                oracle_ep = run_scene_oracle_episode(
+                    agent=rollout_agent,
+                    scene_id=scene["scene_id"],
+                    image_paths=scene["image_paths"],
+                    tool_client=tool_client,
+                    gt_recon=scene.get("gt_recon"),
+                    overlap_matrix=om,
+                    image_indices=indices,
+                    failed_group_max_reward=failed_max,
+                    image_root=data_cfg.get("image_root", ""),
+                )
+                if oracle_ep.reward > failed_max:
+                    if len(scene_episodes) == 1:
+                        scene_episodes.append(oracle_ep)
+                    else:
+                        worst_idx = min(range(len(scene_episodes)),
+                                        key=lambda i: scene_episodes[i].reward)
+                        scene_episodes[worst_idx] = oracle_ep
+                    logger.info(f"  S-GRPO CGI: injected oracle for {scene['scene_id']} (reward={oracle_ep.reward:.3f})")
 
             epoch_episodes.extend(scene_episodes)
             rewards = [e.reward for e in scene_episodes]
