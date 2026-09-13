@@ -144,6 +144,15 @@ class VLLMRolloutAgent:
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+    def _generate_turn(self, messages: list[dict], images_b64: list[str] | None = None) -> str:
+        """Generate a single assistant turn via vLLM.
+
+        Used by scene-level episodes (run_scene_episode). Returns the raw
+        response text. For pair-level episodes, use run_episode() instead.
+        """
+        texts, _ = self._vllm_chat(messages, images_b64 or [], n=1)
+        return texts[0]
+
     def _vllm_chat(self, messages: list[dict], images_b64: list[str],
                    n: int = 1, temperature: float | None = None) -> tuple[list[str], list[list[float] | None]]:
         """Returns (response_texts, per_token_logprobs_list)."""
@@ -288,7 +297,7 @@ class VLLMRolloutAgent:
 
         ep.messages = messages
 
-        num_valid = len(ep.tool_calls)
+        num_valid = sum(1 for tc in ep.tool_calls if tc.tool != "done")
         pose_w = self.pose_weight
         format_w = self.format_weight
         if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
