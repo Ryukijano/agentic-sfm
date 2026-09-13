@@ -98,6 +98,8 @@ class SceneDataset:
                     "scene_id": scene_id,
                     "image_paths": scene_images,
                     "num_images": len(scene_images),
+                    "overlap_matrix": d["overlap_matrix"],
+                    "image_indices": indices,
                     "gt_recon": {
                         "num_images": len(scene_images),
                         "poses": {str(i): scene_poses[i].tolist() if hasattr(scene_poses[i], "tolist") else scene_poses[i] for i in range(len(scene_images))},
@@ -196,6 +198,8 @@ def main():
                     image_paths=scene["image_paths"],
                     tool_client=tool_client,
                     gt_recon=scene.get("gt_recon"),
+                    overlap_matrix=scene.get("overlap_matrix"),
+                    image_indices=scene.get("image_indices"),
                     max_tool_calls=config["rl"].get("max_tool_calls", 20),
                     max_turns=config["rl"].get("max_turns", 30),
                     image_root=data_cfg.get("image_root", ""),
@@ -207,19 +211,6 @@ def main():
             # S-GRPO CGI: inject oracle trajectory when all rollouts fail
             if config["rl"].get("sgrpo_cgi", True) and all_failed and scene_episodes:
                 from agentic_sfm.rl.scene_episode import run_scene_oracle_episode
-                import numpy as np
-                from pathlib import Path
-
-                # Load overlap matrix for oracle pair selection
-                om = None
-                indices = None
-                si_path = Path(data_cfg.get("scene_info_dir", "")) / f"{scene['scene_id']}.npz"
-                if si_path.exists():
-                    d = np.load(str(si_path), allow_pickle=True)
-                    om = d["overlap_matrix"]
-                    # Map image_paths to indices in the full scene
-                    all_paths = [str(p) for p in d["image_paths"]]
-                    indices = [all_paths.index(p) for p in scene["image_paths"] if p in all_paths]
 
                 failed_max = max(e.reward for e in scene_episodes)
                 oracle_ep = run_scene_oracle_episode(
@@ -228,8 +219,8 @@ def main():
                     image_paths=scene["image_paths"],
                     tool_client=tool_client,
                     gt_recon=scene.get("gt_recon"),
-                    overlap_matrix=om,
-                    image_indices=indices,
+                    overlap_matrix=scene.get("overlap_matrix"),
+                    image_indices=scene.get("image_indices"),
                     failed_group_max_reward=failed_max,
                     image_root=data_cfg.get("image_root", ""),
                 )

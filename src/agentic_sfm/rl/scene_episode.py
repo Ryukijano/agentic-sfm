@@ -101,6 +101,8 @@ def run_scene_episode(
     image_paths: list[str],
     tool_client: ToolClient,
     gt_recon: dict[str, Any] | None = None,
+    overlap_matrix: np.ndarray | None = None,
+    image_indices: list[int] | None = None,
     max_tool_calls: int = 20,
     max_turns: int = 30,
     image_root: str = "",
@@ -195,7 +197,11 @@ def run_scene_episode(
             continue
 
         # Execute the tool
-        result = _execute_scene_tool(tool_client, tc, registered_ids, ep)
+        result = _execute_scene_tool(
+            tool_client, tc, registered_ids, ep,
+            overlap_matrix=overlap_matrix,
+            image_indices=image_indices,
+        )
         ep.results.append(result)
         num_valid_calls += 1
 
@@ -416,24 +422,42 @@ def _execute_scene_tool(
     tc: ToolCall,
     registered_ids: dict[str, str],
     ep: SceneRolloutEpisode,
+    overlap_matrix: np.ndarray | None = None,
+    image_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     """Execute a scene-level tool call."""
     args = tc.args
 
     if tc.tool == "retrieve":
-        # Simple retrieval: return all pairs sorted by overlap (if GT available)
-        # In practice, this would use a retrieval model (e.g., NetVLAD, DINO)
-        pairs = []
+        # Use GT overlap matrix to return best pairs (oracle retrieval)
         ids = list(registered_ids.values())
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                pairs.append({
-                    "image_a": ids[i],
-                    "image_b": ids[j],
-                    "score": 1.0 - abs(i - j) / max(len(ids), 1),  # proximity heuristic
-                })
-        pairs.sort(key=lambda p: p["score"], reverse=True)
-        return {"pairs": pairs[:20], "num_pairs": len(pairs[:20])}
+        if overlap_matrix is not None and image_indices is not None:
+            # Build sub-matrix for the registered images
+            sub_om = overlap_matrix[np.ix_(image_indices, image_indices)]
+            pairs = []
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    score = float(sub_om[i, j])
+                    if score > 0.05:  # filter out near-zero overlap
+                        pairs.append({
+                            "image_a": ids[i],
+                            "image_b": ids[j],
+                            "score": score,
+                        })
+            pairs.sort(key=lambda p: p["score"], reverse=True)
+        else:
+            # Fallback: proximity heuristic
+            pairs = []
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    pairs.append({
+                        "image_a": ids[i],
+                        "image_b": ids[j],
+                        "score": 1.0 - abs(i - j) / max(len(ids), 1),
+                    })
+            pairs.sort(key=lambda p: p["score"], reverse=True)
+        top_k = args.get("top_k", 20)
+        return {"pairs": pairs[:top_k], "num_pairs": len(pairs[:top_k])}
 
     if tc.tool == "sfm_run":
         image_dir = str(Path(ep.image_paths[0]).parent) if ep.image_paths else ""
