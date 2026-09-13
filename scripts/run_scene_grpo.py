@@ -38,6 +38,58 @@ from agentic_sfm.tools.client import ToolClient
 logger = logging.getLogger(__name__)
 
 
+def _normalize_scene_ids(scene_ids: list[str] | None) -> set[str] | None:
+    """Normalize scene ids for matching (accepts '15' for '0015' etc.)."""
+    if scene_ids is None:
+        return None
+    out: set[str] = set()
+    for sid in scene_ids:
+        s = str(sid)
+        out.add(s)
+        out.add(s.zfill(4))
+        out.add(s.lstrip("0") or "0")
+    return out
+
+
+def _subsample_scene(scene: dict[str, Any], max_images: int) -> dict[str, Any]:
+    """Return a copy of ``scene`` with at most ``max_images`` images.
+
+    Positions are chosen deterministically (evenly spaced over the loaded
+    image list) so curriculum stage transitions are reproducible.
+    ``image_indices`` and ``gt_recon['poses']`` are remapped consistently.
+    """
+    n = scene["num_images"]
+    k = min(n, max(1, int(max_images)))
+    pos = sorted(set(np.linspace(0, n - 1, k).round().astype(int).tolist()))
+    if len(pos) < k:  # linspace rounding collapsed some points — pad to k
+        chosen = set(pos)
+        for i in range(n):
+            if i not in chosen:
+                pos.append(i)
+                chosen.add(i)
+                if len(pos) == k:
+                    break
+        pos.sort()
+
+    new = dict(scene)
+    new["image_paths"] = [scene["image_paths"][i] for i in pos]
+    new["num_images"] = len(pos)
+    if scene.get("image_indices") is not None:
+        new["image_indices"] = [scene["image_indices"][i] for i in pos]
+    gt = scene.get("gt_recon")
+    if isinstance(gt, dict) and isinstance(gt.get("poses"), dict):
+        new["gt_recon"] = {
+            **gt,
+            "num_images": len(pos),
+            "poses": {
+                str(j): gt["poses"][str(i)]
+                for j, i in enumerate(pos)
+                if str(i) in gt["poses"]
+            },
+        }
+    return new
+
+
 @dataclass
 class SceneDataset:
     """Dataset of scenes for Phase 2 training."""
@@ -47,17 +99,28 @@ class SceneDataset:
     def from_megadepth(cls, scene_info_dir: str, image_root: str,
                        scene_ids: list[str] | None = None,
                        max_images_per_scene: int = 20,
-                       min_images_per_scene: int = 5) -> "SceneDataset":
+                       min_images_per_scene: int = 5,
+                       scenes: list[str] | None = None,
+                       max_images: int | None = None) -> "SceneDataset":
         """Build scene dataset from MegaDepth scene_info.
 
         Each scene has N images with known poses. We sample a subset of images
         per scene (for training efficiency) and store the GT poses for reward
         computation.
+
+        ``scenes``/``max_images`` are curriculum-style aliases that take
+        precedence over ``scene_ids``/``max_images_per_scene`` when given.
         """
         import numpy as np
         from pathlib import Path
 
-        scenes = []
+        if scenes is not None:
+            scene_ids = scenes
+        if max_images is not None:
+            max_images_per_scene = max_images
+        wanted = _normalize_scene_ids(scene_ids)
+
+        scenes_out = []
         si_dir = Path(scene_info_dir)
         img_root = Path(image_root)
 
@@ -65,7 +128,7 @@ class SceneDataset:
             scene_id = npz_file.stem
             if "_" in scene_id:
                 continue
-            if scene_ids and scene_id not in scene_ids:
+            if wanted and scene_id not in wanted:
                 continue
 
             try:
@@ -91,10 +154,15 @@ class SceneDataset:
                 indices = sorted(indices.tolist())
 
                 scene_images = [image_paths[i] for i in indices]
-                scene_poses = {i: poses[i] for i in indices}
-                scene_Ks = {i: intrinsics[i] for i in indices}
+                # gt poses keyed by position in scene_images (0..n-1), which is
+                # what scene_eval._extract_gt_poses resolves via the episode
+                # image_paths lookup.
+                gt_poses = {}
+                for k, i in enumerate(indices):
+                    p = poses[i]
+                    gt_poses[str(k)] = p.tolist() if hasattr(p, "tolist") else p
 
-                scenes.append({
+                scenes_out.append({
                     "scene_id": scene_id,
                     "image_paths": scene_images,
                     "num_images": len(scene_images),
@@ -102,14 +170,83 @@ class SceneDataset:
                     "image_indices": indices,
                     "gt_recon": {
                         "num_images": len(scene_images),
-                        "poses": {str(i): scene_poses[i].tolist() if hasattr(scene_poses[i], "tolist") else scene_poses[i] for i in range(len(scene_images))},
+                        "poses": gt_poses,
                     },
                 })
             except Exception as e:
                 logger.warning(f"Failed to load scene {scene_id}: {e}")
                 continue
 
-        return cls(scenes=scenes)
+        return cls(scenes=scenes_out)
+
+    def filter(self, scenes: list[str] | None = None,
+               max_images: int | None = None) -> "SceneDataset":
+        """Return a filtered view: subset of scenes and/or per-scene images.
+
+        Used by the scene curriculum at stage boundaries. ``scenes=None``
+        keeps all scenes; ``max_images=None`` keeps each scene's full loaded
+        image list. Subsampling is deterministic (evenly spaced positions).
+        """
+        wanted = _normalize_scene_ids(scenes)
+        out: list[dict[str, Any]] = []
+        for s in self.scenes:
+            if wanted is not None and s["scene_id"] not in wanted:
+                continue
+            if max_images is not None and s["num_images"] > max_images:
+                s = _subsample_scene(s, max_images)
+            out.append(s)
+        return SceneDataset(scenes=out)
+
+
+@dataclass
+class CurriculumStage:
+    """One stage of the scene curriculum."""
+    epochs: int
+    max_images: int | None = None
+    scenes: list[str] | None = None
+
+
+class SceneCurriculum:
+    """Epoch-indexed curriculum over scene difficulty.
+
+    Stages are cumulative: stage ``i`` is active for epochs
+    ``[sum(epochs[:i]), sum(epochs[:i+1]))``. Past the end of the last stage
+    the final stage remains active, so ``total_epochs`` in the config may
+    exceed the sum of stage epochs.
+    """
+
+    def __init__(self, stages: list[dict[str, Any]]):
+        self.stages = [
+            CurriculumStage(
+                epochs=int(s.get("epochs", 0)),
+                max_images=s.get("max_images"),
+                scenes=s.get("scenes"),
+            )
+            for s in stages
+        ]
+        self.boundaries: list[int] = []  # boundaries[i] = first epoch of stage i
+        acc = 0
+        for st in self.stages:
+            self.boundaries.append(acc)
+            acc += max(st.epochs, 0)
+        self.total_epochs = acc
+
+    def stage_for_epoch(self, epoch: int) -> int:
+        """Index of the stage active at ``epoch`` (last stage wins past the end)."""
+        idx = 0
+        for i, start in enumerate(self.boundaries):
+            if epoch >= start:
+                idx = i
+        return idx
+
+    def describe(self, idx: int) -> str:
+        st = self.stages[idx]
+        start = self.boundaries[idx]
+        end = start + max(st.epochs, 0) - 1
+        scenes = "all" if st.scenes is None else ",".join(str(s) for s in st.scenes)
+        max_images = "all" if st.max_images is None else str(st.max_images)
+        return (f"stage {idx + 1}/{len(self.stages)} (epochs {start}-{end}): "
+                f"scenes={scenes}, max_images={max_images}")
 
 
 def main():
@@ -134,13 +271,40 @@ def main():
     logger.info(f"vLLM: {args.vllm_url}")
     logger.info(f"Tool server: {args.tool_server_url}")
 
-    # Build scene dataset
+    # Parse curriculum (if any) before loading so we can size the load once
     data_cfg = config.get("data", {})
+    curriculum_cfg = config.get("curriculum", {}) or {}
+    curriculum: SceneCurriculum | None = None
+    load_max_images = data_cfg.get("max_images_per_scene", 20)
+    load_scene_ids = data_cfg.get("scene_ids")
+
+    if curriculum_cfg.get("enabled") and curriculum_cfg.get("stages"):
+        curriculum = SceneCurriculum(curriculum_cfg["stages"])
+        # Load once at the largest image budget any stage needs.
+        stage_maxes = [s.max_images for s in curriculum.stages if s.max_images]
+        if stage_maxes:
+            load_max_images = max(load_max_images, max(stage_maxes))
+        # If every stage names its scenes, only load the union of them.
+        named = [s.scenes for s in curriculum.stages if s.scenes]
+        if named and len(named) == len(curriculum.stages):
+            union = {str(sid) for sc in named for sid in sc}
+            if load_scene_ids is not None:
+                keep = _normalize_scene_ids(sorted(union)) or set()
+                load_scene_ids = [s for s in load_scene_ids if str(s) in keep]
+            else:
+                load_scene_ids = sorted(union)
+        logger.info(f"Curriculum enabled: {len(curriculum.stages)} stages, "
+                    f"{curriculum.total_epochs} stage-epochs total")
+        for i in range(len(curriculum.stages)):
+            logger.info(f"  {curriculum.describe(i)}")
+
+    # Build scene dataset
     scene_dataset = SceneDataset.from_megadepth(
         scene_info_dir=data_cfg.get("scene_info_dir", "data/megadepth/scene_info_full/scene_info"),
         image_root=data_cfg.get("image_root", "data/megadepth/megadepth_test_1500"),
-        scene_ids=data_cfg.get("scene_ids"),
-        max_images_per_scene=data_cfg.get("max_images_per_scene", 20),
+        scene_ids=load_scene_ids,
+        max_images_per_scene=load_max_images,
+        min_images_per_scene=data_cfg.get("min_images_per_scene", 5),
     )
     logger.info(f"Scene dataset: {len(scene_dataset.scenes)} scenes")
     for s in scene_dataset.scenes:
@@ -182,12 +346,35 @@ def main():
     save_freq = config["training"].get("save_freq", 5)
     eval_freq = config["training"].get("eval_freq", 5)
 
+    active_dataset = scene_dataset
+    current_stage = -1
+
     for epoch in range(total_epochs):
-        logger.info(f"=== Epoch {epoch} ===")
+        # Curriculum: re-filter the dataset at stage boundaries.
+        if curriculum is not None:
+            stage_idx = curriculum.stage_for_epoch(epoch)
+            if stage_idx != current_stage:
+                current_stage = stage_idx
+                stage = curriculum.stages[stage_idx]
+                active_dataset = scene_dataset.filter(
+                    scenes=stage.scenes, max_images=stage.max_images)
+                logger.info(f"=== Curriculum {curriculum.describe(stage_idx)} ===")
+                if active_dataset.scenes:
+                    for s in active_dataset.scenes:
+                        logger.info(f"    {s['scene_id']}: {s['num_images']} images")
+                else:
+                    logger.warning(
+                        "Curriculum stage matched 0 scenes — "
+                        "falling back to the full dataset for this stage")
+                    active_dataset = scene_dataset
+
+        stage_tag = (f" [curriculum stage {current_stage + 1}/"
+                     f"{len(curriculum.stages)}]" if curriculum is not None else "")
+        logger.info(f"=== Epoch {epoch}{stage_tag} ===")
         epoch_rewards = []
         epoch_episodes = []
 
-        for scene in scene_dataset.scenes:
+        for scene in active_dataset.scenes:
             # Sample group_size rollouts per scene
             scene_episodes = []
             all_failed = True

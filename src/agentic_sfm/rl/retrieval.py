@@ -23,6 +23,33 @@ _retrieval_model = None
 _retrieval_processor = None
 
 
+def _patch_broken_torchaudio() -> None:
+    """Work around a broken torchaudio install blocking transformers v5.
+
+    transformers>=5 imports ``torchaudio`` unconditionally inside
+    ``audio_utils`` (pulled in by ``processing_utils`` -> ``modeling_layers``),
+    so a CUDA-mismatched/broken torchaudio makes *every* model class
+    unimportable — including vision-only ones like Dinov2Model.  Injecting a
+    bare stub module is safe here: the audio helpers are never invoked on
+    this code path.  No-op when torchaudio imports cleanly.
+    """
+    import importlib.machinery
+    import importlib.util
+    import sys
+    import types
+
+    try:
+        import torchaudio  # noqa: F401
+        return
+    except Exception:
+        pass
+    if "torchaudio" not in sys.modules:
+        stub = types.ModuleType("torchaudio")
+        stub.__spec__ = importlib.machinery.ModuleSpec("torchaudio", loader=None)
+        stub.__version__ = "0.0.0"
+        sys.modules["torchaudio"] = stub
+
+
 def _get_retrieval_model():
     """Lazy-load DINOv2 for image retrieval."""
     global _retrieval_model, _retrieval_processor
@@ -31,6 +58,7 @@ def _get_retrieval_model():
 
     try:
         import torch
+        _patch_broken_torchaudio()
         from transformers import AutoImageProcessor, AutoModel
 
         model_name = "facebook/dinov2-small"  # 22M params, fast

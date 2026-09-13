@@ -48,10 +48,25 @@ def estimate_relative_pose(
     K_b: np.ndarray | list | None = None,
     threshold: float = 1.0,
 ) -> dict[str, Any]:
-    """Relative pose via MAGSAC essential matrix. Keypoints in original pixels."""
+    """Relative pose via MAGSAC essential matrix. Keypoints in original pixels.
+
+    Returns num_inliers, inlier_ratio, pose, plus geometric-consistency
+    diagnostics used by the doppelganger detector:
+      - ``mean_inlier_residual``: mean Sampson *distance* of inliers in
+        normalized image coordinates (sqrt of the squared Sampson error).
+      - ``residual_units``: mean residual divided by the RANSAC threshold.
+        Values ~1 mean inliers sit right at the verification boundary —
+        typical of degenerate fits on doppelganger pairs.
+    """
     pts_a = np.asarray(pts_a, dtype=np.float64).reshape(-1, 2)
     pts_b = np.asarray(pts_b, dtype=np.float64).reshape(-1, 2)
-    empty: dict[str, Any] = {"num_inliers": 0, "inlier_ratio": 0.0, "pose": None}
+    empty: dict[str, Any] = {
+        "num_inliers": 0,
+        "inlier_ratio": 0.0,
+        "pose": None,
+        "mean_inlier_residual": None,
+        "residual_units": None,
+    }
     if len(pts_a) < 8 or len(pts_b) < 8:
         return empty
 
@@ -78,10 +93,31 @@ def estimate_relative_pose(
 
     num_inliers = int(mask.sum())
     _, R, t, _ = cv2.recoverPose(E, n_a, n_b, np.eye(3), mask=mask)
+
+    # Mean Sampson distance of the inlier correspondences (normalized coords).
+    inlier_idx = mask.ravel().astype(bool)
+    mean_resid = None
+    resid_units = None
+    if inlier_idx.any():
+        E3 = E[:3] if E.ndim == 2 and E.shape[0] >= 3 else E
+        x1 = np.concatenate([n_a.reshape(-1, 2), np.ones((len(n_a), 1))], axis=1)
+        x2 = np.concatenate([n_b.reshape(-1, 2), np.ones((len(n_b), 1))], axis=1)
+        Ex1 = (E3 @ x1.T).T
+        Etx2 = (E3.T @ x2.T).T
+        numer = (x2 * Ex1).sum(axis=1) ** 2
+        denom = (
+            Ex1[:, 0] ** 2 + Ex1[:, 1] ** 2 + Etx2[:, 0] ** 2 + Etx2[:, 1] ** 2
+        )
+        sampson_sq = numer / np.maximum(denom, 1e-24)
+        mean_resid = float(np.sqrt(sampson_sq[inlier_idx]).mean())
+        resid_units = mean_resid / max(norm_thresh, 1e-12)
+
     return {
         "num_inliers": num_inliers,
         "inlier_ratio": num_inliers / max(len(pts_a), 1),
         "pose": {"R": R.tolist(), "t": t.flatten().tolist()},
+        "mean_inlier_residual": mean_resid,
+        "residual_units": resid_units,
     }
 
 

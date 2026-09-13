@@ -174,8 +174,14 @@ def format_observation(result: dict[str, Any]) -> str:
     if result.get("pose") is not None:
         parts.append("Pose: estimated")
     if "is_doppelganger" in result:
-        score = result.get("score", 0.0)
-        parts.append(f"Doppelganger: {result['is_doppelganger']} (score: {score:.3f})")
+        conf = result.get("confidence", result.get("score", 0.0))
+        parts.append(f"Doppelganger: {result['is_doppelganger']} (confidence: {conf:.3f})")
+        sim = result.get("similarity_score")
+        if sim is not None:
+            parts.append(f"similarity: {float(sim):.3f}")
+        verdict = result.get("verdict")
+        if verdict:
+            parts.append(f"verdict: {verdict}")
     return " | ".join(parts) if parts else json.dumps(result)
 
 

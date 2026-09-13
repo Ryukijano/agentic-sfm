@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,153 @@ from agentic_sfm.tools.client import ToolClient
 
 logger = logging.getLogger(__name__)
 
+# Confidence at/above which a doppelganger_check flags a pair.
+DOPPELGANGER_CONFIDENCE_THRESHOLD = 0.5
+
+# Crop ids look like "<image_id>_crop_<x1>_<y1>_<x2>_<y2>".
+_CROP_SUFFIX_RE = re.compile(r"_crop_\d+_\d+_\d+_\d+$")
+
+
+def _base_image_id(image_id: str) -> str:
+    """Strip a server crop suffix so crop ids map back to their parent."""
+    return _CROP_SUFFIX_RE.sub("", str(image_id))
+
+
+def _pair_key(image_a: str, image_b: str) -> str:
+    """Canonical pair key: sorted base ids joined with '__'."""
+    return "__".join(sorted((_base_image_id(image_a), _base_image_id(image_b))))
+
+
+def _is_flagged_doppelganger(result: dict[str, Any]) -> bool:
+    """True when a doppelganger_check result flags the pair.
+
+    Uses the calibrated ``confidence`` when present (new response format)
+    and falls back to the raw ``is_doppelganger`` bool.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    conf = result.get("confidence", result.get("score"))
+    if conf is not None:
+        try:
+            return float(conf) >= DOPPELGANGER_CONFIDENCE_THRESHOLD
+        except (TypeError, ValueError):
+            pass
+    return bool(result.get("is_doppelganger"))
+
+
+def _sfm_pair_list(
+    ep: SceneRolloutEpisode, registered_ids: dict[str, str]
+) -> tuple[list[list[str]] | None, int, int]:
+    """Build the COLMAP pair list for sfm_run minus flagged doppelgangers.
+
+    Returns ``(pair_list, n_doppelgangers_present, n_doppelgangers_filtered)``.
+    When the agent never called ``doppelganger_check`` the pair list is
+    ``None`` so the server falls back to exhaustive matching (unchanged
+    behaviour).  Otherwise all registered-image pairs are passed except
+    flagged doppelgangers — i.e. "exhaustive minus doppelgangers".
+    """
+    if not ep.doppelganger_checks:
+        return None, 0, 0
+
+    flagged = {
+        key for key, res in ep.doppelganger_checks.items()
+        if _is_flagged_doppelganger(res)
+    }
+    ids = sorted(set(registered_ids.values()))
+    pair_list: list[list[str]] = []
+    n_filtered = 0
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            if _pair_key(a, b) in flagged:
+                n_filtered += 1
+                continue
+            pair_list.append([a, b])
+    return pair_list, len(flagged), n_filtered
+
+
+def _inject_pose_error(
+    ep: SceneRolloutEpisode, gt_recon: dict[str, Any] | None
+) -> None:
+    """Compute ``mean_pose_error_deg`` from the persisted COLMAP model and
+    inject it into ``ep.recon_result`` so ``compute_scene_reward`` can score
+    pose accuracy.
+
+    The tool server cannot compute this itself — it has no GT poses — so we
+    load the reconstruction it wrote to ``output_dir``, align it to the GT
+    cam-from-world poses (Sim(3) on camera centers with a rotational gauge
+    fix), and record the mean geodesic rotation error.  When fewer than 3
+    images are matched we fall back to the gauge-free mean pairwise relative
+    rotation error.  Best-effort: any failure leaves the field absent.
+    """
+    recon = ep.recon_result
+    if not isinstance(recon, dict) or recon.get("error"):
+        return
+    if recon.get("mean_pose_error_deg") is not None:
+        return
+    if not gt_recon or not gt_recon.get("poses"):
+        return
+    output_dir = recon.get("output_dir")
+    if not output_dir:
+        return
+
+    try:
+        from agentic_sfm.eval.scene_eval import (
+            _camera_center,
+            _extract_gt_poses,
+            _index_lookup,
+            _poses_from_colmap_dir,
+            _resolve_image_index,
+            _rot_geodesic_deg,
+            _rotation_gauge,
+            _umeyama,
+            _apply_sim3_to_pose,
+        )
+
+        lookup = _index_lookup(ep)
+        named = _poses_from_colmap_dir(str(output_dir))
+        pred_poses: dict[int, np.ndarray] = {}
+        for name, M in named.items():
+            idx = _resolve_image_index(name, lookup)
+            if idx is not None:
+                pred_poses[idx] = M
+        gt_poses = _extract_gt_poses(gt_recon, lookup)
+        matched = sorted(set(pred_poses) & set(gt_poses))
+        if not matched:
+            return
+
+        if len(matched) >= 3:
+            W = _rotation_gauge(pred_poses, gt_poses, matched)
+            pred_w = {
+                i: _apply_sim3_to_pose(pred_poses[i], 1.0, W, np.zeros(3))
+                for i in matched
+            }
+            src = np.stack([_camera_center(pred_w[i]) for i in matched])
+            dst = np.stack([_camera_center(gt_poses[i]) for i in matched])
+            s, R_res, ts = _umeyama(src, dst)
+            Rs = R_res @ W
+            errs = [
+                _rot_geodesic_deg(
+                    _apply_sim3_to_pose(pred_poses[i], s, Rs, ts)[:3, :3],
+                    gt_poses[i][:3, :3],
+                )
+                for i in matched
+            ]
+        else:
+            # Gauge-free fallback: mean pairwise relative rotation error.
+            errs = []
+            for a_i, i in enumerate(matched):
+                for j in matched[a_i + 1:]:
+                    R_rel_p = pred_poses[j][:3, :3] @ pred_poses[i][:3, :3].T
+                    R_rel_g = gt_poses[j][:3, :3] @ gt_poses[i][:3, :3].T
+                    errs.append(_rot_geodesic_deg(R_rel_p, R_rel_g))
+
+        if errs:
+            recon["mean_pose_error_deg"] = float(np.mean(errs))
+            recon["num_poses_evaluated"] = len(matched)
+    except Exception as e:
+        logger.debug(f"Pose-error injection skipped: {e}")
+
+
 # System prompt for scene-level episodes
 SCENE_SYSTEM_PROMPT = """You are an SfM reconstruction agent. You are given a set of images from a scene.
 Your goal is to reconstruct the scene by matching image pairs and running COLMAP.
@@ -46,7 +194,7 @@ Available tools:
 - retrieve: find candidate image pairs to match
 - match: match a specific image pair
 - crop_and_match: crop one image then match to the other
-- doppelganger_check: check if a pair is a doppelganger (looks similar but different scene)
+- doppelganger_check: check if a pair is a doppelganger (looks similar but different scene); returns a calibrated confidence, visual similarity, and geometric inlier ratio
 - sfm_run: run COLMAP reconstruction on registered images
 - inspect: inspect the current reconstruction
 - done: end the episode
@@ -79,6 +227,11 @@ class SceneRolloutEpisode:
 
     # Pair-level matches collected during the episode
     pair_matches: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # Doppelganger checks: canonical pair key ("idA__idB", sorted, crop
+    # suffixes stripped) -> raw /doppelganger_check response.  Pairs whose
+    # confidence exceeds the flag threshold are excluded from sfm_run.
+    doppelganger_checks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Final reconstruction result
     recon_result: dict[str, Any] = field(default_factory=dict)
@@ -215,6 +368,14 @@ def run_scene_episode(
             if kept:
                 ep.final_match = kept
 
+        # Track doppelganger checks: flagged pairs are excluded from the
+        # sfm_run pair list and counted for the doppelganger reward.
+        if tc.tool == "doppelganger_check" and not result.get("error"):
+            key = _pair_key(
+                tc.args.get("image_a", "?"), tc.args.get("image_b", "?")
+            )
+            ep.doppelganger_checks[key] = result
+
         # Track reconstruction result
         if tc.tool == "sfm_run":
             ep.recon_result = result
@@ -222,6 +383,9 @@ def run_scene_episode(
         # Format observation
         obs_text = format_observation(result)
         ep.messages.append({"role": "user", "content": f"Observation: {obs_text}"})
+
+    # Inject GT pose error into recon_result before reward computation
+    _inject_pose_error(ep, gt_recon)
 
     # Compute scene-level reward
     agent_reward_cfg = getattr(agent, "reward_config", {})
@@ -356,7 +520,15 @@ def run_scene_oracle_episode(
     oracle_calls.append(ToolCall(tool="sfm_run", args={}))
     oracle_responses.append(json.dumps({"tool": "sfm_run", "args": {}}))
     try:
-        image_dir = str(Path(image_paths[0]).parent) if image_paths else ""
+        if image_paths:
+            p0 = Path(image_paths[0])
+            if not p0.is_absolute() and image_root:
+                p0 = Path(image_root) / p0
+            image_dir = str(p0.parent)
+        elif image_root:
+            image_dir = str(image_root)
+        else:
+            image_dir = ""
         recon_result = tool_client.sfm_run(image_dir=image_dir)
         oracle_results.append(recon_result)
     except Exception as e:
@@ -390,6 +562,10 @@ def run_scene_oracle_episode(
         {"role": "user", "content": f"Observation: {format_observation(recon_result)}"},
         {"role": "assistant", "content": oracle_responses[-1]},  # done
     ]
+
+    # Inject GT pose error before reward computation
+    _inject_pose_error(ep, gt_recon)
+    recon_result = ep.recon_result  # may now contain mean_pose_error_deg
 
     # Compute reward
     agent_reward_cfg = getattr(agent, "reward_config", {})
@@ -444,8 +620,22 @@ def _execute_scene_tool(
         return {"pairs": pairs, "num_pairs": len(pairs)}
 
     if tc.tool == "sfm_run":
-        image_dir = str(Path(ep.image_paths[0]).parent) if ep.image_paths else ""
-        return tool_client.sfm_run(image_dir=image_dir)
+        # Resolve image_dir via image_root when image_paths are relative.
+        if ep.image_paths:
+            p0 = Path(ep.image_paths[0])
+            if not p0.is_absolute() and ep.image_root:
+                p0 = Path(ep.image_root) / p0
+            image_dir = str(p0.parent)
+        elif ep.image_root:
+            image_dir = str(ep.image_root)
+        else:
+            image_dir = ""
+        pair_list, n_present, n_filtered = _sfm_pair_list(ep, registered_ids)
+        result = tool_client.sfm_run(image_dir=image_dir, pair_list=pair_list)
+        if isinstance(result, dict):
+            result.setdefault("num_doppelgangers_present", n_present)
+            result.setdefault("num_doppelgangers_filtered", n_filtered)
+        return result
 
     if tc.tool == "inspect":
         recon_dir = args.get("recon_dir", ep.recon_result.get("output_dir", ""))

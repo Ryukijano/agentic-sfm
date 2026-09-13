@@ -281,6 +281,8 @@ def _match_loftr(
         "num_inliers": pose_result["num_inliers"],
         "pose": pose_result["pose"],
         "inlier_ratio": pose_result["inlier_ratio"],
+        "mean_residual": pose_result.get("mean_inlier_residual"),
+        "residual_units": pose_result.get("residual_units"),
         "keypoints_a": mkpts_a.tolist()[:100],
         "keypoints_b": mkpts_b.tolist()[:100],
     }
@@ -358,6 +360,8 @@ def _match_mast3r(
             "num_inliers": pose_result["num_inliers"],
             "pose": pose_result["pose"],
             "inlier_ratio": pose_result["inlier_ratio"],
+            "mean_residual": pose_result.get("mean_inlier_residual"),
+            "residual_units": pose_result.get("residual_units"),
             "keypoints_a": matches_im0.tolist()[:100],
             "keypoints_b": matches_im1.tolist()[:100],
         }
@@ -408,6 +412,8 @@ def _match_lightglue(
         "num_inliers": pose_result["num_inliers"],
         "pose": pose_result["pose"],
         "inlier_ratio": pose_result["inlier_ratio"],
+        "mean_residual": pose_result.get("mean_inlier_residual"),
+        "residual_units": pose_result.get("residual_units"),
         "keypoints_a": mkpts_a.tolist()[:100],
         "keypoints_b": mkpts_b.tolist()[:100],
     }
@@ -434,23 +440,62 @@ def _estimate_pose_ransac(
     return estimate_relative_pose(pts_a, pts_b, size_a, size_b, K_a=K_a, K_b=K_b)
 
 
+_DOPPELGANGER_DETECTOR = None
+
+
+def _get_doppelganger_detector():
+    """Lazy-load the shared DINOv2+geometry doppelganger detector."""
+    global _DOPPELGANGER_DETECTOR
+    if _DOPPELGANGER_DETECTOR is not None:
+        return _DOPPELGANGER_DETECTOR
+    try:
+        from agentic_sfm.tools.doppelganger import DoppelgangerDetector
+
+        _DOPPELGANGER_DETECTOR = DoppelgangerDetector(device=_torch_device())
+    except Exception as e:
+        logger.warning("Could not create DoppelgangerDetector: %s", e)
+        _DOPPELGANGER_DETECTOR = None
+    return _DOPPELGANGER_DETECTOR
+
+
 def tool_doppelganger_check(image_a: str, image_b: str) -> dict[str, Any]:
-    """Check if image pair is a doppelganger (visually similar but distinct)."""
-    # Placeholder: use MASt3R match count as proxy
-    # TODO: load Doppelgangers++ checkpoint
+    """Check if image pair is a doppelganger (visually similar but distinct).
+
+    Uses the DINOv2 + geometric-consistency detector from
+    ``agentic_sfm.tools.doppelganger``: high appearance similarity with
+    failed essential-matrix verification -> calibrated confidence.
+    Falls back to the legacy match-count heuristic on failure.
+    """
     match_result = tool_match(image_a, image_b, matcher="loftr")
+
+    detector = _get_doppelganger_detector()
+    if detector is not None:
+        # Resolve registered ids to paths / arrays for the embedder.
+        entry_a = _IMAGE_STORE.get(image_a)
+        entry_b = _IMAGE_STORE.get(image_b)
+        if isinstance(entry_a, str) and isinstance(entry_b, str):
+            try:
+                return detector.check(entry_a, entry_b, match_result=match_result)
+            except Exception as e:
+                logger.error("Doppelganger detector failed: %s", e)
+
+    # Heuristic fallback — preserves the old contract on any failure.
     num_matches = match_result.get("num_matches", 0)
     inlier_ratio = match_result.get("inlier_ratio", 0.0)
-
-    # Heuristic: high matches but very low inlier ratio → likely doppelganger
     is_doppelganger = num_matches > 50 and inlier_ratio < 0.1
-    score = 1.0 - inlier_ratio if num_matches > 50 else 0.0
+    confidence = (1.0 - inlier_ratio) * 0.6 if is_doppelganger else 0.0
 
     return {
         "is_doppelganger": is_doppelganger,
-        "score": score,
+        "confidence": confidence,
+        "score": confidence,
+        "similarity_score": None,
         "num_matches": num_matches,
         "inlier_ratio": inlier_ratio,
+        "num_inliers": int(match_result.get("num_inliers") or 0),
+        "residual_units": match_result.get("residual_units"),
+        "verdict": "doppelganger" if is_doppelganger else "uncertain",
+        "method": "heuristic_fallback",
     }
 
 
