@@ -331,8 +331,22 @@ def compute_scene_reward(
     registration_weight: float = 0.5,
     pose_weight: float = 1.0,
     split_penalty: float = 0.5,
+    doppelganger_weight: float = 0.3,
+    accumulative_tool_coef: float = 0.1,
+    use_accumulative_tool_reward: bool = True,
+    num_valid_calls: int = 0,
+    tool_calls: list[ToolCall] | None = None,
+    tool_results: list[dict[str, Any]] | None = None,
+    ntep_intent_coef: float = 0.05,
+    ntep_redundancy_penalty: float = 0.05,
+    use_ntep_rewards: bool = False,
 ) -> dict[str, Any]:
-    """Compute reward for a scene-level SfM episode."""
+    """Compute reward for a scene-level SfM episode.
+
+    Uses the same reward framework as compute_pair_reward: accumulative tool
+    reward (not per-call penalty), optional NTEP process rewards, plus
+    scene-specific components (registration, split, doppelganger filtering).
+    """
     components: dict[str, Any] = {}
 
     num_registered = recon_result.get("num_registered", 0)
@@ -355,12 +369,45 @@ def compute_scene_reward(
     else:
         components["pose_reward"] = 0.0
 
-    components["tool_cost"] = -tool_cost * num_tool_calls
+    # Doppelganger filtering: reward for correctly identifying and filtering
+    # doppelganger pairs (images that look similar but are different scenes).
+    n_doppel_filtered = recon_result.get("num_doppelgangers_filtered", 0)
+    n_doppel_total = recon_result.get("num_doppelgangers_present", 0)
+    if n_doppel_total > 0:
+        doppel_rate = n_doppel_filtered / n_doppel_total
+        components["doppelganger_reward"] = doppelganger_weight * doppel_rate
+    else:
+        components["doppelganger_reward"] = 0.0
+
+    # Accumulative tool reward (replaces per-call penalty)
+    if use_accumulative_tool_reward:
+        outcome_correct = float(components["pose_reward"]) > pose_weight * 0.5
+        components["accumulative_tool_reward"] = (
+            accumulative_tool_coef * num_valid_calls * (1.0 if outcome_correct else 0.0)
+        )
+        components["tool_cost"] = 0.0
+    else:
+        components["tool_cost"] = -tool_cost * num_tool_calls
+        components["accumulative_tool_reward"] = 0.0
+
+    # NTEP process rewards
+    if use_ntep_rewards and tool_calls:
+        n_aligned, n_redundant = _ntep_process_reward_counts(tool_calls, tool_results)
+        components["ntep_intent_reward"] = ntep_intent_coef * n_aligned
+        components["ntep_redundancy_penalty"] = -ntep_redundancy_penalty * n_redundant
+    else:
+        components["ntep_intent_reward"] = 0.0
+        components["ntep_redundancy_penalty"] = 0.0
+
     components["total_reward"] = float(
         components["registration_reward"]
         + components["split_penalty"]
         + components["pose_reward"]
+        + components["doppelganger_reward"]
         + components["tool_cost"]
+        + components["accumulative_tool_reward"]
+        + components["ntep_intent_reward"]
+        + components["ntep_redundancy_penalty"]
     )
     return components
 

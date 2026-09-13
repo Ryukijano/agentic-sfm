@@ -9,6 +9,10 @@ from agentic_sfm.rl.rc_grpo import (
     HIGH_REWARD_TOKEN,
     LOW_REWARD_TOKEN,
 )
+from agentic_sfm.rl.scene_episode import (
+    SceneRolloutEpisode,
+    run_scene_episode,
+)
 
 __all__ = [
     "FissionGRPO",
@@ -20,4 +24,6 @@ __all__ = [
     "prepare_rctp_training_data",
     "HIGH_REWARD_TOKEN",
     "LOW_REWARD_TOKEN",
+    "SceneRolloutEpisode",
+    "run_scene_episode",
 ]

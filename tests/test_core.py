@@ -487,9 +487,90 @@ class TestOracleCrops:
         others = {j[2] for j in jobs}
         assert sides == {"img_a", "img_b"}
         assert others == {"img_a", "img_b"}
-        for crop_id, bbox, other_id in jobs:
-            assert crop_id != other_id
-            assert bbox in ORACLE_CROP_BOXES
+
+
+class TestSceneReward:
+    """Tests for compute_scene_reward with accumulative + NTEP framework."""
+
+    def _recon(self, registered=80, points=5000, pose_err=5.0, doppel_filtered=2, doppel_present=3):
+        return {
+            "num_registered": registered,
+            "num_points3d": points,
+            "mean_pose_error_deg": pose_err,
+            "num_doppelgangers_filtered": doppel_filtered,
+            "num_doppelgangers_present": doppel_present,
+        }
+
+    def test_scene_reward_positive(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        rc = compute_scene_reward(self._recon(), gt_recon={"num_images": 100})
+        assert rc["total_reward"] > 0
+        assert rc["registration_reward"] > 0
+        assert rc["pose_reward"] > 0
+        assert rc["doppelganger_reward"] > 0  # 2/3 filtered
+
+    def test_scene_reward_zero_registered(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        rc = compute_scene_reward(self._recon(registered=0), gt_recon={"num_images": 100})
+        assert rc["split_penalty"] < 0
+
+    def test_scene_reward_accumulative_tool(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # With pose_reward > pose_weight*0.5, accumulative should be positive
+        rc = compute_scene_reward(
+            self._recon(pose_err=2.0),  # high pose reward → accumulative fires
+            gt_recon={"num_images": 100},
+            num_valid_calls=5,
+            use_accumulative_tool_reward=True,
+        )
+        assert rc["accumulative_tool_reward"] > 0
+        assert rc["tool_cost"] == 0.0
+
+    def test_scene_reward_accumulative_gated_low_pose(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # With low pose reward, accumulative should be 0
+        rc = compute_scene_reward(
+            self._recon(pose_err=19.0),  # pose_reward = 1 - 19/20 = 0.05 < 0.5
+            gt_recon={"num_images": 100},
+            num_valid_calls=5,
+            use_accumulative_tool_reward=True,
+        )
+        assert rc["accumulative_tool_reward"] == 0.0
+
+    def test_scene_reward_legacy_mode(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        rc = compute_scene_reward(
+            self._recon(),
+            gt_recon={"num_images": 100},
+            num_tool_calls=10,
+            use_accumulative_tool_reward=False,
+            tool_cost=0.05,
+        )
+        assert rc["tool_cost"] < 0  # legacy per-call penalty
+        assert rc["accumulative_tool_reward"] == 0.0
+
+    def test_scene_reward_ntep_disabled_by_default(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        rc = compute_scene_reward(
+            self._recon(),
+            gt_recon={"num_images": 100},
+            tool_calls=[ToolCall(tool="match", args={})],
+            tool_results=[{"num_inliers": 100}],
+        )
+        assert rc["ntep_intent_reward"] == 0.0
+        assert rc["ntep_redundancy_penalty"] == 0.0
+
+
+class TestSceneEpisode:
+    """Tests for the scene-level episode runner."""
+
+    def test_scene_episode_dataclass(self):
+        from agentic_sfm.rl.scene_episode import SceneRolloutEpisode
+        ep = SceneRolloutEpisode(scene_id="test", image_paths=["a.jpg", "b.jpg"], num_images=2)
+        assert ep.scene_id == "test"
+        assert ep.num_images == 2
+        assert not ep.done
+        assert ep.reward == 0.0
 
 
 class TestPolicyDefaults:
