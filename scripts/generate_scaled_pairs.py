@@ -60,7 +60,8 @@ def load_scene_pairs_from_overlap_matrix(npz_path: str, image_root: str,
     existing_indices = []
     for i, p in enumerate(image_paths):
         if p is not None:
-            full_path = os.path.join(image_root, str(p))
+            p_str = p.decode() if isinstance(p, bytes) else str(p)
+            full_path = os.path.join(image_root, p_str)
             if os.path.exists(full_path):
                 existing_indices.append(i)
 
@@ -81,12 +82,19 @@ def load_scene_pairs_from_overlap_matrix(npz_path: str, image_root: str,
             if overlap <= 0:
                 continue
 
-            path_a = os.path.join(image_root, str(image_paths[i_global]))
-            path_b = os.path.join(image_root, str(image_paths[j_global]))
+            pa_str = image_paths[i_global]
+            pb_str = image_paths[j_global]
+            pa_str = pa_str.decode() if isinstance(pa_str, bytes) else str(pa_str)
+            pb_str = pb_str.decode() if isinstance(pb_str, bytes) else str(pb_str)
+            path_a = os.path.join(image_root, pa_str)
+            path_b = os.path.join(image_root, pb_str)
 
-            pose_a = np.array(poses[i_global])
-            pose_b = np.array(poses[j_global])
-            if pose_a is None or pose_b is None:
+            raw_a, raw_b = poses[i_global], poses[j_global]
+            if raw_a is None or raw_b is None:
+                continue
+            pose_a = np.array(raw_a)
+            pose_b = np.array(raw_b)
+            if pose_a.ndim < 2 or pose_b.ndim < 2:
                 continue
 
             R_rel, t_rel = compute_relative_pose(pose_a, pose_b)
@@ -191,6 +199,11 @@ def main():
         train_pairs.extend(subset[n_val:])
 
     logger.info(f"Train: {len(train_pairs)} | Val: {len(val_pairs)}")
+
+    # Shuffle train/val so file order is not difficulty-ordered (subsets like
+    # [:50] must sample all bins, not just the first difficulty).
+    rng.shuffle(train_pairs)
+    rng.shuffle(val_pairs)
 
     # Save
     train_path = output_dir / "hard_pairs_train.json"

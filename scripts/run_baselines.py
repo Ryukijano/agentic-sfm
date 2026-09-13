@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Baseline evaluation for agentic SfM — no policy model required.
 
 Runs pure tool-server baselines on the hard-pairs dataset and scores each
@@ -263,8 +263,14 @@ def paired_bootstrap(
 ) -> dict[str, Any]:
     """Paired bootstrap on mean(x) - mean(y) over resampled pair indices.
 
-    Reports the 95% percentile CI and a two-sided p-value
-    2 * min(P(diff <= 0), P(diff >= 0)).
+    Reports the 95% percentile CI and a two-sided p-value from a sign-flipping
+    permutation test (the paired-data analogue of the permutation test).
+
+    The CI is the bootstrap percentile interval on mean(x) - mean(y).
+    The p-value uses the null distribution obtained by randomly flipping the
+    sign of each pair's difference — valid because under the null hypothesis
+    (no difference between baselines), the sign of each pair's difference is
+    symmetric around 0.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -272,6 +278,8 @@ def paired_bootstrap(
     if n == 0:
         return {"n_pairs": 0}
     rng = np.random.default_rng(seed)
+
+    # Bootstrap CI on mean(x) - mean(y)
     diffs = np.empty(n_boot, dtype=np.float64)
     done = 0
     while done < n_boot:
@@ -280,7 +288,21 @@ def paired_bootstrap(
         diffs[done : done + b] = x[idx].mean(axis=1) - y[idx].mean(axis=1)
         done += b
     lo, hi = np.percentile(diffs, [2.5, 97.5])
-    p_two_sided = 2.0 * min(float((diffs <= 0).mean()), float((diffs >= 0).mean()))
+
+    # Permutation p-value: flip each pair's sign randomly, measure how often
+    # the permuted mean diff is at least as extreme as the observed one.
+    obs_diff = x.mean() - y.mean()
+    pair_diffs = x - y
+    perm_diffs = np.empty(n_boot, dtype=np.float64)
+    done = 0
+    while done < n_boot:
+        b = min(2000, n_boot - done)
+        signs = rng.choice([-1.0, 1.0], size=(b, n))
+        perm_diffs[done : done + b] = (signs * pair_diffs[np.newaxis, :]).mean(axis=1)
+        done += b
+    p_two_sided = float(np.mean(np.abs(perm_diffs) >= np.abs(obs_diff)))
+    p_two_sided = min(p_two_sided, 1.0)
+
     return {
         "n_pairs": int(n),
         "mean_x": float(x.mean()),
@@ -288,8 +310,8 @@ def paired_bootstrap(
         "mean_diff": float(x.mean() - y.mean()),
         "ci95_lo": float(lo),
         "ci95_hi": float(hi),
-        "p_value": float(min(p_two_sided, 1.0)),
-        "significant_05": bool(min(p_two_sided, 1.0) < 0.05),
+        "p_value": float(p_two_sided),
+        "significant_05": bool(p_two_sided < 0.05),
     }
 
 

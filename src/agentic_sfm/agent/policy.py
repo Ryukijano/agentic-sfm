@@ -387,13 +387,15 @@ class AgenticSfMAgent:
                 crop_content[-1]["text"] += f" Use id {cid} in match."
             messages.append({"role": "user", "content": crop_content})
 
-        num_valid = len(episode.tool_calls)
+        num_valid = sum(1 for tc in episode.tool_calls if tc.tool != "done")
         episode.reward_components = compute_pair_reward(
             episode.final_match or {},
             gt_pose=gt_pose,
             num_tool_calls=len(episode.tool_calls) + num_invalid,
             num_invalid_calls=num_invalid,
             num_valid_calls=num_valid,
+            tool_calls=episode.tool_calls,
+            tool_results=episode.results,
         )
         episode.reward = episode.reward_components["total_reward"]
 

@@ -160,7 +160,7 @@ def _ntep_intent_satisfied(tool: str, args: dict[str, Any], result: Any) -> bool
       - doppelganger_check → "verify scene identity" → needs is_doppelganger
     """
     if isinstance(result, dict):
-        if result.get("error"):
+        if "error" in result and result["error"] is not None:
             return False
         res = result
     else:
@@ -183,7 +183,17 @@ def _ntep_process_reward_counts(
 
     ``tool_results`` are paired with non-``done`` calls in order (callers only
     record results for executed calls; the terminal ``done`` produces none).
+    A length mismatch between non-done calls and results is logged and the
+    shorter length is used.
     """
+    n_non_done = sum(1 for tc in tool_calls if getattr(tc, "tool", None) not in (None, "done"))
+    n_results = len(tool_results) if tool_results else 0
+    if tool_results is not None and n_results != n_non_done:
+        logger.debug(
+            f"NTEP tool_results length ({n_results}) != non-done tool_calls "
+            f"({n_non_done}); pairing first {min(n_results, n_non_done)}"
+        )
+
     n_aligned = 0
     n_redundant = 0
     seen_goals: dict[Hashable, list[list[float] | None]] = {}
@@ -284,8 +294,10 @@ def compute_pair_reward(
 
     if use_accumulative_tool_reward:
         # PyVision-RL: reward tool calls only when outcome is correct.
-        # "Correct" = pose_reward > 0 (at least one AUC threshold passed).
-        outcome_correct = float(components["pose_reward"]) > 0.0
+        # "Correct" = pose_reward > pose_weight * 0.5, i.e. at least 2 of 3
+        # AUC thresholds passed (5°,10°,20°). This is stricter than ">0" to
+        # prevent rewarding barely-lucky outcomes.
+        outcome_correct = float(components["pose_reward"]) > pose_weight * 0.5
         components["accumulative_tool_reward"] = (
             accumulative_tool_coef * num_valid_calls * (1.0 if outcome_correct else 0.0)
         )

@@ -213,6 +213,9 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         num_valid_calls = 0
         num_invalid_calls = 0
         terminated = False
+        # Track tool calls and results for NTEP process rewards
+        tool_calls: list[ToolCall] = []
+        tool_results: list[dict[str, Any]] = []
 
         start_time = time.time()
         for turn in range(self.max_tool_calls):
@@ -262,6 +265,7 @@ class AgenticSfmAgentLoop(AgentLoopBase):
                 continue
 
             if tc.tool == "done":
+                tool_calls.append(tc)
                 terminated = True
                 break
 
@@ -271,6 +275,9 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             except Exception as exc:
                 logger.warning("[%s] Tool execution failed for %s: %s", pair_id, tc.tool, exc)
                 result = {"error": str(exc)}
+
+            tool_calls.append(tc)
+            tool_results.append(result)
 
             if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
                 kept = keep_best_match(final_match_result or None, result)
@@ -352,6 +359,11 @@ class AgenticSfmAgentLoop(AgentLoopBase):
                 "pose_weight",
                 "format_weight",
                 "invalid_penalty",
+                "accumulative_tool_coef",
+                "use_accumulative_tool_reward",
+                "ntep_intent_coef",
+                "ntep_redundancy_penalty",
+                "use_ntep_rewards",
             }
         }
         reward_components = compute_pair_reward(
@@ -360,6 +372,8 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             num_tool_calls=num_tool_calls,
             num_invalid_calls=num_invalid_calls,
             num_valid_calls=num_valid_calls,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
             **reward_kwargs,
         )
         total_reward = float(reward_components.get("total_reward", 0.0))

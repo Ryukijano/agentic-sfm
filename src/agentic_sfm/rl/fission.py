@@ -291,7 +291,7 @@ class FissionGRPO:
         ep.messages = messages
 
         from agentic_sfm.rewards.pose_rewards import compute_pair_reward
-        num_valid = len(ep.tool_calls)
+        num_valid = sum(1 for tc in ep.tool_calls if getattr(tc, "tool", None) != "done")
         num_invalid = sum(
             1 for r in ep.results
             if "error" in r and "Unknown tool" not in str(r.get("error", ""))
@@ -306,6 +306,13 @@ class FissionGRPO:
             pose_weight=self.agent.pose_weight,
             format_weight=self.agent.format_weight,
             invalid_penalty=self.agent.invalid_penalty,
+            accumulative_tool_coef=getattr(self.agent, "accumulative_tool_coef", 0.1),
+            use_accumulative_tool_reward=getattr(self.agent, "use_accumulative_tool_reward", True),
+            tool_calls=ep.tool_calls,
+            tool_results=ep.results,
+            ntep_intent_coef=getattr(self.agent, "ntep_intent_coef", 0.05),
+            ntep_redundancy_penalty=getattr(self.agent, "ntep_redundancy_penalty", 0.05),
+            use_ntep_rewards=getattr(self.agent, "use_ntep_rewards", False),
         )
         ep.reward = ep.reward_components["total_reward"]
 

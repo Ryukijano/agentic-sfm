@@ -320,14 +320,20 @@ class VLLMRolloutAgent:
 
     def run_oracle_episode(self, pair_id: str, image_a_path: str, image_b_path: str,
                            tool_client: ToolClient, gt_pose: dict | None = None,
-                           K_a=None, K_b=None) -> RolloutEpisode:
+                           K_a=None, K_b=None,
+                           failed_group_max_reward: float = 0.0) -> RolloutEpisode:
         """S-GRPO CGI: generate an oracle trajectory using heuristic crop boxes.
 
         Tries each ORACLE_CROP_BOX on both images, runs crop_and_match, keeps
         the best result. Constructs a synthetic episode with the oracle
-        trajectory and max reward (for group-relative advantage injection).
+        trajectory and guarantees reward >= failed_group_max_reward so the
+        injected trajectory always yields positive advantage in the group.
+
+        ``failed_group_max_reward`` is the highest reward among the failed
+        rollouts in this group (usually 0 or negative). The oracle's final
+        reward is max(computed_reward, failed_group_max_reward + epsilon).
         """
-        from agentic_sfm.geometry import iter_oracle_crops, keep_best_match, k_for_image
+        from agentic_sfm.geometry import iter_oracle_crops, keep_best_match
 
         ep = RolloutEpisode(pair_id=pair_id, image_a=image_a_path, image_b=image_b_path)
         tool_client.register_image("img_a", image_a_path)
@@ -337,31 +343,32 @@ class VLLMRolloutAgent:
         img_b_b64 = self._encode_image(image_b_path)
         ep.images = [img_a_b64, img_b_b64]
 
+        match_kwargs = {"matcher": self.matcher}
+        if K_a is not None:
+            match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
+        if K_b is not None:
+            match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
+
         best_match = None
-        best_crop_info: tuple[str, list[float]] | None = None
+        best_crop_info: tuple[str, list[float], str] | None = None
 
         for crop_img_id, bbox, other_img_id in iter_oracle_crops():
             try:
+                # execute_sfm_tool expects: image_id (crop target), bbox, image_b (other side)
                 tc = ToolCall(
                     tool="crop_and_match",
                     args={
-                        "crop_image_id": crop_img_id,
+                        "image_id": crop_img_id,
                         "bbox": bbox,
-                        "match_image_id": other_img_id,
+                        "image_b": other_img_id,
                         "matcher": self.matcher,
                     },
                 )
-                match_kwargs = {"matcher": self.matcher}
-                if K_a is not None:
-                    match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
-                if K_b is not None:
-                    match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
-
                 result = execute_sfm_tool(tool_client, tc, match_kwargs)
                 if result and not result.get("error"):
                     best_match = keep_best_match(best_match, result)
                     if best_match is result:
-                        best_crop_info = (crop_img_id, bbox)
+                        best_crop_info = (crop_img_id, bbox, other_img_id)
             except Exception as e:
                 logger.debug(f"Oracle crop failed for {crop_img_id} {bbox}: {e}")
                 continue
@@ -369,14 +376,9 @@ class VLLMRolloutAgent:
         # Also try full-frame match as baseline
         try:
             tc_full = ToolCall(tool="match", args={
-                "image_a_id": "img_a", "image_b_id": "img_b",
+                "image_a": "img_a", "image_b": "img_b",
                 "matcher": self.matcher,
             })
-            match_kwargs = {"matcher": self.matcher}
-            if K_a is not None:
-                match_kwargs["K_a"] = K_a if not hasattr(K_a, "tolist") else K_a.tolist()
-            if K_b is not None:
-                match_kwargs["K_b"] = K_b if not hasattr(K_b, "tolist") else K_b.tolist()
             full_result = execute_sfm_tool(tool_client, tc_full, match_kwargs)
             best_match = keep_best_match(best_match, full_result)
             if best_match is full_result:
@@ -384,30 +386,51 @@ class VLLMRolloutAgent:
         except Exception:
             pass
 
-        # Construct synthetic oracle trajectory
+        # Construct synthetic oracle trajectory with correct arg names
+        oracle_tool_calls: list[ToolCall] = []
         if best_crop_info:
-            crop_img_id, bbox = best_crop_info
-            oracle_response = json.dumps({
-                "tool": "crop_and_match",
-                "args": {
-                    "crop_image_id": crop_img_id,
+            crop_img_id, bbox, other_img_id = best_crop_info
+            oracle_tc = ToolCall(
+                tool="crop_and_match",
+                args={
+                    "image_id": crop_img_id,
                     "bbox": bbox,
-                    "match_image_id": "img_b" if crop_img_id == "img_a" else "img_a",
+                    "image_b": other_img_id,
                     "matcher": self.matcher,
                 },
-            })
+            )
+            oracle_response = json.dumps({"tool": "crop_and_match", "args": oracle_tc.args})
         else:
-            oracle_response = json.dumps({
-                "tool": "match",
-                "args": {"image_a_id": "img_a", "image_b_id": "img_b", "matcher": self.matcher},
-            })
+            oracle_tc = ToolCall(
+                tool="match",
+                args={"image_a": "img_a", "image_b": "img_b", "matcher": self.matcher},
+            )
+            oracle_response = json.dumps({"tool": "match", "args": oracle_tc.args})
 
-        ep.tool_calls = [ToolCall(tool="done", args={})]
-        ep.assistant_responses = [oracle_response, json.dumps({"tool": "done"})]
+        done_tc = ToolCall(tool="done", args={})
+        ep.tool_calls = [oracle_tc, done_tc]
+        ep.assistant_responses = [oracle_response, json.dumps({"tool": "done", "args": {}})]
         ep.final_match = best_match
         ep.results = [best_match or {}]
 
-        # Build minimal messages for logprob computation
+        # Build messages matching run_episode's structure (with crop image if available)
+        obs_text = f"Observation: {format_observation(best_match or {})}"
+        obs_content: list | str = obs_text
+        crop_b64 = None
+        if best_match:
+            crop_b64 = (best_match.get("image_b64")
+                        or (best_match.get("crop") or {}).get("image_b64"))
+            crop_path = (best_match.get("path")
+                         or (best_match.get("crop") or {}).get("path"))
+            if not crop_b64 and crop_path and os.path.exists(crop_path):
+                crop_b64 = self._encode_image(crop_path)
+        if crop_b64:
+            ep.images.append(crop_b64)
+            obs_content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
+                {"type": "text", "text": obs_text},
+            ]
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
@@ -416,19 +439,26 @@ class VLLMRolloutAgent:
                 {"type": "text", "text": "Match these two images. Call tools to achieve the best matching result, then output {\"tool\": \"done\"}."},
             ]},
             {"role": "assistant", "content": oracle_response},
-            {"role": "user", "content": f"Observation: {format_observation(best_match or {})}"},
-            {"role": "assistant", "content": json.dumps({"tool": "done"})},
+            {"role": "user", "content": obs_content},
+            {"role": "assistant", "content": json.dumps({"tool": "done", "args": {}})},
         ]
         ep.messages = messages
 
-        # Compute oracle reward (should be high — this is the expert trajectory)
+        # Apply same reward schedule as normal episodes
+        pose_w = self.pose_weight
+        format_w = self.format_weight
+        if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
+            pose_w = pose_w * (1.0 / 3.0)
+        elif self.reward_schedule == "dynamic":
+            format_w = format_w * 0.5
+
         ep.reward_components = compute_pair_reward(
             ep.final_match or {}, gt_pose=gt_pose,
-            num_tool_calls=1, num_invalid_calls=0, num_valid_calls=1,
+            num_tool_calls=2, num_invalid_calls=0, num_valid_calls=1,
             tool_cost=self.tool_cost,
             inlier_weight=self.inlier_weight,
-            pose_weight=self.pose_weight,
-            format_weight=self.format_weight,
+            pose_weight=pose_w,
+            format_weight=format_w,
             invalid_penalty=self.invalid_penalty,
             accumulative_tool_coef=self.accumulative_tool_coef,
             use_accumulative_tool_reward=self.use_accumulative_tool_reward,
@@ -439,6 +469,14 @@ class VLLMRolloutAgent:
             use_ntep_rewards=self.use_ntep_rewards,
         )
         ep.reward = ep.reward_components["total_reward"]
+
+        # S-GRPO: guarantee oracle reward > all failed rollouts in the group
+        # so it always yields positive advantage. Small epsilon ensures strictly
+        # greater even when computed reward happens to tie.
+        if ep.reward <= failed_group_max_reward:
+            ep.reward = failed_group_max_reward + 0.1
+            ep.reward_components["oracle_floor_boost"] = ep.reward - ep.reward_components["total_reward"]
+
         return ep
 
 
@@ -617,6 +655,7 @@ class GRPOTrainer:
             # S-GRPO CGI: if all rollouts failed, inject oracle trajectory
             if self.sgrpo_cgi and all_failed and group_episodes:
                 gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
+                failed_max = max(e.reward for e in group_episodes)
                 oracle_ep = rollout_agent.run_oracle_episode(
                     pair_id=pair.pair_id,
                     image_a_path=pair.image_a,
@@ -625,10 +664,18 @@ class GRPOTrainer:
                     gt_pose=gt_pose,
                     K_a=pair.K_a,
                     K_b=pair.K_b,
+                    failed_group_max_reward=failed_max,
                 )
-                if oracle_ep.reward > 0:
-                    # Replace the worst rollout with the oracle trajectory
-                    group_episodes[0] = oracle_ep
+                if oracle_ep.reward > failed_max:
+                    if len(group_episodes) == 1:
+                        # Append so the group has >1 member (zero-variance filter
+                        # would drop a single-episode group).
+                        group_episodes.append(oracle_ep)
+                    else:
+                        # Replace the worst rollout with the oracle trajectory.
+                        worst_idx = min(range(len(group_episodes)),
+                                        key=lambda i: group_episodes[i].reward)
+                        group_episodes[worst_idx] = oracle_ep
                     cgi_injections += 1
                     logger.debug(f"  S-GRPO CGI: injected oracle for {pair.pair_id} (reward={oracle_ep.reward:.3f})")
 
