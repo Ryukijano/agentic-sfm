@@ -1,8 +1,8 @@
 # Phase 0: Zero-shot crop feasibility evaluation
-# Evaluates whether stock Qwen3-VL-2B-Instruct proposing crops improves matching
+# Evaluates whether stock Qwen3.5-2B proposing crops improves matching
 
 model:
-  name: "Qwen/Qwen3-VL-2B-Instruct"
+  name: "Qwen/Qwen3.5-2B"
   device: "cuda:0"
   max_new_tokens: 512
   max_tool_calls: 10
@@ -31,7 +31,7 @@ eval:
   methods:
     - "direct_loftr"      # baseline: direct LoFTR matching
     - "direct_mast3r"     # baseline: direct MASt3R matching
-    - "agent_zeroshot"    # Qwen3-VL-2B-Instruct zero-shot tool calling
+    - "agent_zeroshot"    # Qwen3.5-2B zero-shot tool calling
   # Subset sizes (for quick feasibility)
   max_pairs_per_difficulty: 25
   difficulties: ["easy", "medium", "hard", "extreme"]

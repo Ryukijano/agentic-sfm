@@ -582,4 +582,14 @@ def serve(host: str = "0.0.0.0", port: int = 8765):
 
 
 if __name__ == "__main__":
-    serve()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Agentic SfM tool server")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("TOOL_SERVER_PORT", "8765")),
+    )
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    args = parser.parse_args()
+    serve(host=args.host, port=args.port)

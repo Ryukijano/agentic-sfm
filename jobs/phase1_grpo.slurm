@@ -28,8 +28,8 @@ mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 # Environment
 source /scratch/kcwp264/.aire_scratch_env.sh
 source "${PROJECT_ROOT}/scripts/agentic_sfm_env.sh"
-module load cuda/12.6.2 2>/dev/null || true
-export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
+module load cuda/12.4.1 2>/dev/null || true
+export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
@@ -49,6 +49,18 @@ mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_DIR}" "${FLASHINFER_JIT_D
 
 cd "${PROJECT_ROOT}"
 
+# Shared GPU nodes: unique ports per job.
+VLLM_PORT=$((39000 + SLURM_JOB_ID % 20000))
+TOOL_SERVER_PORT=$((19000 + SLURM_JOB_ID % 20000))
+export VLLM_PORT TOOL_SERVER_PORT
+echo "vLLM port: ${VLLM_PORT}  tool port: ${TOOL_SERVER_PORT}"
+
+if [[ ! -d outputs/sft/checkpoints/epoch_5 ]]; then
+  echo "ERROR: SFT adapter missing at outputs/sft/checkpoints/epoch_5"
+  echo "Run oracle SFT then SFT warmup first."
+  exit 1
+fi
+
 python - <<'PY'
 from agentic_sfm.constants import assert_qwen35_runtime
 assert_qwen35_runtime()
@@ -58,11 +70,11 @@ PY
 # Start vLLM server on GPU 0
 echo "Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --model "Qwen/Qwen3.5-2B" \
     --enable-lora \
     --max-loras 1 \
     --max-lora-rank 32 \
-    --port 8000 \
+    --port "${VLLM_PORT}" \
     --gpu-memory-utilization 0.90 \
     --max-model-len 8192 \
     --limit-mm-per-prompt '{"image":6,"video":0}' \
@@ -77,7 +89,7 @@ VLLM_PID=$!
 # Wait for vLLM to be ready
 echo "Waiting for vLLM..."
 for i in $(seq 1 240); do
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+    if curl -s "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
         echo "vLLM ready (took ${i}x2s = $((i*2))s)"
         break
     fi
@@ -99,17 +111,22 @@ done
 # Start tool server on GPU 2 (LoFTR / MASt3R / LightGlue + MAGSAC pose)
 echo "Starting tool server on GPU 2..."
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH="${PROJECT_ROOT}/src" python \
-    "${PROJECT_ROOT}/tools_server/server.py" &
+    "${PROJECT_ROOT}/tools_server/server.py" --port "${TOOL_SERVER_PORT}" &
 TOOL_PID=$!
 
 # Wait for tool server
 echo "Waiting for tool server..."
-for i in $(seq 1 30); do
-    if curl -s http://localhost:8765/health > /dev/null 2>&1; then
-        echo "Tool server ready"
+for i in $(seq 1 60); do
+    if ! kill -0 ${TOOL_PID} 2>/dev/null; then
+        echo "ERROR: Tool server process died before bind"
+        kill ${VLLM_PID} 2>/dev/null || true
+        exit 1
+    fi
+    if curl -s "http://localhost:${TOOL_SERVER_PORT}/health" > /dev/null 2>&1; then
+        echo "Tool server ready on :${TOOL_SERVER_PORT}"
         break
     fi
-    if [ $i -eq 30 ]; then
+    if [ $i -eq 60 ]; then
         echo "ERROR: Tool server failed to start"
         kill ${VLLM_PID} ${TOOL_PID} 2>/dev/null || true
         exit 1
@@ -121,8 +138,8 @@ done
 echo "Starting GRPO training..."
 CUDA_VISIBLE_DEVICES=1 python scripts/run_grpo.py \
     --config "${CONFIG}" \
-    --tool-server-url "http://localhost:8765" \
-    --vllm-url "http://localhost:8000" \
+    --tool-server-url "http://localhost:${TOOL_SERVER_PORT}" \
+    --vllm-url "http://localhost:${VLLM_PORT}" \
     --output-dir "${OUTPUT_DIR}" \
     2>&1 | tee "${LOG_DIR}/grpo_training_${SLURM_JOB_ID}.log"
 

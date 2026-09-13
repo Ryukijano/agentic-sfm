@@ -41,7 +41,7 @@ mkdir -p "${LOG_DIR}" "${OUT_DIR}"
 # ---------------------------------------------------------------------------
 source /scratch/kcwp264/.aire_scratch_env.sh
 module load miniforge/24.7.1 || true
-module load cuda/12.6.2 || true
+module load cuda/12.4.1 || true
 
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "/opt/apps/pkg/interpreters/miniforge/24.7.1")
 set +u
@@ -127,5 +127,6 @@ else
 fi
 
 echo "Eval exit code: ${EVAL_EXIT}"
+seff "${SLURM_JOB_ID}" 2>/dev/null || true
 echo "End: $(date)"
 exit "${EVAL_EXIT}"

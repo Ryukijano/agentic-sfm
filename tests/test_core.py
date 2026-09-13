@@ -493,18 +493,19 @@ class TestOracleCrops:
 
 
 class TestPolicyDefaults:
-    def test_qwen35_4b_policy(self):
+    def test_qwen35_2b_policy(self):
         from agentic_sfm.constants import DEFAULT_LORA_TARGET_MODULES, DEFAULT_POLICY_MODEL
 
         from agentic_sfm.constants import _version_tuple
 
-        assert DEFAULT_POLICY_MODEL == "Qwen/Qwen3-VL-2B-Instruct"
+        assert DEFAULT_POLICY_MODEL == "Qwen/Qwen3.5-2B"
         assert "q_proj" in DEFAULT_LORA_TARGET_MODULES
         assert "gate_proj" in DEFAULT_LORA_TARGET_MODULES
-        assert "in_proj_qkv" not in DEFAULT_LORA_TARGET_MODULES  # no GDN in Qwen3-VL
-        assert _version_tuple("4.57.6") < (5, 0)
+        assert "in_proj_qkv" in DEFAULT_LORA_TARGET_MODULES  # Gated DeltaNet
+        assert _version_tuple("4.57.6") < (5, 2)
+        assert _version_tuple("5.1.0") < (5, 2)
         assert _version_tuple("0.11.0") < (0, 17)
-        assert _version_tuple("5.14.1") >= (5, 0)
+        assert _version_tuple("5.16.1") >= (5, 2)
 
     def test_default_matcher_loftr(self):
         from agentic_sfm.constants import DEFAULT_MATCHER

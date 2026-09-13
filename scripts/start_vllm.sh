@@ -1,9 +1,9 @@
 #!/bin/bash
-# Start vLLM server for Qwen3-VL-2B-Instruct rollout sampling on GPU 0.
-# Requires vLLM >= 0.17 (Qwen3-VL).
+# Start vLLM server for Qwen3.5-2B rollout sampling on GPU 0.
+# Requires vLLM >= 0.17 (qwen3_5).
 set -euo pipefail
 
-MODEL_NAME="${1:-Qwen/Qwen3-VL-2B-Instruct}"
+MODEL_NAME="${1:-Qwen/Qwen3.5-2B}"
 PORT="${2:-8000}"
 GPU_ID="${3:-0}"
 

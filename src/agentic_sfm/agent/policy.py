@@ -1,4 +1,4 @@
-"""MLLM agent: Qwen 4B VLM policy for agentic SfM tool orchestration."""
+"""MLLM agent: Qwen3.5-2B VLM policy for agentic SfM tool orchestration."""
 
 from __future__ import annotations
 
@@ -22,14 +22,14 @@ def load_policy_processor_and_model(
     device_map=None,
     quantization_config=None,
 ):
-    """Load Qwen3-VL-2B-Instruct processor + VLM (AutoModelForImageTextToText)."""
+    """Load Qwen3.5-2B processor + VLM (AutoModelForImageTextToText)."""
     import torch
     from transformers import AutoProcessor
 
     if torch_dtype is None:
         torch_dtype = torch.bfloat16
 
-    if model_name == DEFAULT_POLICY_MODEL or "Qwen3-VL" in model_name:
+    if model_name == DEFAULT_POLICY_MODEL or "Qwen3.5" in model_name or "Qwen3-VL" in model_name:
         assert_qwen35_runtime()
 
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -44,8 +44,8 @@ def load_policy_processor_and_model(
         model = AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
     except Exception as e:
         raise RuntimeError(
-            f"Failed to load policy {model_name}. Qwen3-VL-2B-Instruct needs Transformers 5.x "
-            f"(model_type qwen3_vl) and vLLM >= 0.17. Original error: {e}"
+            f"Failed to load policy {model_name}. Qwen3.5-2B needs Transformers >= 5.2 "
+            f"(model_type qwen3_5) and vLLM >= 0.17. Original error: {e}"
         ) from e
     return processor, model
 
@@ -229,7 +229,7 @@ def _collect_pil_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
 
 
 class AgenticSfMAgent:
-    """Qwen 4B VLM agent for agentic SfM.
+    """Qwen3.5-2B VLM agent for agentic SfM.
 
     Phase 0 (zero-shot): stock model with tool-calling prompt.
     Phase 1 (RL): LoRA-tuned model trained with GRPO.

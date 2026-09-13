@@ -6,7 +6,7 @@ model weights so vLLM can serve the fine-tuned model without PEFT.
 
 Usage:
   python scripts/merge_lora.py \
-      --base-model "Qwen/Qwen3-VL-2B-Instruct" \
+      --base-model "Qwen/Qwen3.5-2B" \
       --lora-path outputs/sft/checkpoints/epoch_5 \
       --output-dir outputs/sft/merged_model
 """
@@ -60,7 +60,7 @@ def merge_lora(base_model: str, lora_path: str, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Merge LoRA adapter into base model")
-    parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
+    parser.add_argument("--base-model", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--lora-path", type=str, required=True,
                         help="Path to LoRA adapter directory")
     parser.add_argument("--output-dir", type=str, required=True,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 1a: Collect zero-shot trajectories from stock Qwen3-VL-2B-Instruct.
+"""Phase 1a: Collect zero-shot trajectories from stock Qwen3.5-2B.
 
 Runs the stock model (no LoRA) on all training pairs with temperature=1.0
 and group_size=N to collect diverse trajectories for SFT warmup data.

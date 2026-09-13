@@ -8,7 +8,7 @@
 # accumulative tool reward enabled — before launching the real phase1_grpo run.
 #
 # GPU layout:
-#   GPU 0: vLLM rollout server (Qwen3-VL-2B-Instruct inference, LoRA hot-reload)
+#   GPU 0: vLLM rollout server (Qwen3.5-2B inference, LoRA hot-reload)
 #   GPU 1: Training (LoRA gradient updates)
 #   GPU 2: Matcher inference (tool server: crop / match / pose)
 #
@@ -41,7 +41,7 @@ echo "Start: $(date)"
 # AIRE scratch env first (before HF/uv/torch), then miniforge + cuda modules.
 source /scratch/kcwp264/.aire_scratch_env.sh
 module load miniforge/24.7.1 || true
-module load cuda/12.6.2 || true
+module load cuda/12.4.1 || true
 
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "/opt/apps/pkg/interpreters/miniforge/24.7.1")
 set +u
@@ -50,7 +50,7 @@ conda activate /scratch/kcwp264/.conda_envs/agentic-sfm
 set -u
 export CONDA_DEFAULT_ENV=agentic-sfm
 
-export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
+export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
@@ -108,7 +108,7 @@ else
     echo "Smoke subset already exists: ${SUBSET_FILE}"
 fi
 
-# Runtime check (transformers/vllm/peft/torch versions for Qwen3-VL)
+# Runtime check (transformers/vllm/peft/torch versions for Qwen3.5)
 python - <<'PY'
 from agentic_sfm.constants import assert_qwen35_runtime
 assert_qwen35_runtime()
@@ -137,7 +137,7 @@ TOOL_PID=$!
 # ---------------------------------------------------------------------------
 echo "Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --model "Qwen/Qwen3.5-2B" \
     --enable-lora \
     --max-loras 1 \
     --max-lora-rank 32 \
@@ -234,4 +234,5 @@ find "${OUTPUT_DIR}" -maxdepth 3 -type f | sort || true
 
 echo "Training exit code: ${TRAIN_EXIT}"
 echo "End: $(date)"
+seff "${SLURM_JOB_ID}" 2>/dev/null || true
 exit ${TRAIN_EXIT}

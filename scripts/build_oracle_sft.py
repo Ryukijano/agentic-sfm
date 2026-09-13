@@ -164,11 +164,16 @@ def main() -> None:
             if kb is not None:
                 match_kwargs["K_b"] = kb
 
-            full = execute_sfm_tool(
-                tool_client,
-                ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b", "matcher": args.matcher}),
-                match_kwargs,
-            )
+            try:
+                full = execute_sfm_tool(
+                    tool_client,
+                    ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b", "matcher": args.matcher}),
+                    match_kwargs,
+                )
+            except Exception as exc:
+                logger.warning("Full-frame match failed for %s: %s", pair.pair_id, exc)
+                n_errors += 1
+                continue
             if full.get("error"):
                 n_errors += 1
                 continue

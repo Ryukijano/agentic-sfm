@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """Phase 1: GRPO RL training for agentic matching.
 
-Trains Qwen3-VL-2B-Instruct with LoRA using GRPO (Group Relative Policy Optimization)
+Trains Qwen3.5-2B with LoRA using GRPO (Group Relative Policy Optimization)
 to learn crop/match tool-calling policies for hard image pairs.
 
 Architecture:
   - vLLM server (GPU 0): fast rollout sampling for episode generation
-  - Training model (GPU 1): LoRA-adapted Qwen 4B VLM for policy gradient updates
+  - Training model (GPU 1): LoRA-adapted Qwen3.5-2B VLM for policy gradient updates
     - Tool server (GPU 2): matcher inference (LoFTR/MASt3R)
 
 GRPO: For each prompt, sample N trajectories via vLLM, compute group-relative

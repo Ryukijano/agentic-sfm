@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Phase 1c: SFT (Supervised Fine-Tuning) warmup for agentic SfM.
 
-LoRA fine-tuning of Qwen3-VL-2B-Instruct on curated successful trajectories.
+LoRA fine-tuning of Qwen3.5-2B on curated successful trajectories.
 Trains with cross-entropy loss on assistant tokens only.
 
 Usage:
@@ -78,7 +78,7 @@ def _load_example_images(ex: dict) -> list:
 
 
 class SFTTrainer:
-    """Supervised fine-tuning with LoRA on Qwen3-VL-2B-Instruct."""
+    """Supervised fine-tuning with LoRA on Qwen3.5-2B."""
 
     def __init__(self, config: dict, output_dir: str = "outputs/sft"):
         self.config = config

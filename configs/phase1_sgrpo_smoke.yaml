@@ -12,15 +12,15 @@
 # stage below must include "medium" or no pairs will be selected.
 
 model:
-  name: "Qwen/Qwen3-VL-2B-Instruct"
+  name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
   sft_adapter: "outputs/sft/checkpoints/epoch_5"  # optional warmup; skipped if dir absent
   lora:
     rank: 32                  # must be <= vLLM --max-lora-rank 32
     alpha: 64
     dropout: 0.0  # GRPO: dropout would make eval/train logprob ratio noise
-    # Qwen3-VL: standard attention + MLP (no Gated DeltaNet)
-    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    # Qwen3.5: gated attention + Gated DeltaNet + MLP
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
 
 rl:
   algorithm: "grpo"
@@ -98,5 +98,5 @@ output:
   log_dir: "logs/sgrpo_smoke"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase1-sgrpo-smoke-qwen3vl-2b"
+  wandb_run_name: "phase1-sgrpo-smoke-qwen35-2b"
   wandb_enabled: false   # smoke test: no W&B run

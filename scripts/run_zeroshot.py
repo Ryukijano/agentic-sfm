@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Phase 0: Zero-shot crop feasibility evaluation.
 
-Evaluates whether stock Qwen3-VL-2B-Instruct proposing crops improves matching
+Evaluates whether stock Qwen3.5-2B proposing crops improves matching
 on hard image pairs, compared to direct matching baselines.
 
 Usage:
@@ -125,7 +125,7 @@ def main():
     if not args.skip_agent:
         from agentic_sfm.agent.policy import AgenticSfMAgent
 
-        logger.info("\n--- Agent: Qwen3-VL-2B-Instruct zero-shot ---")
+        logger.info("\n--- Agent: Qwen3.5-2B zero-shot ---")
         agent = AgenticSfMAgent(
             model_name=config["model"]["name"],
             device=config["model"]["device"],

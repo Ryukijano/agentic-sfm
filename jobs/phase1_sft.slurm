@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-echo "=== Agentic-SFM Phase 1c SFT warmup (Qwen3-VL-2B-Instruct) ==="
+echo "=== Agentic-SFM Phase 1c SFT warmup (Qwen3.5-2B) ==="
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: ${SLURM_NODELIST}"
 echo "Start: $(date)"
@@ -25,8 +25,8 @@ mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
 source /scratch/kcwp264/.aire_scratch_env.sh
 source "${PROJECT_ROOT}/scripts/agentic_sfm_env.sh"
-module load cuda/12.6.2 2>/dev/null || true
-export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
+module load cuda/12.4.1 2>/dev/null || true
+export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export HF_HOME="/scratch/kcwp264/.cache/huggingface"
 export TORCH_HOME="/scratch/kcwp264/.cache/torch"
 export TRITON_CACHE_DIR="/scratch/kcwp264/.triton_cache"

@@ -35,10 +35,10 @@ echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
 echo "Start: $(date)"
 
-# Start vLLM on GPU 0 (Qwen3-VL-2B-Instruct ~8GB weights; rest of the 48GB card is for KV + training on GPU 1)
+# Start vLLM on GPU 0 (Qwen3.5-2B ~5GB BF16 weights; rest of the 48GB card is for KV + training on GPU 1)
 echo "Starting vLLM server on GPU 0 (shared memory mode)..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --model "Qwen/Qwen3.5-2B" \
     --enable-lora \
     --max-loras 1 \
     --max-lora-rank 32 \

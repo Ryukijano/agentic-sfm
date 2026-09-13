@@ -1,5 +1,5 @@
-actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct
-actor_rollout_ref.model.tokenizer_path=Qwen/Qwen3-VL-2B-Instruct
+actor_rollout_ref.model.path=Qwen/Qwen3.5-2B
+actor_rollout_ref.model.tokenizer_path=Qwen/Qwen3.5-2B
 actor_rollout_ref.model.trust_remote_code=true
 actor_rollout_ref.rollout.name=vllm
 actor_rollout_ref.rollout.n=4
@@ -30,7 +30,7 @@ actor_rollout_ref.actor.ppo_mini_batch_size=8
 actor_rollout_ref.actor.optim.lr=1.0e-6
 actor_rollout_ref.actor.grad_clip=1.0
 actor_rollout_ref.actor.use_remove_padding=true
-data.tokenizer=Qwen/Qwen3-VL-2B-Instruct
+data.tokenizer=Qwen/Qwen3.5-2B
 data.train_files=/scratch/kcwp264/agentic-sfm/data/verl/hard_pairs_train.parquet
 data.val_files=/scratch/kcwp264/agentic-sfm/data/verl/hard_pairs_val.parquet
 data.train_batch_size=8

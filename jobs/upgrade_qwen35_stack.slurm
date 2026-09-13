@@ -11,12 +11,12 @@
 #SBATCH --error=/scratch/kcwp264/logs/agentic-sfm/upgrade_qwen35_%j.err
 
 # In-place pip/uv upgrade of the existing conda env for the policy VLM:
-# transformers>=5.0 (qwen3_vl) + vllm>=0.17.
+# transformers>=5.2 (qwen3_5) + vllm>=0.17.
 # Do not create a separate .venv — Slurm jobs already use this prefix.
 
 set -euo pipefail
 
-echo "=== Upgrade agentic-sfm conda env for Qwen3-VL-2B-Instruct ==="
+echo "=== Upgrade agentic-sfm conda env for Qwen3.5-2B ==="
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: ${SLURM_NODELIST}"
 echo "Start: $(date)"
@@ -29,8 +29,8 @@ mkdir -p "${RECORD_DIR}" /scratch/kcwp264/logs/agentic-sfm
 
 source /scratch/kcwp264/.aire_scratch_env.sh
 source "${PROJECT_ROOT}/scripts/agentic_sfm_env.sh"
-module load cuda/12.6.2 2>/dev/null || true
-export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
+module load cuda/12.4.1 2>/dev/null || true
+export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export UV_PYTHON="${CONDA_ENV}/bin/python"
 export MAX_JOBS="${SLURM_CPUS_PER_TASK:-8}"
 export CPATH="${CUDA_HOME}/include${CPATH:+:${CPATH}}"
@@ -43,7 +43,7 @@ echo "=== Ensure policy stack (transformers>=5, vllm>=0.17, peft) ==="
 if ! python -c "import vllm" 2>/dev/null; then
   uv pip install --python "${UV_PYTHON}" --torch-backend=auto \
       "vllm>=0.17" \
-      "transformers>=5.0" \
+      "transformers>=5.2" \
       "peft>=0.13" \
       "accelerate>=1.0"
 else
@@ -67,13 +67,13 @@ print("vllm", vllm.__version__)
 print("peft", peft.__version__)
 
 import transformers.models as m
-has = hasattr(m, "qwen3_vl") or "qwen3_vl" in dir(m)
-print("has_qwen3_vl", has)
+has = hasattr(m, "qwen3_5") or "qwen3_5" in dir(m)
+print("has_qwen3_5", has)
 if not has:
-    raise SystemExit("transformers still missing qwen3_vl")
+    raise SystemExit("transformers still missing qwen3_5")
 
 from packaging.version import Version
-if Version(transformers.__version__) < Version("5.0"):
+if Version(transformers.__version__) < Version("5.2"):
     raise SystemExit(f"transformers too old: {transformers.__version__}")
 if Version(vllm.__version__.split("+")[0]) < Version("0.17"):
     raise SystemExit(f"vllm too old: {vllm.__version__}")
@@ -83,12 +83,12 @@ assert_qwen35_runtime()
 print("assert_qwen35_runtime: ok")
 
 from transformers import AutoConfig
-cfg = AutoConfig.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True)
+cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
 print("config_type", type(cfg).__name__, "model_type", getattr(cfg, "model_type", None))
 
 # Smoke: vLLM can construct engine args (does not start server).
 from vllm import EngineArgs
-EngineArgs(model="Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True, dtype="bfloat16")
+EngineArgs(model="Qwen/Qwen3.5-2B", trust_remote_code=True, dtype="bfloat16")
 print("vllm EngineArgs: ok")
 PY
 

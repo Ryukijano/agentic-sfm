@@ -132,7 +132,7 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         **kwargs: Any,
     ) -> None:
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config)
-        # Qwen3-VL-Instruct has no thinking mode; tool-call JSON owns the budget.
+        # Qwen3.5-2B defaults to non-thinking; tool-call JSON owns the budget.
         chat_kwargs = dict(getattr(self, "apply_chat_template_kwargs", {}) or {})
         chat_kwargs.setdefault("enable_thinking", False)
         self.apply_chat_template_kwargs = chat_kwargs

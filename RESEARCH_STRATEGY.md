@@ -62,7 +62,7 @@ primary GitHub repositories. X/LinkedIn used only as supplementary signal.*
 > is verifiable and it's easy to sort the samples by difficulty to allow for curriculum
 > learning)... Main problem: vision people are not good at RL, and vice versa."
 
-We took this idea and built the infrastructure: Qwen3-VL-2B policy, FastAPI tool server,
+We took this idea and built the infrastructure: Qwen3.5-2B policy, FastAPI tool server,
 LoFTR/MASt3R/LightGlue/COLMAP tools, verifiable pose rewards, custom GRPO trainer. Phase 0
 zero-shot inference results were posted publicly as Ryukijano. **The remaining work is the
 training itself** — Phase 1 (GRPO) and beyond.
@@ -165,7 +165,7 @@ fixed action template with slots, not free-form JSON generation.
 ## 3. What to Keep, Simplify, Remove, Redesign
 
 ### Keep
-- **Qwen3-VL-2B-Instruct** as the policy model (validated by LiteSearch-VL for 2B agents).
+- **Qwen3.5-2B** as the policy model (official Instruct/post-trained 2B VLM; LiteSearch-VL still validates 2B agents + contract SFT).
 - **3× L40S GPU layout** (rollout / training / tool server).
 - **Verifiable pose-AUC + inlier rewards** (core reward signal, validated by DCRL).
 - **Curriculum over difficulty bins** (validated by DCRL: +5.2 F1 over uniform).

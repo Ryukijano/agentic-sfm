@@ -2,7 +2,7 @@
 """Run real zero-shot evaluation on MegaDepth-1500 pairs.
 
 1. Direct LoFTR matching (baseline)
-2. Qwen3-VL-2B-Instruct agent with crop+match tool calling
+2. Qwen3.5-2B agent with crop+match tool calling
 3. Save results + match visualizations (SuperGlue-style)
 """
 import argparse
@@ -396,7 +396,7 @@ def main():
     from agentic_sfm.agent.policy import AgenticSfMAgent
     from agentic_sfm.tools.client import ToolClient
 
-    print("Loading Qwen3-VL-2B-Instruct agent (training tool-call schema)...")
+    print("Loading Qwen3.5-2B agent (training tool-call schema)...")
     agent = AgenticSfMAgent(device=DEVICE, do_sample=True, temperature=1.0)
 
     tool_client = None

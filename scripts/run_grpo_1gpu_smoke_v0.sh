@@ -21,7 +21,7 @@ sleep 2
 
 echo ">>> Starting vLLM (V0 engine) on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 ${PY} -m vllm.entrypoints.openai.api_server \
-  --model "Qwen/Qwen3-VL-2B-Instruct" \
+  --model "Qwen/Qwen3.5-2B" \
   --enable-lora \
   --max-loras 1 \
   --max-lora-rank 32 \

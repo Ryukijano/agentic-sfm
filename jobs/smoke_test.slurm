@@ -28,8 +28,8 @@ mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 # Environment
 source /scratch/kcwp264/.aire_scratch_env.sh
 source "${PROJECT_ROOT}/scripts/agentic_sfm_env.sh"
-module load cuda/12.6.2 2>/dev/null || true
-export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.6.2}"
+module load cuda/12.4.1 2>/dev/null || true
+export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
@@ -52,7 +52,7 @@ cd "${PROJECT_ROOT}"
 # Start vLLM server on GPU 0
 echo "Starting vLLM server on GPU 0..."
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-VL-2B-Instruct" \
+    --model "Qwen/Qwen3.5-2B" \
     --enable-lora \
     --max-loras 1 \
     --max-lora-rank 32 \

@@ -1,5 +1,5 @@
-actor_rollout_ref.model.path=Qwen/Qwen3-VL-2B-Instruct
-actor_rollout_ref.model.tokenizer_path=Qwen/Qwen3-VL-2B-Instruct
+actor_rollout_ref.model.path=Qwen/Qwen3.5-2B
+actor_rollout_ref.model.tokenizer_path=Qwen/Qwen3.5-2B
 actor_rollout_ref.model.trust_remote_code=true
 +actor_rollout_ref.model.override_config.attn_implementation=sdpa
 actor_rollout_ref.rollout.name=vllm
@@ -35,7 +35,7 @@ actor_rollout_ref.actor.use_remove_padding=true
 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2
 actor_rollout_ref.actor.fsdp_config.model_dtype=bf16
 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2
-data.tokenizer=Qwen/Qwen3-VL-2B-Instruct
+data.tokenizer=Qwen/Qwen3.5-2B
 data.train_files=/scratch/kcwp264/agentic-sfm/data/verl/hard_pairs_train.parquet
 data.val_files=/scratch/kcwp264/agentic-sfm/data/verl/hard_pairs_val.parquet
 data.train_batch_size=4

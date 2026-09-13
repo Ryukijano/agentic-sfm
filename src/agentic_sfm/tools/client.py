@@ -63,7 +63,12 @@ class ToolClient:
         if K_b is not None:
             payload["K_b"] = K_b
         r = self.client.post("/match", json=payload)
-        r.raise_for_status()
+        if r.is_error:
+            raise httpx.HTTPStatusError(
+                f"{r.status_code} on /match: {r.text[:500]}",
+                request=r.request,
+                response=r,
+            )
         return r.json()
 
     def doppelganger_check(self, image_a: str, image_b: str) -> dict[str, Any]:

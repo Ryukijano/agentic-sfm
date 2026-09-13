@@ -18,7 +18,7 @@ Structure-from-motion pipelines break on **hard pairs**: low overlap, extreme vi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Qwen3-VL-2B-Instruct (policy, LoRA r=32)                       │
+│  Qwen3.5-2B (policy, LoRA r=32)                                 │
 │  multi-turn JSON tool calls                                     │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ HTTP
@@ -60,7 +60,7 @@ All inference outputs live under [`results/`](results/). See [`results/README.md
 
 ### Phase 0 — zero-shot feasibility
 
-Does stock Qwen3-VL-2B-Instruct cropping beat direct matching without RL?
+Does stock Qwen3.5-2B cropping beat direct matching without RL?
 
 <p align="center">
   <img src="results/figures/agentic_sfm_phase0_comparison.png" alt="Phase 0 comparison" width="600"/>
@@ -122,13 +122,13 @@ python scripts/run_zeroshot.py --config configs/phase0_zeroshot.yaml
 
 ### 3. Phase 1 — SFT warmup then GRPO
 
-Stock Qwen3-VL-2B-Instruct almost never crops, so SFT needs **oracle crop traces** (heuristic boxes that beat full-frame inliers), not zero-shot rollouts.
+Stock Qwen3.5-2B still needs **oracle crop traces** (heuristic boxes that beat full-frame inliers) so SFT can install the tool-call contract before GRPO.
 
 ```bash
 # 1-GPU: LoFTR oracle crops → data/sft_train.jsonl
 sbatch jobs/phase1_oracle_sft.slurm
 
-# 1-GPU: LoRA SFT on those traces (Qwen/Qwen3-VL-2B-Instruct)
+# 1-GPU: LoRA SFT on those traces (Qwen/Qwen3.5-2B)
 sbatch jobs/phase1_sft.slurm
 
 # Point configs/phase1_grpo.yaml model.sft_adapter at outputs/sft/checkpoints/epoch_N
@@ -174,7 +174,7 @@ agentic-sfm/
 
 ## Key dependencies
 
-- [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) — small open-weight multimodal 2B policy (Apache 2.0)
+- [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) — official 2B unified VLM / Instruct checkpoint (Apache 2.0). There is no `Qwen3.5-2B-Instruct` SKU.
 - [verl](https://github.com/volcengine/verl) — distributed GRPO training
 - [vLLM](https://github.com/vllm-project/vllm) — fast rollout sampling
 - [MASt3R](https://github.com/naver/mast3r) / LoFTR — dense matchers
@@ -182,7 +182,7 @@ agentic-sfm/
 
 ## Training details
 
-- **Model:** `Qwen/Qwen3-VL-2B-Instruct` + LoRA (r=32, α=64)
+- **Model:** `Qwen/Qwen3.5-2B` + LoRA (r=32, α=64; gated attention + Gated DeltaNet)
 - **Algorithm:** GRPO (group size 8, clip-higher, dynamic sampling)
 - **Reward:** pose AUC@{5°,10°,20°} + inlier shaping − per-tool cost
 - **Curriculum:** easy/medium → hard → extreme overlap bins
