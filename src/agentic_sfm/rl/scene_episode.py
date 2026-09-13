@@ -68,6 +68,7 @@ class SceneRolloutEpisode:
 
     scene_id: str = ""
     image_paths: list[str] = field(default_factory=list)
+    image_root: str = ""
     num_images: int = 0
 
     # Trajectory
@@ -116,6 +117,7 @@ def run_scene_episode(
     ep = SceneRolloutEpisode(
         scene_id=scene_id,
         image_paths=image_paths,
+        image_root=image_root,
         num_images=len(image_paths),
         gt_recon=gt_recon,
     )
@@ -274,6 +276,7 @@ def run_scene_oracle_episode(
     ep = SceneRolloutEpisode(
         scene_id=scene_id,
         image_paths=image_paths,
+        image_root=image_root,
         num_images=len(image_paths),
         gt_recon=gt_recon,
     )
@@ -429,35 +432,16 @@ def _execute_scene_tool(
     args = tc.args
 
     if tc.tool == "retrieve":
-        # Use GT overlap matrix to return best pairs (oracle retrieval)
-        ids = list(registered_ids.values())
-        if overlap_matrix is not None and image_indices is not None:
-            # Build sub-matrix for the registered images
-            sub_om = overlap_matrix[np.ix_(image_indices, image_indices)]
-            pairs = []
-            for i in range(len(ids)):
-                for j in range(i + 1, len(ids)):
-                    score = float(sub_om[i, j])
-                    if score > 0.05:  # filter out near-zero overlap
-                        pairs.append({
-                            "image_a": ids[i],
-                            "image_b": ids[j],
-                            "score": score,
-                        })
-            pairs.sort(key=lambda p: p["score"], reverse=True)
-        else:
-            # Fallback: proximity heuristic
-            pairs = []
-            for i in range(len(ids)):
-                for j in range(i + 1, len(ids)):
-                    pairs.append({
-                        "image_a": ids[i],
-                        "image_b": ids[j],
-                        "score": 1.0 - abs(i - j) / max(len(ids), 1),
-                    })
-            pairs.sort(key=lambda p: p["score"], reverse=True)
-        top_k = args.get("top_k", 20)
-        return {"pairs": pairs[:top_k], "num_pairs": len(pairs[:top_k])}
+        # Use learned retrieval (DINOv2 embeddings) for agent rollouts.
+        # The S-GRPO oracle uses GT overlap_matrix instead — that's the
+        # difference between what the agent sees and what the oracle knows.
+        from agentic_sfm.rl.retrieval import retrieve_pairs_from_paths
+        pairs = retrieve_pairs_from_paths(
+            ep.image_paths, registered_ids,
+            top_k=args.get("top_k", 20),
+            image_root=ep.image_root,
+        )
+        return {"pairs": pairs, "num_pairs": len(pairs)}
 
     if tc.tool == "sfm_run":
         image_dir = str(Path(ep.image_paths[0]).parent) if ep.image_paths else ""
