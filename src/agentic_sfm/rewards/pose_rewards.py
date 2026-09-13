@@ -6,6 +6,12 @@ Reward components that enter the total (nothing else):
   - format_reward / invalid_penalty
   - accumulative_tool_reward: PyVision-RL style — reward productive tool calls
     only when the outcome is correct (prevents interaction collapse)
+  - ntep_intent_reward: NTEP (arXiv 2609.03493) process reward — per-call
+    bonus when the tool call's intent aligns with a valid evidence-seeking
+    goal and the result is non-error
+  - ntep_redundancy_penalty: NTEP non-repeated-goal regularizer — per-call
+    penalty when a call revisits an evidence goal already pursued earlier
+    in the episode (same tool + same target + overlapping bbox / same pair)
 
 Replaced the old per-call tool_cost penalty (which caused interaction collapse
 per PyVision-RL, ICML 2026) with an accumulative tool reward.
@@ -15,11 +21,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Hashable
 
 import numpy as np
 
 from agentic_sfm.constants import REWARD_TOTAL_KEYS
+
+if TYPE_CHECKING:
+    from agentic_sfm.agent.policy import ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +84,135 @@ def pose_auc_score(pose_error: PoseError) -> float:
     return float(np.mean(both_pass.astype(float)))
 
 
+# ---------------------------------------------------------------------------
+# NTEP-style process rewards (Necessary Tool-Evidence Path, arXiv 2609.03493)
+#
+# Two per-call shaping terms over the episode's tool trajectory:
+#   1. Intent-evidence alignment: +coef for each call whose intent matches the
+#      tool's evidence-seeking capability AND whose result is non-error.
+#   2. Non-repeated-goal regularizer: -penalty for each call that revisits an
+#      evidence goal already pursued earlier in the episode.
+# ---------------------------------------------------------------------------
+
+_NTEP_IOU_THRESHOLD = 0.5
+
+
+def _first_arg(args: dict[str, Any], *names: str) -> Any:
+    """First non-None value among alternative arg spellings."""
+    for name in names:
+        value = args.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _bbox_from_args(args: dict[str, Any]) -> list[float] | None:
+    """Extract a normalized [x1, y1, x2, y2] bbox from tool args, or None."""
+    bbox = args.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    try:
+        return [float(x) for x in bbox[:4]]
+    except (TypeError, ValueError):
+        return None
+
+
+def _bbox_iou(a: list[float], b: list[float]) -> float:
+    """IoU between two normalized [x1, y1, x2, y2] bboxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _ntep_goal(tool: str, args: dict[str, Any]) -> tuple[Hashable | None, list[float] | None]:
+    """Evidence-goal signature for the non-repeated-goal regularizer.
+
+    Returns (goal_key, bbox). ``goal_key`` groups calls pursuing the same
+    evidence goal; ``bbox`` (when present) is compared via IoU so that only
+    overlapping regions count as repeats. ``None`` key = no trackable goal.
+    """
+    if tool in ("crop", "crop_and_match"):
+        image_id = _first_arg(args, "image_id", "crop_image_id")
+        return (tool, image_id), _bbox_from_args(args)
+    if tool == "match":
+        a = _first_arg(args, "image_a", "image_a_id")
+        b = _first_arg(args, "image_b", "image_b_id")
+        # Different matcher = different evidence source → different goal.
+        return (tool, frozenset(x for x in (a, b) if x is not None), args.get("matcher")), None
+    if tool == "doppelganger_check":
+        a = _first_arg(args, "image_a", "image_a_id")
+        b = _first_arg(args, "image_b", "image_b_id")
+        return (tool, frozenset(x for x in (a, b) if x is not None)), None
+    return None, None
+
+
+def _ntep_intent_satisfied(tool: str, args: dict[str, Any], result: Any) -> bool:
+    """True when the call's intent aligns with a valid evidence goal.
+
+    Requires a non-error result (a missing result is treated as non-error —
+    the caller simply did not track results). Intent checks:
+      - crop_and_match with bbox → "find overlap region" → needs inliers > 0
+      - match (no crop) → "full-frame baseline" → always valid intent
+      - doppelganger_check → "verify scene identity" → needs is_doppelganger
+    """
+    if isinstance(result, dict):
+        if result.get("error"):
+            return False
+        res = result
+    else:
+        res = {}
+    if tool == "crop_and_match":
+        return _bbox_from_args(args) is not None and float(res.get("num_inliers") or 0) > 0
+    if tool == "match":
+        return True
+    if tool == "doppelganger_check":
+        return "is_doppelganger" in res
+    return False
+
+
+def _ntep_process_reward_counts(
+    tool_calls: list[ToolCall],
+    tool_results: list[dict[str, Any]] | None,
+    iou_threshold: float = _NTEP_IOU_THRESHOLD,
+) -> tuple[int, int]:
+    """Walk the trajectory once; return (n_aligned_intents, n_redundant_calls).
+
+    ``tool_results`` are paired with non-``done`` calls in order (callers only
+    record results for executed calls; the terminal ``done`` produces none).
+    """
+    n_aligned = 0
+    n_redundant = 0
+    seen_goals: dict[Hashable, list[list[float] | None]] = {}
+
+    results_iter = iter(tool_results or [])
+    for tc in tool_calls:
+        tool = getattr(tc, "tool", None)
+        if tool is None or tool == "done":
+            continue
+        args = getattr(tc, "args", None) or {}
+        result = next(results_iter, None)
+
+        if _ntep_intent_satisfied(tool, args, result):
+            n_aligned += 1
+
+        goal_key, bbox = _ntep_goal(tool, args)
+        if goal_key is not None:
+            history = seen_goals.setdefault(goal_key, [])
+            if bbox is None:
+                # Goal has no spatial extent — any exact-goal revisit is redundant.
+                if history:
+                    n_redundant += 1
+            elif any(prev is not None and _bbox_iou(bbox, prev) > iou_threshold for prev in history):
+                n_redundant += 1
+            history.append(bbox)
+
+    return n_aligned, n_redundant
+
+
 def compute_pair_reward(
     match_result: dict[str, Any],
     gt_pose: dict[str, Any] | None = None,
@@ -88,6 +226,11 @@ def compute_pair_reward(
     invalid_penalty: float = 0.2,
     accumulative_tool_coef: float = 0.1,
     use_accumulative_tool_reward: bool = True,
+    tool_calls: list[ToolCall] | None = None,
+    tool_results: list[dict[str, Any]] | None = None,
+    ntep_intent_coef: float = 0.05,
+    ntep_redundancy_penalty: float = 0.05,
+    use_ntep_rewards: bool = False,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a pair-level matching episode.
@@ -99,6 +242,16 @@ def compute_pair_reward(
         R_tool = coef * n_tool_calls * 1[outcome_is_correct]
     This replaces the old per-call tool_cost penalty which caused interaction
     collapse (models learn to reduce tool usage to minimize penalty).
+
+    NTEP process rewards (arXiv 2609.03493, Phase 2):
+        ntep_intent_reward      = +ntep_intent_coef per call whose intent
+                                  aligns with a valid evidence-seeking goal
+                                  and whose result is non-error.
+        ntep_redundancy_penalty = -ntep_redundancy_penalty per call revisiting
+                                  an earlier evidence goal (same tool + same
+                                  image + bbox IoU > 0.5, or same image pair).
+    Both default to 0 unless ``use_ntep_rewards=True`` and ``tool_calls`` is
+    provided; all new params are optional so existing callers are unaffected.
     """
     components: dict[str, Any] = {}
 
@@ -141,6 +294,16 @@ def compute_pair_reward(
         # Legacy per-call penalty (causes interaction collapse — not recommended)
         components["tool_cost"] = -tool_cost * num_tool_calls
         components["accumulative_tool_reward"] = 0.0
+
+    # NTEP process rewards: per-call intent-evidence alignment bonus and
+    # non-repeated-goal penalty over the episode's tool trajectory.
+    if use_ntep_rewards and tool_calls:
+        n_aligned, n_redundant = _ntep_process_reward_counts(tool_calls, tool_results)
+        components["ntep_intent_reward"] = ntep_intent_coef * n_aligned
+        components["ntep_redundancy_penalty"] = -ntep_redundancy_penalty * n_redundant
+    else:
+        components["ntep_intent_reward"] = 0.0
+        components["ntep_redundancy_penalty"] = 0.0
 
     components["total_reward"] = float(
         sum(float(components[k]) for k in REWARD_TOTAL_KEYS if k in components)

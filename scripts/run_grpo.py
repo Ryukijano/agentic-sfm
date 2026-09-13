@@ -108,7 +108,10 @@ class VLLMRolloutAgent:
                  invalid_penalty: float = 0.2, reward_schedule: str = "static",
                  reward_warmup_steps: int = 30, matcher: str = DEFAULT_MATCHER,
                  accumulative_tool_coef: float = 0.1,
-                 use_accumulative_tool_reward: bool = True):
+                 use_accumulative_tool_reward: bool = True,
+                 ntep_intent_coef: float = 0.05,
+                 ntep_redundancy_penalty: float = 0.05,
+                 use_ntep_rewards: bool = False):
         self.vllm_url = vllm_url.rstrip("/")
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -127,6 +130,10 @@ class VLLMRolloutAgent:
         # PyVision-RL accumulative tool reward (prevents interaction collapse)
         self.accumulative_tool_coef = accumulative_tool_coef
         self.use_accumulative_tool_reward = use_accumulative_tool_reward
+        # NTEP process rewards (per-call intent alignment + non-repeated-goal)
+        self.ntep_intent_coef = ntep_intent_coef
+        self.ntep_redundancy_penalty = ntep_redundancy_penalty
+        self.use_ntep_rewards = use_ntep_rewards
         self._global_step = 0
         self.vllm_model = model_name
         self._lora_loaded = False
@@ -301,6 +308,11 @@ class VLLMRolloutAgent:
             invalid_penalty=self.invalid_penalty,
             accumulative_tool_coef=self.accumulative_tool_coef,
             use_accumulative_tool_reward=self.use_accumulative_tool_reward,
+            tool_calls=ep.tool_calls,
+            tool_results=ep.results,
+            ntep_intent_coef=self.ntep_intent_coef,
+            ntep_redundancy_penalty=self.ntep_redundancy_penalty,
+            use_ntep_rewards=self.use_ntep_rewards,
         )
         ep.reward = ep.reward_components["total_reward"]
 
@@ -420,6 +432,11 @@ class VLLMRolloutAgent:
             invalid_penalty=self.invalid_penalty,
             accumulative_tool_coef=self.accumulative_tool_coef,
             use_accumulative_tool_reward=self.use_accumulative_tool_reward,
+            tool_calls=ep.tool_calls,
+            tool_results=ep.results,
+            ntep_intent_coef=self.ntep_intent_coef,
+            ntep_redundancy_penalty=self.ntep_redundancy_penalty,
+            use_ntep_rewards=self.use_ntep_rewards,
         )
         ep.reward = ep.reward_components["total_reward"]
         return ep
@@ -474,6 +491,10 @@ class GRPOTrainer:
         # PyVision-RL accumulative tool reward
         self.accumulative_tool_coef = config.get("reward", {}).get("accumulative_tool_coef", 0.1)
         self.use_accumulative_tool_reward = config.get("reward", {}).get("use_accumulative_tool_reward", True)
+        # NTEP process rewards (arXiv 2609.03493) — off by default for Phase 1
+        self.ntep_intent_coef = config.get("reward", {}).get("ntep_intent_coef", 0.05)
+        self.ntep_redundancy_penalty = config.get("reward", {}).get("ntep_redundancy_penalty", 0.05)
+        self.use_ntep_rewards = config.get("reward", {}).get("use_ntep_rewards", False)
         # S-GRPO: Conditional Ground-Truth Trajectory Injection
         self.sgrpo_cgi = config.get("rl", {}).get("sgrpo_cgi", True)
         self._global_step = 0
@@ -997,6 +1018,9 @@ class GRPOTrainer:
             matcher=self.matcher,
             accumulative_tool_coef=self.accumulative_tool_coef,
             use_accumulative_tool_reward=self.use_accumulative_tool_reward,
+            ntep_intent_coef=self.ntep_intent_coef,
+            ntep_redundancy_penalty=self.ntep_redundancy_penalty,
+            use_ntep_rewards=self.use_ntep_rewards,
         )
         if self.sft_adapter and os.path.isdir(self.sft_adapter):
             self._reload_vllm_lora(Path(self.sft_adapter), rollout_agent)

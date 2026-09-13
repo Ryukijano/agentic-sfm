@@ -136,6 +136,120 @@ class TestRewards:
         assert compute_doppelganger_reward(False, False) == 1.0
         assert compute_doppelganger_reward(True, False) == -1.0
 
+    def test_ntep_intent_reward_positive(self):
+        """Each valid evidence-seeking call earns +ntep_intent_coef."""
+        tool_calls = [
+            ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b"}),
+            ToolCall(tool="crop_and_match", args={
+                "image_id": "img_a", "bbox": [0.1, 0.1, 0.6, 0.6], "image_b": "img_b",
+            }),
+            ToolCall(tool="doppelganger_check", args={"image_a": "img_a", "image_b": "img_b"}),
+            ToolCall(tool="done", args={}),
+        ]
+        tool_results = [
+            {"num_inliers": 50, "inlier_ratio": 0.5},
+            {"num_inliers": 30, "inlier_ratio": 0.4},
+            {"is_doppelganger": False, "score": 0.1},
+        ]
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=4, num_valid_calls=4,
+            tool_calls=tool_calls, tool_results=tool_results,
+            use_ntep_rewards=True,
+        )
+        assert reward["ntep_intent_reward"] == pytest.approx(3 * 0.05)
+        assert reward["ntep_redundancy_penalty"] == 0.0
+        assert reward["ntep_intent_reward"] > 0
+        # NTEP components participate in the total when enabled.
+        assert reward["total_reward"] == pytest.approx(
+            reward["format_reward"] + reward["invalid_penalty"]
+            + reward["inlier_reward"] + reward["pose_reward"] + reward["tool_cost"]
+            + reward["accumulative_tool_reward"] + reward["ntep_intent_reward"]
+            + reward["ntep_redundancy_penalty"]
+        )
+
+    def test_ntep_intent_requires_nonerror_result(self):
+        """Error results and unmet evidence checks earn no intent reward."""
+        tool_calls = [
+            ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b"}),
+            ToolCall(tool="crop_and_match", args={
+                "image_id": "img_a", "bbox": [0.1, 0.1, 0.6, 0.6], "image_b": "img_b",
+            }),
+            ToolCall(tool="doppelganger_check", args={"image_a": "img_a", "image_b": "img_b"}),
+        ]
+        tool_results = [
+            {"error": "boom"},                      # error → no reward
+            {"num_inliers": 0, "inlier_ratio": 0.0},  # no inliers → intent not met
+            {"num_matches": 80},                    # missing is_doppelganger → not met
+        ]
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=3, num_valid_calls=3,
+            tool_calls=tool_calls, tool_results=tool_results,
+            use_ntep_rewards=True,
+        )
+        assert reward["ntep_intent_reward"] == 0.0
+
+    def test_ntep_redundant_calls_penalized(self):
+        """Same tool + same image + IoU > 0.5 → redundant, -penalty each."""
+        tool_calls = [
+            ToolCall(tool="crop_and_match", args={
+                "image_id": "img_a", "bbox": [0.0, 0.0, 0.5, 0.5], "image_b": "img_b",
+            }),
+            ToolCall(tool="crop_and_match", args={
+                "image_id": "img_a", "bbox": [0.05, 0.05, 0.55, 0.55], "image_b": "img_b",
+            }),  # IoU ≈ 0.68 > 0.5 → redundant
+            ToolCall(tool="crop_and_match", args={
+                "image_id": "img_a", "bbox": [0.5, 0.5, 1.0, 1.0], "image_b": "img_b",
+            }),  # different region → not redundant
+        ]
+        tool_results = [
+            {"num_inliers": 10}, {"num_inliers": 12}, {"num_inliers": 40},
+        ]
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=3, num_valid_calls=3,
+            tool_calls=tool_calls, tool_results=tool_results,
+            use_ntep_rewards=True,
+        )
+        assert reward["ntep_redundancy_penalty"] == pytest.approx(-0.05)
+        # All three still earn intent reward (valid evidence-seeking).
+        assert reward["ntep_intent_reward"] == pytest.approx(3 * 0.05)
+
+    def test_ntep_repeated_match_goal_penalized(self):
+        """Repeating the same match on the same pair+matcher is redundant."""
+        tool_calls = [
+            ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b", "matcher": "loftr"}),
+            ToolCall(tool="match", args={"image_a": "img_b", "image_b": "img_a", "matcher": "loftr"}),  # same pair
+            ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b", "matcher": "mast3r"}),  # new matcher
+        ]
+        tool_results = [{"num_inliers": 5}, {"num_inliers": 6}, {"num_inliers": 20}]
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=3, num_valid_calls=3,
+            tool_calls=tool_calls, tool_results=tool_results,
+            use_ntep_rewards=True,
+        )
+        assert reward["ntep_redundancy_penalty"] == pytest.approx(-0.05)
+        assert reward["ntep_intent_reward"] == pytest.approx(3 * 0.05)
+
+    def test_ntep_disabled_by_default(self):
+        """NTEP rewards are 0 unless use_ntep_rewards=True (backward compat)."""
+        tool_calls = [
+            ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b"}),
+        ]
+        tool_results = [{"num_inliers": 50}]
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=1, num_valid_calls=1,
+            tool_calls=tool_calls, tool_results=tool_results,
+        )
+        assert reward["ntep_intent_reward"] == 0.0
+        assert reward["ntep_redundancy_penalty"] == 0.0
+
+        # Enabled flag without tool_calls → still 0.
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=1, num_valid_calls=1,
+            use_ntep_rewards=True,
+        )
+        assert reward["ntep_intent_reward"] == 0.0
+        assert reward["ntep_redundancy_penalty"] == 0.0
+
 
 class TestData:
     def test_difficulty_bin(self):

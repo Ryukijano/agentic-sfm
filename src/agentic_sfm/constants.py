@@ -36,6 +36,9 @@ REWARD_TOTAL_KEYS = (
     "pose_reward",
     "tool_cost",
     "accumulative_tool_reward",
+    # NTEP process rewards (arXiv 2609.03493) — 0 unless use_ntep_rewards=True
+    "ntep_intent_reward",
+    "ntep_redundancy_penalty",
 )
 
 
