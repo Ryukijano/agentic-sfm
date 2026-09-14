@@ -337,7 +337,10 @@ def run_scene_episode(
         if terminated or num_tool_calls >= max_tool_calls:
             break
 
-        # Generate via vLLM
+        # Trim the rolling context to stay under the model's context budget
+        # before generating (long scenes + many tool calls would otherwise
+        # overflow vLLM's max_model_len and the whole episode would fail).
+        _trim_scene_context(ep)
         try:
             response = agent._generate_turn(ep.messages, ep.images)
         except Exception as e:
@@ -428,6 +431,48 @@ def run_scene_episode(
         f"reward={ep.reward:.3f}, registered={ep.recon_result.get('num_registered', 0)}"
     )
     return ep
+
+
+# Conservative context budget for scene rollouts. The model supports ~262k
+# positions but vLLM is launched with a smaller --max-model-len; we keep the
+# rolling conversation well under it so long episodes never hit the 400
+# "input exceeds max context length" errors seen in early Phase-2 runs.
+SCENE_CONTEXT_BUDGET = 24000  # tokens (chars/4 estimate + image cost)
+_IMG_TOKEN_COST = 300         # rough token cost per image/thumbnail
+
+
+def _estimate_context_tokens(messages: list[dict[str, Any]], num_images: int) -> int:
+    """Rough token estimate: ~4 chars/token of text + per-image cost."""
+    chars = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    chars += len(str(part.get("text", "")))
+    return chars // 4 + num_images * _IMG_TOKEN_COST
+
+
+def _trim_scene_context(ep: Any, max_tokens: int = SCENE_CONTEXT_BUDGET) -> None:
+    """Drop the oldest assistant/observation turns when over the token budget.
+
+    Keeps ``messages[0]`` (system) and ``messages[1]`` (initial user with the
+    scene thumbnails), then retains only the most recent turns so the rolling
+    prompt stays under ``max_tokens``. Mutates ``ep.messages``; also bounds
+    ``ep.images`` to the thumbnail count actually referenced.
+    """
+    num_images = len(getattr(ep, "images", []) or [])
+    if _estimate_context_tokens(ep.messages, num_images) <= max_tokens:
+        return
+    # messages[0]=system, [1]=user+images; tail = [assistant, user-obs] turns.
+    head = ep.messages[:2]
+    tail = ep.messages[2:]
+    # Drop oldest turns until under budget (each tail element is one message).
+    while tail and _estimate_context_tokens(head + tail, num_images) > max_tokens:
+        tail = tail[1:]
+    ep.messages = head + tail
 
 
 def run_scene_oracle_episode(

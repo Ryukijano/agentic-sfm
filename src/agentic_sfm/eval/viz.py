@@ -425,13 +425,17 @@ def render_gt_pointcloud(
     ax = fig.add_subplot(111, projection="3d")
     ax.set_facecolor(FIG_BG)
 
+    # ScanNet world frames are Z-up (camera heights ~1.1-1.7 m in Z), so the
+    # axes map straight through: (X, Y, Z) <- (x, y, z) keeps the room
+    # upright — unlike ``render_point_cloud`` which remaps for the
+    # COLMAP/Y-up convention.
     if len(pts):
-        ax.scatter(pts[:, 0], pts[:, 2], -pts[:, 1],
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
                    c=np.clip(cols, 0, 1), s=1.2, alpha=0.9,
                    linewidths=0, depthshade=True)
 
     if len(cam_centers):
-        ax.scatter(cam_centers[:, 0], cam_centers[:, 2], -cam_centers[:, 1],
+        ax.scatter(cam_centers[:, 0], cam_centers[:, 1], cam_centers[:, 2],
                    c=C_CAMERA, s=45, marker="^", edgecolors="k",
                    linewidths=0.4, label="cameras", depthshade=False)
 
@@ -445,8 +449,8 @@ def render_gt_pointcloud(
         mid = np.median(pts, axis=0)
         rng = np.ptp(pts, axis=0).max()
         ax.set_xlim(mid[0] - rng * 0.6, mid[0] + rng * 0.6)
-        ax.set_ylim(mid[2] - rng * 0.6, mid[2] + rng * 0.6)
-        ax.set_zlim(-mid[1] - rng * 0.6, -mid[1] + rng * 0.6)
+        ax.set_ylim(mid[1] - rng * 0.6, mid[1] + rng * 0.6)
+        ax.set_zlim(mid[2] - rng * 0.6, mid[2] + rng * 0.6)
     ax.view_init(elev=elev, azim=azim)
 
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
@@ -456,13 +460,13 @@ def render_gt_pointcloud(
         axis._axinfo["grid"]["color"] = (0.3, 0.3, 0.35, 0.3)
     ax.tick_params(colors=C_TEXT, labelsize=7)
     ax.set_xlabel("X", color=C_TEXT)
-    ax.set_ylabel("Z", color=C_TEXT)
-    ax.set_zlabel("-Y", color=C_TEXT)
+    ax.set_ylabel("Y", color=C_TEXT)
+    ax.set_zlabel("Z", color=C_TEXT)
     try:
         if len(pts):
             ax.set_box_aspect((np.ptp(pts[:, 0]) + 1e-6,
-                               np.ptp(pts[:, 2]) + 1e-6,
-                               np.ptp(pts[:, 1]) + 1e-6))
+                               np.ptp(pts[:, 1]) + 1e-6,
+                               np.ptp(pts[:, 2]) + 1e-6))
     except Exception:
         pass
     if len(cam_centers):

@@ -95,7 +95,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
     --max-lora-rank 32 \
     --port "${VLLM_PORT}" \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 8192 \
+    --max-model-len 32768 \
     --limit-mm-per-prompt '{"image":8,"video":0}' \
     --mm-processor-kwargs '{"max_pixels":1003520,"min_pixels":3136}' \
     --mm-processor-cache-gb 0 \
