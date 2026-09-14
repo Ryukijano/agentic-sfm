@@ -118,6 +118,8 @@ def estimate_relative_pose(
         "pose": {"R": R.tolist(), "t": t.flatten().tolist()},
         "mean_inlier_residual": mean_resid,
         "residual_units": resid_units,
+        # bool mask over the input correspondence order (for viz / downstream use)
+        "inlier_mask": inlier_idx.tolist(),
     }
 
 

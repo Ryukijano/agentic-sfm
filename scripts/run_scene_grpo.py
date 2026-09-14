@@ -495,6 +495,60 @@ class SceneGRPOTrainer(GRPOTrainer):
         return metrics
 
     # ------------------------------------------------------------------
+    # Qualitative wandb media (3D recon + match viz)
+    # ------------------------------------------------------------------
+
+    def _log_scene_media(self, episodes: list, step: int, tag: str = "eval") -> None:
+        """Render each scene's COLMAP reconstruction + a match figure to wandb.
+
+        - The sparse reconstruction is logged as an interactive ``wandb.Object3D``
+          point cloud (x,y,z + RGB) AND a static rendered figure.
+        - A best-match correspondence figure is logged when the episode carried
+          keypoints.
+        """
+        if not self._wandb:
+            return
+        try:
+            import wandb
+            from agentic_sfm.eval.viz import (
+                episode_qualitative_media, render_point_cloud,
+            )
+            import pycolmap
+        except Exception as e:
+            logger.warning(f"scene media unavailable: {e}")
+            return
+
+        for ep in episodes:
+            sid = getattr(ep, "scene_id", "scene")
+            out_dir = (getattr(ep, "recon_result", None) or {}).get("output_dir")
+            if out_dir:
+                try:
+                    recon = pycolmap.Reconstruction(str(out_dir))
+                    # interactive 3D point cloud
+                    pts = np.asarray([p.xyz for p in recon.points3D.values()])
+                    cols = np.asarray([p.color for p in recon.points3D.values()])
+                    if len(pts):
+                        pc = np.concatenate([pts, cols], axis=1)  # (N,6)
+                        self._wandb.log(
+                            {f"{tag}/{sid}_pointcloud": wandb.Object3D(pc)},
+                            step=step)
+                    # static render
+                    fig = render_point_cloud(
+                        reconstruction=recon, title=f"{sid} — {len(recon.images)} imgs")
+                    self._wandb.log(
+                        {f"{tag}/{sid}_recon": wandb.Image(fig)}, step=step)
+                except Exception as e:
+                    logger.warning(f"recon render failed for {sid}: {e}")
+            # match viz for the episode's best match
+            try:
+                media = episode_qualitative_media(ep, prefix=f"{tag}/{sid}")
+                if media:
+                    self._wandb.log(
+                        {k: wandb.Image(v) for k, v in media.items()}, step=step)
+            except Exception as e:
+                logger.warning(f"match viz failed for {sid}: {e}")
+
+    # ------------------------------------------------------------------
     # Eval
     # ------------------------------------------------------------------
 
@@ -552,7 +606,8 @@ class SceneGRPOTrainer(GRPOTrainer):
             self._wandb.log({
                 f"eval/{k}": v for k, v in stats.items()
                 if isinstance(v, (int, float))
-            })
+            }, step=self._global_step)
+            self._log_scene_media(episodes, step=self._global_step, tag="eval")
         return stats
 
     # ------------------------------------------------------------------

@@ -285,6 +285,7 @@ def _match_loftr(
         "residual_units": pose_result.get("residual_units"),
         "keypoints_a": mkpts_a.tolist()[:100],
         "keypoints_b": mkpts_b.tolist()[:100],
+        "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
     }
 
 
@@ -364,6 +365,7 @@ def _match_mast3r(
             "residual_units": pose_result.get("residual_units"),
             "keypoints_a": matches_im0.tolist()[:100],
             "keypoints_b": matches_im1.tolist()[:100],
+            "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
         }
     finally:
         os.unlink(tmp_a)
@@ -416,6 +418,7 @@ def _match_lightglue(
         "residual_units": pose_result.get("residual_units"),
         "keypoints_a": mkpts_a.tolist()[:100],
         "keypoints_b": mkpts_b.tolist()[:100],
+        "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
     }
 
 

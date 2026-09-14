@@ -240,6 +240,11 @@ def match(req: MatchRequest):
                 {"pt_a": pts0[i].tolist(), "pt_b": pts1[i].tolist(), "conf": float(conf[i])}
                 for i in range(min(len(pts0), 20))
             ],
+            # High-confidence correspondences that entered pose estimation,
+            # aligned with inlier_mask — used by the match visualiser.
+            "keypoints_a": pts0_hc.tolist()[:100],
+            "keypoints_b": pts1_hc.tolist()[:100],
+            "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
         }
     except Exception as e:
         logger.error(f"Match failed: {e}")

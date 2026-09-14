@@ -958,6 +958,7 @@ class GRPOTrainer:
         steps and gradients are zeroed.
         """
         episodes = self.collect_rollouts(pairs, rollout_agent)
+        self._last_episodes = episodes  # kept for wandb media logging
         # DAPO Dynamic Sampling: filter zero-variance groups
         episodes = self._filter_zero_variance_groups(episodes)
         if not episodes:
@@ -1049,6 +1050,29 @@ class GRPOTrainer:
         if is_last_accum:
             self._model.eval()
         return stats
+
+    def _log_qualitative_media(self, step: int, tag: str = "qual") -> None:
+        """Render the best episode's match figure + log to wandb.
+
+        Picks the highest-reward episode from the last train_step, builds the
+        inlier/outlier correspondence figure, and logs it as a wandb.Image so
+        the dashboard shows live match quality during training.
+        """
+        if not self._wandb:
+            return
+        eps = getattr(self, "_last_episodes", None) or []
+        if not eps:
+            return
+        try:
+            from agentic_sfm.eval.viz import episode_qualitative_media
+            import wandb
+            best = max(eps, key=lambda e: getattr(e, "reward", 0.0))
+            media = episode_qualitative_media(best, prefix=tag)
+            if media:
+                self._wandb.log({k: wandb.Image(v) for k, v in media.items()},
+                                step=step)
+        except Exception as e:
+            logger.warning(f"qualitative media log failed: {e}")
 
     def evaluate(self, rollout_agent: VLLMRolloutAgent, max_pairs: int = 50) -> dict:
         if len(self.val_dataset) == 0:
@@ -1205,7 +1229,8 @@ class GRPOTrainer:
                                 "train/loss": stats.get("loss", 0.0),
                                 "train/epoch": epoch + 1,
                                 "train/global_step": global_step,
-                            })
+                            }, step=global_step)
+                            self._log_qualitative_media(global_step, tag="train")
 
             mean_reward = np.mean([s["mean_reward"] for s in epoch_stats]) if epoch_stats else 0.0
             logger.info(f"Epoch {epoch+1} mean reward: {mean_reward:.3f}")
