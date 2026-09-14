@@ -59,11 +59,26 @@ def _count_image_slots(messages: list[dict]) -> int:
 
 
 def _load_example_images(ex: dict) -> list:
-    """Pair images plus any crop frames stored on the SFT example."""
-    images = [
-        Image.open(ex["image_a"]).convert("RGB"),
-        Image.open(ex["image_b"]).convert("RGB"),
-    ]
+    """Scene or pair images plus any crop frames stored on the SFT example.
+
+    Scene-level examples (``build_scene_sft.py``) carry ``image_paths`` — a
+    list of scene image paths; the chat's image slots use the first N of
+    them. Pair-level examples carry ``image_a`` / ``image_b``.
+    """
+    if ex.get("image_paths"):
+        images = []
+        for path in ex["image_paths"]:
+            try:
+                images.append(Image.open(path).convert("RGB"))
+            except Exception:
+                continue
+        if not images:
+            raise ValueError("no loadable images in image_paths")
+    else:
+        images = [
+            Image.open(ex["image_a"]).convert("RGB"),
+            Image.open(ex["image_b"]).convert("RGB"),
+        ]
     for path in ex.get("crop_image_paths") or []:
         try:
             images.append(Image.open(path).convert("RGB"))
@@ -242,7 +257,10 @@ class SFTTrainer:
                 total_loss = total_loss + loss.detach()
                 valid_count += 1
             except Exception as e:
-                logger.warning(f"SFT step failed for {ex.get('pair_id', '?')}: {e}")
+                logger.warning(
+                    f"SFT step failed for "
+                    f"{ex.get('pair_id') or ex.get('scene_id', '?')}: {e}"
+                )
                 continue
 
         if valid_count > 0 and is_last_accum:

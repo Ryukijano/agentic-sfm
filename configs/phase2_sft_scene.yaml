@@ -1,0 +1,39 @@
+# Phase 2a: Scene-level SFT warmup for agentic SfM
+# LoRA fine-tuning of Qwen3.5-2B on oracle scene trajectories (scene tool
+# grammar: retrieve -> match/crop_and_match -> doppelganger_check -> sfm_run
+# -> inspect -> done). Runs BEFORE phase2_scene GRPO — same role as
+# phase1_sft.yaml played for pair-level training.
+#
+# Data: scripts/build_scene_sft.py -> data/scene_sft_train.jsonl
+# Train: python scripts/run_sft.py --config configs/phase2_sft_scene.yaml
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  total_epochs: 5
+  batch_size: 2
+  gradient_accumulation_steps: 8  # effective batch size = 16
+  max_grad_norm: 1.0
+  save_freq: 1
+
+data:
+  sft_data: "data/scene_sft_train.jsonl"
+
+output:
+  checkpoint_dir: "outputs/scene_sft/checkpoints"
+  results_dir: "outputs/scene_sft"
+  log_dir: "logs/scene_sft"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-scene-sft-qwen35-2b"
+  wandb_enabled: false
