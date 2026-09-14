@@ -187,27 +187,41 @@ def _inject_pose_error(
 
 
 # System prompt for scene-level episodes
-SCENE_SYSTEM_PROMPT = """You are an SfM reconstruction agent. You are given a set of images from a scene.
-Your goal is to reconstruct the scene by matching image pairs and running COLMAP.
+SCENE_SYSTEM_PROMPT = """\
+You are an SfM agent. Reconstruct the scene from its images (img_0000, \
+img_0001, ...). Output exactly one JSON tool call per turn:
+{"tool": "name", "args": {...}}
 
-Available tools:
-- retrieve: find candidate image pairs to match
-- match: match a specific image pair
-- crop_and_match: crop one image then match to the other
-- doppelganger_check: check if a pair is a doppelganger (looks similar but different scene); returns a calibrated confidence, visual similarity, and geometric inlier ratio
-- sfm_run: run COLMAP reconstruction on registered images
-- inspect: inspect the current reconstruction
-- done: end the episode
+Tools:
+- retrieve {"top_k": 20} -> candidate pairs [{"image_a","image_b","score"}]
+- match {"image_a","image_b","matcher":"loftr"} -> num_inliers, inlier_ratio, \
+pose
+- crop {"image_id","bbox":[x1,y1,x2,y2]} -> cropped_image_id; bbox coords 0-1
+- crop_and_match {"image_id","bbox":[...],"image_b","matcher"} -> crop + match \
+in one step; use when overlap is small
+- doppelganger_check {"image_a","image_b"} -> is_doppelganger, confidence, \
+inlier_ratio; detects look-alike pairs of a different place
+- sfm_run {} -> COLMAP reconstruction: num_registered, num_points3d, \
+mean_reproj_error
+- inspect {} -> stats of the last reconstruction
+- done {} -> end episode
 
-Output format: {"tool": "<name>", "args": {...}}
+Workflow: retrieve once; match the best 5-10 pairs (crop_and_match for small \
+overlap); doppelganger_check suspicious pairs — similar look but low \
+inlier_ratio — BEFORE sfm_run (flagged pairs are filtered out); then sfm_run \
+and inspect; if few images registered, match more and rerun; done when most \
+are registered.
 
-Strategy:
-1. Call retrieve to find good candidate pairs
-2. For each pair, call match or crop_and_match
-3. If a pair looks suspicious, call doppelganger_check
-4. After matching enough pairs, call sfm_run
-5. Call inspect to check the result
-6. Call done when satisfied"""
+Reward: higher for more registered images, accurate poses, and filtered \
+doppelgangers. sfm_run with too few or bad matches scores low. Do not repeat \
+calls.
+
+Examples:
+{"tool": "retrieve", "args": {"top_k": 15}}
+{"tool": "match", "args": {"image_a": "img_0000", "image_b": "img_0001", "matcher": "loftr"}}
+{"tool": "doppelganger_check", "args": {"image_a": "img_0002", "image_b": "img_0007"}}
+{"tool": "sfm_run", "args": {}}
+{"tool": "done", "args": {}}"""
 
 
 @dataclass
@@ -320,7 +334,7 @@ def run_scene_episode(
     terminated = False
 
     for turn in range(max_turns):
-        if terminated:
+        if terminated or num_tool_calls >= max_tool_calls:
             break
 
         # Generate via vLLM

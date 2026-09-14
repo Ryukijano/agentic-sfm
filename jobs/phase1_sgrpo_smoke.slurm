@@ -54,6 +54,7 @@ export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=1
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 

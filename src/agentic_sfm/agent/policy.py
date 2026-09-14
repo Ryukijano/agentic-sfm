@@ -152,12 +152,44 @@ def parse_tool_call(text: str) -> ToolCall | None:
     return None
 
 
+def _fmt_num(value: Any, spec: str = ".3f") -> str | None:
+    """Format a numeric field; None when missing or non-numeric."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return None
+
+
 def format_observation(result: dict[str, Any]) -> str:
-    """Format a tool result as a text observation for the MLLM."""
+    """Format a tool result as a text observation for the MLLM.
+
+    Handles pair-level results (crop, match, crop_and_match,
+    doppelganger_check) and scene-level results (retrieve -> pair list,
+    sfm_run/inspect -> reconstruction stats).
+    """
     if "error" in result:
         return f"Error: {result['error']}"
 
     parts = []
+
+    # retrieve -> ranked candidate pairs (compact, top 10)
+    pairs = result.get("pairs")
+    if isinstance(pairs, list):
+        parts.append(f"Found {result.get('num_pairs', len(pairs))} candidate pairs")
+        shown = []
+        for p in pairs[:10]:
+            if not isinstance(p, dict):
+                continue
+            score = _fmt_num(p.get("score"))
+            label = f"{p.get('image_a', '?')}-{p.get('image_b', '?')}"
+            shown.append(f"{label} ({score})" if score else label)
+        if shown:
+            parts.append("top: " + ", ".join(shown))
+        return " | ".join(parts)
+
+    # crop -> new image id
     cid = crop_image_id(result)
     if cid:
         parts.append(f"cropped_image_id: {cid} (use this id in match)")
@@ -165,23 +197,57 @@ def format_observation(result: dict[str, Any]) -> str:
         parts.append(f"crop_size: {result['crop_size']}")
     if "size" in result:
         parts.append(f"size: {result['size']}")
-    if "num_matches" in result:
+
+    # match / doppelganger_check geometry stats
+    if result.get("num_matches") is not None:
         parts.append(f"Matches: {result['num_matches']}")
-    if "num_inliers" in result:
+    if result.get("num_inliers") is not None:
         parts.append(f"Inliers: {result['num_inliers']}")
-    if "inlier_ratio" in result:
-        parts.append(f"Inlier ratio: {result['inlier_ratio']:.3f}")
+    inlier_ratio = _fmt_num(result.get("inlier_ratio"))
+    if inlier_ratio is not None:
+        parts.append(f"Inlier ratio: {inlier_ratio}")
     if result.get("pose") is not None:
         parts.append("Pose: estimated")
+
+    # sfm_run / inspect -> reconstruction stats
+    if "num_registered" in result or "num_points3d" in result:
+        parts.append(f"Registered: {result.get('num_registered', 0)} images")
+        parts.append(f"Points3D: {result.get('num_points3d', 0)}")
+        if result.get("num_cameras") is not None:
+            parts.append(f"Cameras: {result['num_cameras']}")
+        reproj = _fmt_num(result.get("mean_reproj_error"), ".2f")
+        if reproj is not None:
+            parts.append(f"Reproj error: {reproj}px")
+        pose_err = _fmt_num(result.get("mean_pose_error_deg"), ".2f")
+        if pose_err is not None:
+            parts.append(f"Pose error: {pose_err} deg")
+        if result.get("num_pairs_matched"):
+            parts.append(f"Pairs matched: {result['num_pairs_matched']}")
+        n_present = result.get("num_doppelgangers_present")
+        if n_present:
+            parts.append(
+                f"Doppelgangers filtered: "
+                f"{result.get('num_doppelgangers_filtered', 0)}/{n_present}"
+            )
+        n_comp = result.get("num_components")
+        if isinstance(n_comp, int) and n_comp > 1:
+            parts.append(f"Components: {n_comp} (scene split)")
+        if result.get("output_dir"):
+            parts.append(f"output_dir: {result['output_dir']}")
+
+    # doppelganger_check -> verdict
     if "is_doppelganger" in result:
-        conf = result.get("confidence", result.get("score", 0.0))
-        parts.append(f"Doppelganger: {result['is_doppelganger']} (confidence: {conf:.3f})")
-        sim = result.get("similarity_score")
+        conf = _fmt_num(result.get("confidence", result.get("score"))) or "?"
+        parts.append(
+            f"Doppelganger: {result['is_doppelganger']} (confidence: {conf})"
+        )
+        sim = _fmt_num(result.get("similarity_score"))
         if sim is not None:
-            parts.append(f"similarity: {float(sim):.3f}")
+            parts.append(f"similarity: {sim}")
         verdict = result.get("verdict")
         if verdict:
             parts.append(f"verdict: {verdict}")
+
     return " | ".join(parts) if parts else json.dumps(result)
 
 

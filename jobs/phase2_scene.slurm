@@ -47,6 +47,7 @@ export CUDA_HOME="${CUDA_HOME:-/opt/apps/pkg/compilers/cuda/12.4.1}"
 export NCCL_P2P_DISABLE=1
 export NCCL_NET=Socket
 export NCCL_IB_DISABLE=1
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=1
 export TRITON_CACHE_DIR="/scratch/kcwp264/.triton_cache"
 export FLASHINFER_WORKSPACE_DIR="/scratch/kcwp264/.flashinfer"
 export FLASHINFER_JIT_DIR="/scratch/kcwp264/.flashinfer/jit"

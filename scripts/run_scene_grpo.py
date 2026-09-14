@@ -20,22 +20,42 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import re
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+_REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(_REPO))  # for `import scripts.run_grpo`
 
-from agentic_sfm.agent.policy import parse_tool_call, format_observation
-from agentic_sfm.constants import DEFAULT_MATCHER, DEFAULT_POLICY_MODEL
-from agentic_sfm.rl.scene_episode import SceneRolloutEpisode, run_scene_episode
+from agentic_sfm.constants import DEFAULT_MATCHER, assert_qwen35_runtime
+from agentic_sfm.rl.scene_episode import (
+    SceneRolloutEpisode,
+    run_scene_episode,
+    run_scene_oracle_episode,
+)
 from agentic_sfm.tools.client import ToolClient
+from scripts.run_grpo import GRPOTrainer, VLLMRolloutAgent
 
 logger = logging.getLogger(__name__)
+
+# Scene-level reward components surfaced in logs / wandb (see
+# rewards.pose_rewards.compute_scene_reward).
+SCENE_REWARD_KEYS = (
+    "registration_reward",
+    "pose_reward",
+    "doppelganger_reward",
+    "split_penalty",
+    "tool_cost",
+    "accumulative_tool_reward",
+    "ntep_intent_reward",
+    "ntep_redundancy_penalty",
+)
 
 
 def _normalize_scene_ids(scene_ids: list[str] | None) -> set[str] | None:
@@ -249,6 +269,351 @@ class SceneCurriculum:
                 f"scenes={scenes}, max_images={max_images}")
 
 
+class SceneGRPOTrainer(GRPOTrainer):
+    """Scene-level GRPO trainer for Phase 2.
+
+    Subclasses the pair-level ``GRPOTrainer`` and overrides everything that
+    touches pair-specific fields:
+
+      - ``_group_key`` groups episodes by ``scene_id`` (not ``pair_id``), which
+        fixes both ``compute_advantages`` and DAPO zero-variance filtering.
+      - ``collect_scene_rollouts`` runs ``run_scene_episode`` per scene ×
+        ``group_size`` (plus S-GRPO CGI oracle injection), replacing the
+        pair-level ``collect_rollouts``.  The inherited ``train_step`` calls
+        ``self.collect_rollouts`` so the whole policy-gradient path
+        (logprobs, clipped surrogate, grad accumulation) is reused.
+      - ``evaluate`` runs one rollout per held-out (or sampled) scene.
+      - ``save_lora_checkpoint`` additionally writes ``trainer_state.json``
+        (epoch + global step) so ``--resume`` can restore both.
+      - ``resume`` loads a saved LoRA adapter and returns the epoch to
+        restart from.
+
+    ``image_root``/``max_turns``/scene reward weights come from the config
+    sections ``data``, ``rl`` and ``reward``.
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        tool_client: ToolClient,
+        vllm_url: str = "http://localhost:8000",
+        output_dir: str = "outputs/phase2",
+        image_root: str | None = None,
+        max_turns: int | None = None,
+        scene_dataset: "SceneDataset | None" = None,
+        val_scenes: list[dict[str, Any]] | None = None,
+    ):
+        super().__init__(
+            config=config,
+            tool_client=tool_client,
+            vllm_url=vllm_url,
+            output_dir=output_dir,
+            load_pair_datasets=False,
+        )
+        data_cfg = config.get("data", {})
+        self.image_root = (
+            image_root if image_root is not None else data_cfg.get("image_root", "")
+        )
+        self.max_turns = (
+            max_turns if max_turns is not None else config["rl"].get("max_turns", 30)
+        )
+        self.scene_dataset = scene_dataset
+        self.val_scenes = list(val_scenes or [])
+        # Epoch index currently being trained — written to trainer_state.json.
+        self.current_epoch = 0
+        # Episodes from the most recent collect_scene_rollouts call (pre
+        # dynamic-sampling filter), used for scene-level metric logging.
+        self._last_collected_episodes: list[SceneRolloutEpisode] = []
+        # Scene-level reward weights passed to run_scene_episode through
+        # agent.reward_config. Keys match compute_scene_reward's kwargs.
+        self._base_reward_config: dict[str, Any] = dict(config.get("reward", {}) or {})
+
+    # ------------------------------------------------------------------
+    # Grouping / rollout collection
+    # ------------------------------------------------------------------
+
+    def _group_key(self, ep: SceneRolloutEpisode) -> str:
+        return ep.scene_id
+
+    def _scheduled_reward_config(self) -> dict[str, Any]:
+        """Reward config for the current ``_global_step`` under the schedule.
+
+        Mirrors the pair-level dynamic schedule: during warmup
+        (``_global_step < reward_warmup_steps``) the pose term is scaled down
+        so registration/format signal dominates while the policy is cold.
+        """
+        cfg = dict(self._base_reward_config)
+        if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
+            cfg["pose_weight"] = cfg.get("pose_weight", 1.0) * (1.0 / 3.0)
+        return cfg
+
+    def collect_scene_rollouts(
+        self,
+        scenes: list[dict[str, Any]],
+        rollout_agent: VLLMRolloutAgent,
+    ) -> list[SceneRolloutEpisode]:
+        """Collect ``group_size`` scene rollouts per scene, with S-GRPO CGI.
+
+        When every rollout in a scene's group fails, inject the oracle
+        trajectory (GT-overlap pairs -> match -> sfm_run) so the group still
+        yields a positive learning signal.
+        """
+        rollout_agent.reward_config = self._scheduled_reward_config()
+        episodes: list[SceneRolloutEpisode] = []
+        cgi_injections = 0
+        for scene in scenes:
+            group_episodes: list[SceneRolloutEpisode] = []
+            all_failed = True
+            for _ in range(self.group_size):
+                ep = run_scene_episode(
+                    agent=rollout_agent,
+                    scene_id=scene["scene_id"],
+                    image_paths=scene["image_paths"],
+                    tool_client=self.tool_client,
+                    gt_recon=scene.get("gt_recon"),
+                    overlap_matrix=scene.get("overlap_matrix"),
+                    image_indices=scene.get("image_indices"),
+                    max_tool_calls=self.max_tool_calls,
+                    max_turns=self.max_turns,
+                    image_root=self.image_root,
+                )
+                group_episodes.append(ep)
+                if ep.reward > 0:
+                    all_failed = False
+
+            # S-GRPO CGI: inject oracle trajectory when all rollouts fail
+            if self.sgrpo_cgi and all_failed and group_episodes:
+                failed_max = max(e.reward for e in group_episodes)
+                oracle_ep = run_scene_oracle_episode(
+                    agent=rollout_agent,
+                    scene_id=scene["scene_id"],
+                    image_paths=scene["image_paths"],
+                    tool_client=self.tool_client,
+                    gt_recon=scene.get("gt_recon"),
+                    overlap_matrix=scene.get("overlap_matrix"),
+                    image_indices=scene.get("image_indices"),
+                    failed_group_max_reward=failed_max,
+                    image_root=self.image_root,
+                )
+                if oracle_ep.reward > failed_max:
+                    if len(group_episodes) == 1:
+                        # Keep the group >1 member so the zero-variance
+                        # filter doesn't drop it entirely.
+                        group_episodes.append(oracle_ep)
+                    else:
+                        worst_idx = min(
+                            range(len(group_episodes)),
+                            key=lambda i: group_episodes[i].reward,
+                        )
+                        group_episodes[worst_idx] = oracle_ep
+                    cgi_injections += 1
+                    logger.info(
+                        f"  S-GRPO CGI: injected oracle for {scene['scene_id']} "
+                        f"(reward={oracle_ep.reward:.3f})"
+                    )
+
+            rewards = [e.reward for e in group_episodes]
+            logger.info(
+                f"  {scene['scene_id']}: rewards={[f'{r:.3f}' for r in rewards]}, "
+                f"mean={np.mean(rewards):.3f}"
+            )
+            episodes.extend(group_episodes)
+
+        if cgi_injections > 0:
+            logger.info(
+                f"  S-GRPO CGI: injected {cgi_injections} oracle trajectories "
+                f"({cgi_injections}/{len(scenes)} scenes)"
+            )
+        self._last_collected_episodes = episodes
+        return episodes
+
+    def collect_rollouts(self, scenes: list, rollout_agent: VLLMRolloutAgent) -> list:
+        """Override so the inherited ``train_step`` collects scene rollouts."""
+        return self.collect_scene_rollouts(scenes, rollout_agent)
+
+    # ------------------------------------------------------------------
+    # Training step / metrics
+    # ------------------------------------------------------------------
+
+    def train_step(self, scenes: list, rollout_agent: VLLMRolloutAgent,
+                   accum_step: int = 0, is_last_accum: bool = True) -> dict:
+        """One scene-level GRPO step (inherited update + scene metrics)."""
+        stats = super().train_step(
+            scenes, rollout_agent, accum_step=accum_step, is_last_accum=is_last_accum
+        )
+        stats.update(self._scene_metrics(self._last_collected_episodes))
+        return stats
+
+    def _scene_metrics(self, episodes: list[SceneRolloutEpisode]) -> dict[str, float]:
+        """Mean scene-level reward components + reconstruction stats."""
+        if not episodes:
+            return {}
+        metrics: dict[str, float] = {}
+        for key in SCENE_REWARD_KEYS:
+            vals = [
+                float(ep.reward_components[key])
+                for ep in episodes
+                if isinstance(ep.reward_components.get(key), (int, float))
+            ]
+            metrics[f"scene/{key}"] = float(np.mean(vals)) if vals else 0.0
+        registered = [
+            float((ep.recon_result or {}).get("num_registered", 0) or 0)
+            for ep in episodes
+        ]
+        metrics["scene/mean_registered"] = float(np.mean(registered))
+        metrics["scene/mean_registered_frac"] = float(
+            np.mean([r / max(ep.num_images or len(ep.image_paths), 1)
+                     for r, ep in zip(registered, episodes)])
+        )
+        pose_errs = [
+            float(ep.recon_result["mean_pose_error_deg"])
+            for ep in episodes
+            if isinstance((ep.recon_result or {}).get("mean_pose_error_deg"), (int, float))
+        ]
+        metrics["scene/mean_pose_error_deg"] = (
+            float(np.mean(pose_errs)) if pose_errs else 0.0
+        )
+        metrics["scene/done_rate"] = float(
+            np.mean([1.0 if ep.done else 0.0 for ep in episodes])
+        )
+        metrics["scene/mean_num_images"] = float(
+            np.mean([ep.num_images or len(ep.image_paths) for ep in episodes])
+        )
+        # Doppelganger bookkeeping: checks issued, pairs the sfm_run saw as
+        # flagged, and pairs actually filtered out of the COLMAP pair list.
+        metrics["scene/mean_doppelganger_checks"] = float(
+            np.mean([len(ep.doppelganger_checks) for ep in episodes])
+        )
+        metrics["scene/mean_doppelgangers_present"] = float(np.mean([
+            float((ep.recon_result or {}).get("num_doppelgangers_present", 0) or 0)
+            for ep in episodes
+        ]))
+        metrics["scene/mean_doppelgangers_filtered"] = float(np.mean([
+            float((ep.recon_result or {}).get("num_doppelgangers_filtered", 0) or 0)
+            for ep in episodes
+        ]))
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Eval
+    # ------------------------------------------------------------------
+
+    def _eval_scenes(self) -> list[dict[str, Any]]:
+        """Scenes to evaluate on: held-out val scenes, else a train subset."""
+        if self.val_scenes:
+            return list(self.val_scenes)
+        if self.scene_dataset is not None:
+            return list(self.scene_dataset.scenes)
+        return []
+
+    def evaluate(self, rollout_agent: VLLMRolloutAgent,
+                 max_scenes: int | None = None,
+                 scenes: list[dict[str, Any]] | None = None) -> dict:
+        eval_scenes = scenes if scenes is not None else self._eval_scenes()
+        if not eval_scenes:
+            return {"mean_reward": 0.0, "num_scenes": 0}
+        if max_scenes is None:
+            max_scenes = self.config["training"].get("eval_num_scenes", 4)
+        eval_scenes = eval_scenes[:max_scenes]
+
+        # Eval uses the unscheduled reward config.
+        rollout_agent.reward_config = dict(self._base_reward_config)
+        episodes = []
+        for scene in eval_scenes:
+            ep = run_scene_episode(
+                agent=rollout_agent,
+                scene_id=scene["scene_id"],
+                image_paths=scene["image_paths"],
+                tool_client=self.tool_client,
+                gt_recon=scene.get("gt_recon"),
+                overlap_matrix=scene.get("overlap_matrix"),
+                image_indices=scene.get("image_indices"),
+                max_tool_calls=self.max_tool_calls,
+                max_turns=self.max_turns,
+                image_root=self.image_root,
+            )
+            episodes.append(ep)
+
+        rewards = [ep.reward for ep in episodes]
+        tool_calls = [len(ep.tool_calls) for ep in episodes]
+        registered = [
+            float((ep.recon_result or {}).get("num_registered", 0) or 0)
+            for ep in episodes
+        ]
+        stats = {
+            "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+            "num_scenes": len(episodes),
+            "mean_tool_calls": float(np.mean(tool_calls)) if tool_calls else 0.0,
+            "success_rate": float(np.mean([1.0 if r > 0 else 0.0 for r in registered])),
+            "mean_registered": float(np.mean(registered)) if registered else 0.0,
+        }
+        stats.update(self._scene_metrics(episodes))
+        if self._wandb:
+            self._wandb.log({
+                f"eval/{k}": v for k, v in stats.items()
+                if isinstance(v, (int, float))
+            })
+        return stats
+
+    # ------------------------------------------------------------------
+    # Checkpointing / resume
+    # ------------------------------------------------------------------
+
+    def save_lora_checkpoint(self, epoch: int | str,
+                             rollout_agent: VLLMRolloutAgent | None = None):
+        """Save LoRA + trainer_state.json, then hot-reload the vLLM adapter."""
+        super().save_lora_checkpoint(epoch, rollout_agent)
+        if self._model is None:
+            return
+        tag = epoch if isinstance(epoch, str) else f"epoch_{epoch}"
+        state = {
+            "tag": tag,
+            # Next epoch index to resume from (epochs are 0-based; the
+            # checkpoint at tag epoch_N is written after epoch N-1 finishes).
+            "epoch": self.current_epoch + 1,
+            "global_step": self._global_step,
+        }
+        try:
+            (self.ckpt_dir / tag / "trainer_state.json").write_text(
+                json.dumps(state, indent=2)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write trainer_state.json: {e}")
+
+    def resume(self, ckpt_path: str | Path) -> int:
+        """Resume LoRA weights from a checkpoint dir. Returns the start epoch.
+
+        Sets ``self.sft_adapter`` so ``_load_training_model`` initialises the
+        PEFT model from the saved adapter, and restores ``_global_step`` /
+        ``current_epoch`` from ``trainer_state.json`` (falling back to an
+        ``epoch_N`` suffix in the directory name).
+        """
+        p = Path(ckpt_path)
+        if not p.is_dir():
+            raise FileNotFoundError(f"--resume checkpoint not found: {p}")
+        self.sft_adapter = str(p)
+
+        start_epoch = 0
+        state_path = p / "trainer_state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text())
+                self._global_step = int(state.get("global_step", 0))
+                start_epoch = int(state.get("epoch", 0) or 0)
+            except Exception as e:
+                logger.warning(f"Could not parse {state_path}: {e}")
+        if start_epoch == 0:
+            m = re.search(r"epoch_(\d+)", p.name)
+            if m:
+                start_epoch = int(m.group(1))
+        self.current_epoch = start_epoch
+        logger.info(
+            f"Resuming from {p} (start_epoch={start_epoch}, "
+            f"global_step={self._global_step})"
+        )
+        return start_epoch
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="YAML config path")
@@ -261,6 +626,8 @@ def main():
     import yaml
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    assert_qwen35_runtime()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -310,6 +677,22 @@ def main():
     for s in scene_dataset.scenes:
         logger.info(f"  {s['scene_id']}: {s['num_images']} images")
 
+    # Held-out val scenes (data.val_scene_ids) are excluded from training and
+    # used by the periodic eval.  When unset, eval falls back to a small
+    # deterministic subset of the training scenes.
+    val_ids = _normalize_scene_ids(data_cfg.get("val_scene_ids"))
+    val_scenes: list[dict[str, Any]] = []
+    train_dataset = scene_dataset
+    if val_ids:
+        val_scenes = [s for s in scene_dataset.scenes if s["scene_id"] in val_ids]
+        train_dataset = SceneDataset(scenes=[
+            s for s in scene_dataset.scenes if s["scene_id"] not in val_ids
+        ])
+        logger.info(
+            f"Held-out val scenes: {[s['scene_id'] for s in val_scenes]} "
+            f"({len(train_dataset.scenes)} train scenes remain)"
+        )
+
     # Initialize tool client
     tool_client = ToolClient(base_url=args.tool_server_url)
     try:
@@ -319,8 +702,7 @@ def main():
         logger.error(f"Tool server not reachable: {e}")
         sys.exit(1)
 
-    # Initialize rollout agent
-    from scripts.run_grpo import VLLMRolloutAgent, GRPOTrainer
+    # Initialize rollout agent (scene reward weights flow via reward_config)
     rollout_agent = VLLMRolloutAgent(
         model_name=config["model"]["name"],
         vllm_url=args.vllm_url,
@@ -330,33 +712,64 @@ def main():
         max_tool_calls=config["rl"].get("max_tool_calls", 20),
         matcher=data_cfg.get("matcher", DEFAULT_MATCHER),
         sft_adapter=config["model"].get("sft_adapter"),
+        reward_config=config.get("reward", {}),
     )
 
-    # Initialize GRPO trainer
-    trainer = GRPOTrainer(
+    # Scene-level GRPO trainer
+    trainer = SceneGRPOTrainer(
         config=config,
         tool_client=tool_client,
         vllm_url=args.vllm_url,
         output_dir=args.output_dir,
+        image_root=data_cfg.get("image_root", ""),
+        max_turns=config["rl"].get("max_turns", 30),
+        scene_dataset=train_dataset,
+        val_scenes=val_scenes,
     )
 
-    # Phase 2 training loop
+    # --resume: restore LoRA weights + trainer state, start at saved epoch.
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.resume(args.resume)
+    else:
+        # No explicit resume: warm-start the training LoRA from the Phase 1
+        # checkpoint, falling back to the SFT adapter when the Phase 1
+        # checkpoint isn't a real PEFT adapter dir.
+        for warm in (config["model"].get("checkpoint"),
+                     config["model"].get("sft_adapter")):
+            if warm and os.path.isdir(str(warm)) and \
+                    (Path(warm) / "adapter_config.json").exists():
+                trainer.sft_adapter = str(warm)
+                logger.info(f"Warm-starting training LoRA from {warm}")
+                break
+
+    # Hot-load the initial adapter into vLLM so rollouts are on-policy.
+    init_adapter = args.resume or trainer.sft_adapter
+    if init_adapter and os.path.isdir(str(init_adapter)):
+        trainer._reload_vllm_lora(Path(init_adapter), rollout_agent)
+
+    # Phase 2 training loop: scenes -> micro-batches with gradient accumulation.
     total_epochs = config["training"].get("total_epochs", 50)
-    group_size = config["rl"].get("group_size", 6)
+    batch_size = config.get("rollout", {}).get("batch_size", 2)
     save_freq = config["training"].get("save_freq", 5)
     eval_freq = config["training"].get("eval_freq", 5)
+    log_freq = config["training"].get("log_freq", 10)
+    grad_accum = trainer.grad_accum
 
-    active_dataset = scene_dataset
+    active_dataset = train_dataset
     current_stage = -1
+    global_step = trainer._global_step
 
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
+        trainer.current_epoch = epoch
+
         # Curriculum: re-filter the dataset at stage boundaries.
         if curriculum is not None:
             stage_idx = curriculum.stage_for_epoch(epoch)
             if stage_idx != current_stage:
                 current_stage = stage_idx
                 stage = curriculum.stages[stage_idx]
-                active_dataset = scene_dataset.filter(
+                active_dataset = train_dataset.filter(
                     scenes=stage.scenes, max_images=stage.max_images)
                 logger.info(f"=== Curriculum {curriculum.describe(stage_idx)} ===")
                 if active_dataset.scenes:
@@ -366,83 +779,83 @@ def main():
                     logger.warning(
                         "Curriculum stage matched 0 scenes — "
                         "falling back to the full dataset for this stage")
-                    active_dataset = scene_dataset
+                    active_dataset = train_dataset
 
         stage_tag = (f" [curriculum stage {current_stage + 1}/"
                      f"{len(curriculum.stages)}]" if curriculum is not None else "")
         logger.info(f"=== Epoch {epoch}{stage_tag} ===")
-        epoch_rewards = []
-        epoch_episodes = []
 
-        for scene in active_dataset.scenes:
-            # Sample group_size rollouts per scene
-            scene_episodes = []
-            all_failed = True
-            for g in range(group_size):
-                ep = run_scene_episode(
-                    agent=rollout_agent,
-                    scene_id=scene["scene_id"],
-                    image_paths=scene["image_paths"],
-                    tool_client=tool_client,
-                    gt_recon=scene.get("gt_recon"),
-                    overlap_matrix=scene.get("overlap_matrix"),
-                    image_indices=scene.get("image_indices"),
-                    max_tool_calls=config["rl"].get("max_tool_calls", 20),
-                    max_turns=config["rl"].get("max_turns", 30),
-                    image_root=data_cfg.get("image_root", ""),
-                )
-                scene_episodes.append(ep)
-                if ep.reward > 0:
-                    all_failed = False
+        scenes = list(active_dataset.scenes)
+        if not scenes:
+            logger.warning("No scenes in the active dataset — skipping epoch.")
+            continue
+        rng = np.random.default_rng(epoch)
+        rng.shuffle(scenes)
 
-            # S-GRPO CGI: inject oracle trajectory when all rollouts fail
-            if config["rl"].get("sgrpo_cgi", True) and all_failed and scene_episodes:
-                from agentic_sfm.rl.scene_episode import run_scene_oracle_episode
+        epoch_stats = []
+        micro_step = 0
 
-                failed_max = max(e.reward for e in scene_episodes)
-                oracle_ep = run_scene_oracle_episode(
-                    agent=rollout_agent,
-                    scene_id=scene["scene_id"],
-                    image_paths=scene["image_paths"],
-                    tool_client=tool_client,
-                    gt_recon=scene.get("gt_recon"),
-                    overlap_matrix=scene.get("overlap_matrix"),
-                    image_indices=scene.get("image_indices"),
-                    failed_group_max_reward=failed_max,
-                    image_root=data_cfg.get("image_root", ""),
-                )
-                if oracle_ep.reward > failed_max:
-                    if len(scene_episodes) == 1:
-                        scene_episodes.append(oracle_ep)
-                    else:
-                        worst_idx = min(range(len(scene_episodes)),
-                                        key=lambda i: scene_episodes[i].reward)
-                        scene_episodes[worst_idx] = oracle_ep
-                    logger.info(f"  S-GRPO CGI: injected oracle for {scene['scene_id']} (reward={oracle_ep.reward:.3f})")
-
-            epoch_episodes.extend(scene_episodes)
-            rewards = [e.reward for e in scene_episodes]
-            logger.info(
-                f"  {scene['scene_id']}: rewards={[f'{r:.3f}' for r in rewards]}, "
-                f"mean={np.mean(rewards):.3f}"
+        for batch_start in range(0, len(scenes), batch_size):
+            batch = scenes[batch_start:batch_start + batch_size]
+            micro_step += 1
+            is_last_accum = (
+                (micro_step % grad_accum == 0)
+                or (batch_start + batch_size >= len(scenes))
             )
-            epoch_rewards.extend(rewards)
 
-        # Compute advantages and update
-        if epoch_episodes:
-            metrics = trainer.train_step(epoch_episodes, rollout_agent)
-            logger.info(f"  Epoch {epoch} metrics: {metrics}")
-            logger.info(f"  Mean reward: {np.mean(epoch_rewards):.4f}")
+            stats = trainer.train_step(
+                batch, rollout_agent,
+                accum_step=micro_step, is_last_accum=is_last_accum,
+            )
+            epoch_stats.append(stats)
 
-        # Save checkpoint
-        if (epoch + 1) % save_freq == 0:
-            trainer.save_checkpoint(epoch)
-            logger.info(f"  Saved checkpoint at epoch {epoch}")
+            if is_last_accum:
+                global_step += 1
+                trainer._global_step = global_step
+                rollout_agent._global_step = global_step
+
+                if global_step % log_freq == 0:
+                    logger.info(
+                        f"  Step {global_step}: "
+                        f"reward={stats['mean_reward']:.3f} ± {stats['std_reward']:.3f}, "
+                        f"tool_calls={stats['mean_tool_calls']:.1f}, "
+                        f"registered={stats.get('scene/mean_registered', 0.0):.1f}, "
+                        f"loss={stats.get('loss', 0.0):.4f}"
+                    )
+                    if trainer._wandb:
+                        payload = {
+                            f"train/{k}": v for k, v in stats.items()
+                            if isinstance(v, (int, float))
+                        }
+                        payload["train/epoch"] = epoch + 1
+                        payload["train/global_step"] = global_step
+                        trainer._wandb.log(payload)
+
+        if epoch_stats:
+            mean_reward = np.mean([s.get("mean_reward", 0.0) for s in epoch_stats])
+            logger.info(f"Epoch {epoch} mean reward: {mean_reward:.3f}")
 
         # Eval
         if (epoch + 1) % eval_freq == 0:
             logger.info(f"  Running eval at epoch {epoch}...")
+            eval_stats = trainer.evaluate(rollout_agent)
+            logger.info(
+                f"  Eval: reward={eval_stats['mean_reward']:.3f}, "
+                f"success_rate={eval_stats.get('success_rate', 0.0):.3f}, "
+                f"registered={eval_stats.get('mean_registered', 0.0):.1f}, "
+                f"pose_err={eval_stats.get('scene/mean_pose_error_deg', 0.0):.2f}°"
+            )
 
+        # Always dump `latest` so vLLM rollouts track the LoRA policy;
+        # numbered checkpoints at save_freq.
+        trainer.save_lora_checkpoint("latest", rollout_agent)
+        if (epoch + 1) % save_freq == 0:
+            trainer.save_lora_checkpoint(epoch + 1, rollout_agent)
+            logger.info(f"  Saved checkpoint at epoch {epoch + 1}")
+
+    trainer.save_lora_checkpoint(total_epochs, rollout_agent)
+    if trainer._wandb:
+        trainer._wandb.finish()
     logger.info("Training complete!")
 
 

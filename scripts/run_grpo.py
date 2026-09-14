@@ -111,7 +111,9 @@ class VLLMRolloutAgent:
                  use_accumulative_tool_reward: bool = True,
                  ntep_intent_coef: float = 0.05,
                  ntep_redundancy_penalty: float = 0.05,
-                 use_ntep_rewards: bool = False):
+                 use_ntep_rewards: bool = False,
+                 sft_adapter: str | None = None,
+                 reward_config: dict[str, Any] | None = None):
         self.vllm_url = vllm_url.rstrip("/")
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -137,6 +139,12 @@ class VLLMRolloutAgent:
         self._global_step = 0
         self.vllm_model = model_name
         self._lora_loaded = False
+        # Optional LoRA adapter to serve rollouts from (hot-loaded into vLLM by
+        # the trainer via _reload_vllm_lora). Stored here for reference.
+        self.sft_adapter = sft_adapter
+        # Scene-level reward weights — read by run_scene_episode via
+        # getattr(agent, "reward_config", {}).
+        self.reward_config = dict(reward_config or {})
 
     def _encode_image(self, image_path: str) -> str:
         img = Image.open(image_path).convert("RGB")
@@ -502,6 +510,7 @@ class GRPOTrainer:
         tool_client: ToolClient,
         vllm_url: str = "http://localhost:8000",
         output_dir: str = "outputs/phase1",
+        load_pair_datasets: bool = True,
     ):
         self.config = config
         self.tool_client = tool_client
@@ -550,11 +559,16 @@ class GRPOTrainer:
 
         self.matcher = config.get("data", {}).get("matcher", DEFAULT_MATCHER)
 
-        train_path = config["data"].get("train_pairs", "data/hard_pairs_train.json")
-        val_path = config["data"].get("val_pairs", "data/hard_pairs_val.json")
-        self.train_dataset = HardPairDataset.load(train_path) if os.path.exists(train_path) else HardPairDataset()
-        self.val_dataset = HardPairDataset.load(val_path) if os.path.exists(val_path) else HardPairDataset()
-        logger.info(f"Train: {len(self.train_dataset)} pairs | Val: {len(self.val_dataset)} pairs")
+        if load_pair_datasets:
+            train_path = config["data"].get("train_pairs", "data/hard_pairs_train.json")
+            val_path = config["data"].get("val_pairs", "data/hard_pairs_val.json")
+            self.train_dataset = HardPairDataset.load(train_path) if os.path.exists(train_path) else HardPairDataset()
+            self.val_dataset = HardPairDataset.load(val_path) if os.path.exists(val_path) else HardPairDataset()
+            logger.info(f"Train: {len(self.train_dataset)} pairs | Val: {len(self.val_dataset)} pairs")
+        else:
+            # Scene-level trainers never touch the pair datasets — skip the load.
+            self.train_dataset = HardPairDataset()
+            self.val_dataset = HardPairDataset()
 
         self.model_name = config["model"].get("name", DEFAULT_POLICY_MODEL)
         self.lora_config = config["model"]["lora"]
@@ -617,6 +631,17 @@ class GRPOTrainer:
             self._model = PeftModel.from_pretrained(self._model, self.sft_adapter, is_trainable=True)
         else:
             self._model = get_peft_model(self._model, lora_cfg)
+
+        # Gradient checkpointing: recompute activations during backward instead of
+        # storing them. Essential for 8192-token multimodal sequences — the eval
+        # forward alone is ~9GB, and the grad pass would otherwise need ~40GB+.
+        if hasattr(self._model, "gradient_checkpointing_enable"):
+            self._model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        # use_cache must be off when checkpointing is on.
+        if hasattr(self._model, "config") and hasattr(self._model.config, "use_cache"):
+            self._model.config.use_cache = False
         self._model.print_trainable_parameters()
 
         trainable = [p for p in self._model.parameters() if p.requires_grad]
@@ -694,13 +719,21 @@ class GRPOTrainer:
             logger.info(f"  S-GRPO CGI: injected {cgi_injections} oracle trajectories ({cgi_injections}/{len(pairs)} pairs)")
         return episodes
 
+    def _group_key(self, ep) -> str:
+        """Grouping key for group-relative advantages.
+
+        Pair-level episodes group by ``pair_id``; SceneGRPOTrainer overrides
+        this to group scene-level episodes by ``scene_id``.
+        """
+        return ep.pair_id
+
     def compute_advantages(self, episodes: list[RolloutEpisode]) -> list[float]:
         groups: dict[str, list[RolloutEpisode]] = {}
         for ep in episodes:
-            groups.setdefault(ep.pair_id, []).append(ep)
+            groups.setdefault(self._group_key(ep), []).append(ep)
         advantages = []
         for ep in episodes:
-            group = groups[ep.pair_id]
+            group = groups[self._group_key(ep)]
             rewards = [e.reward for e in group]
             mean_r = np.mean(rewards)
             std_r = np.std(rewards) + 1e-8
@@ -715,10 +748,10 @@ class GRPOTrainer:
             return episodes
         groups: dict[str, list[RolloutEpisode]] = {}
         for ep in episodes:
-            groups.setdefault(ep.pair_id, []).append(ep)
+            groups.setdefault(self._group_key(ep), []).append(ep)
         filtered = []
         skipped = 0
-        for pair_id, group in groups.items():
+        for group_key, group in groups.items():
             rewards = [e.reward for e in group]
             if np.std(rewards) < 1e-8:
                 skipped += len(group)
@@ -800,11 +833,32 @@ class GRPOTrainer:
             except Exception:
                 continue
         if len(images) < 2:
-            images = [
-                Image.open(ep.image_a).convert("RGB"),
-                Image.open(ep.image_b).convert("RGB"),
-            ]
+            images = []
+            for p in self._episode_fallback_image_paths(ep):
+                try:
+                    images.append(Image.open(p).convert("RGB"))
+                except Exception:
+                    continue
         return images
+
+    def _episode_fallback_image_paths(self, ep) -> list[str]:
+        """On-disk image paths to load when an episode's stored images can't be decoded.
+
+        Pair episodes carry ``image_a``/``image_b``; scene episodes carry
+        ``image_paths`` (resolved against ``image_root`` when relative).
+        """
+        image_a = getattr(ep, "image_a", None)
+        image_b = getattr(ep, "image_b", None)
+        if image_a and image_b:
+            return [image_a, image_b]
+        root = getattr(ep, "image_root", "") or ""
+        out: list[str] = []
+        for p in list(getattr(ep, "image_paths", None) or [])[:8]:
+            pp = Path(p)
+            if not pp.is_absolute() and root:
+                pp = Path(root) / pp
+            out.append(str(pp))
+        return out
 
     def _policy_messages_and_images(
         self, ep: RolloutEpisode
@@ -867,8 +921,13 @@ class GRPOTrainer:
 
                 logits = outputs.logits[:, :-1, :]
                 target_ids = inputs["input_ids"][:, 1:]
-                token_logps = F.log_softmax(logits, dim=-1)
-                per_token_logps = token_logps.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)  # [1, seq_len-1]
+                # Memory-efficient logprob: log p(target) = logit_target - logsumexp(logits).
+                # Avoids materializing the full [seq_len, vocab] log_softmax tensor, which
+                # OOMs at seq_len~8192 x vocab~150k (two ~5GB fp32 copies on the train GPU).
+                lse = torch.logsumexp(logits, dim=-1)  # [1, seq_len-1]
+                target_logit = logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+                per_token_logps = target_logit - lse  # [1, seq_len-1]
+                del logits, outputs
 
                 # Align mask: mask[i] corresponds to input_ids[i], logps[i] predicts input_ids[i+1]
                 # So logps at position i predicts token i+1; we need mask shifted by 1
@@ -876,7 +935,7 @@ class GRPOTrainer:
 
                 results.append((per_token_logps.squeeze(0), assistant_mask))
             except Exception as e:
-                logger.warning(f"Logprob computation failed for {ep.pair_id}: {e}")
+                logger.warning(f"Logprob computation failed for {self._group_key(ep)}: {e}")
                 results.append((torch.tensor(0.0, device=self.training_device), torch.tensor([], device=self.training_device, dtype=torch.bool)))
 
         return results

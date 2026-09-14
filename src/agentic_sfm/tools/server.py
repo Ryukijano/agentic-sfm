@@ -439,7 +439,10 @@ def sfm_run(req: SfMRequest):
                 shutil.rmtree(old)
             else:
                 old.unlink()
-        recon.write(str(sparse_dir / "0"))
+        # pycolmap's Reconstruction.write requires the model dir to exist.
+        model_dir = sparse_dir / "0"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        recon.write(str(model_dir))
 
         mean_reproj_error = (
             float(recon.compute_mean_reprojection_error())
