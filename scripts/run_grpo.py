@@ -990,20 +990,27 @@ class GRPOTrainer:
         self._model.eval()
         old_results = self.compute_logprobs(episodes, requires_grad=False)
         self._model.train()
-        new_results = self.compute_logprobs(episodes, requires_grad=True)
 
-        total_loss = torch.tensor(0.0, device=self.training_device, dtype=torch.float32)
+        total_loss = 0.0  # Python float accumulator — avoids holding GPU tensors across episodes
         valid_count = 0
 
         for i, (ep, adv) in enumerate(zip(episodes, advantages)):
             if not ep.messages or not ep.assistant_responses:
                 continue
 
-            new_logps, new_mask = new_results[i]
             old_logps, old_mask = old_results[i]
-            if new_logps.ndim == 0 or new_mask.numel() == 0:
-                continue
             if old_logps.ndim == 0 or old_mask.numel() == 0:
+                continue
+
+            # Compute the grad-pass logprob for THIS episode only, so at most one
+            # computation graph is live. Calling compute_logprobs on the whole
+            # batch upfront would hold N forward graphs simultaneously and OOM.
+            try:
+                new_logps, new_mask = self.compute_logprobs([ep], requires_grad=True)[0]
+            except Exception as e:
+                logger.warning(f"Logprob (grad) failed for {self._group_key(ep)}: {e}")
+                continue
+            if new_logps.ndim == 0 or new_mask.numel() == 0:
                 continue
 
             try:
@@ -1023,12 +1030,14 @@ class GRPOTrainer:
                 loss = loss / self.grad_accum
                 loss.backward()
 
-                total_loss = total_loss + loss.detach()
+                total_loss += float(loss.detach().item())
+                del new_logps, new_mask, ratio, clipped_ratio, loss
                 valid_count += 1
             except Exception as e:
                 logger.warning(f"Policy gradient failed for episode {i}: {e}")
                 continue
 
+        stats["loss"] = (total_loss / valid_count) if valid_count > 0 else 0.0
         if valid_count > 0 and is_last_accum:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self._model.parameters() if p.requires_grad],
@@ -1036,11 +1045,6 @@ class GRPOTrainer:
             )
             self._optimizer.step()
             self._optimizer.zero_grad()
-            stats["loss"] = (total_loss / valid_count).item()
-        elif valid_count > 0:
-            stats["loss"] = (total_loss / valid_count).item()
-        else:
-            stats["loss"] = 0.0
 
         if is_last_accum:
             self._model.eval()

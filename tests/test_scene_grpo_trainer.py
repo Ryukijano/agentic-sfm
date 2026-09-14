@@ -283,18 +283,22 @@ class TestTrainStep:
     def _stub_logprobs(self, trainer, model):
         """compute_logprobs whose 'new' tensors depend on model params.
 
-        The model-weight coefficient varies per episode so the per-episode
+        The model-weight coefficient varies per grad-call so the per-episode
         clipped-surrogate losses (and their gradients) don't cancel to zero
-        — group-relative advantages always sum to zero within a group.
+        — group-relative advantages always sum to zero within a group. The
+        trainer calls compute_logprobs per episode (requires_grad=True), so
+        we track the episode with a mutable counter rather than enumerate(eps).
         """
         old = torch.tensor([-1.0, -0.8, -0.6, -0.4])
+        state = {"i": 0}
 
         def fake(eps, requires_grad=False):
             out = []
-            for i, _ in enumerate(eps):
+            for _ in eps:
                 mask = torch.ones(4, dtype=torch.bool)
                 if requires_grad:
-                    lp = old + model.weight.view(-1)[0] * (0.05 + 0.02 * i)
+                    lp = old + model.weight.view(-1)[0] * (0.05 + 0.02 * state["i"])
+                    state["i"] += 1
                 else:
                     lp = old.clone()
                 out.append((lp, mask))
