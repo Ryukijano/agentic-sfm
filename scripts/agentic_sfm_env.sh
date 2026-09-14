@@ -4,8 +4,11 @@
 #   source /scratch/kcwp264/.aire_scratch_env.sh
 #   source /scratch/kcwp264/agentic-sfm/scripts/agentic_sfm_env.sh
 #
-# vLLM 0.17+ wheels bundle CUDA 13 user-space libs (libcudart.so.13). AIRE module
-# cuda/12.6.2 is the driver/toolkit; pip nvidia-* packages supply runtime .so files.
+# vLLM 0.28+cu129 bundles CUDA 12.9 user-space libs (libcudart.so.12 from
+# nvidia-cuda-runtime-cu12==12.9.x). AIRE driver 560.35.03 reports max CUDA 12.6,
+# but CUDA 12.x minor-version compatibility runs 12.9 user-space on a 12.6
+# driver when the app uses the bundled pip runtime (which this script puts on
+# LD_LIBRARY_PATH). Do NOT install vllm cu130 — CUDA 13 needs driver >= 580.
 
 : "${AGENTIC_SFM_ROOT:=/scratch/kcwp264/agentic-sfm}"
 : "${CONDA_ENV:=/scratch/kcwp264/.conda_envs/agentic-sfm}"
