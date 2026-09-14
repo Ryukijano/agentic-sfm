@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools_server"))
 
 from agentic_sfm.eval.viz import (  # noqa: E402
     FIG_BG, C_TEXT, C_ACCENT, draw_match_pair, render_point_cloud,
-    plot_training_curves,
+    render_gt_pointcloud, plot_training_curves,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,25 @@ def _run_loftr(img_a: Path, img_b: Path, matcher: str = "loftr") -> dict:
     TS._IMAGE_STORE["a"] = str(img_a)
     TS._IMAGE_STORE["b"] = str(img_b)
     return TS.tool_match("a", "b", matcher)
+
+
+def _scannet_scene_dir(root: Path, scene_id: str) -> Path:
+    """Resolve a ScanNet scene dir from 'scene0772_00' / '0772_00' / '772'."""
+    root = Path(root)
+    if not list(root.glob("scene*_*")) and (root / "scannet_test_1500").is_dir():
+        root = root / "scannet_test_1500"
+    sid = scene_id if scene_id.startswith("scene") else f"scene{scene_id}"
+    cand = root / sid
+    if cand.is_dir():
+        return cand
+    stem = sid[len("scene"):]
+    matches = [d for d in root.glob("scene*_*")
+               if d.is_dir() and (d.name == f"scene{stem}"
+                                  or d.name.split("_")[0] == f"scene{stem}"
+                                  or d.name.split("_")[0] == f"scene{stem.zfill(4)}")]
+    if len(matches) == 1:
+        return matches[0]
+    raise FileNotFoundError(f"ScanNet scene '{scene_id}' not found under {root}")
 
 
 def _parse_rewards(log_path: Path) -> list[float]:
@@ -79,6 +98,12 @@ def main():
     ap.add_argument("--matcher", default="loftr")
     ap.add_argument("--recon", default="outputs/phase0_real/scene_0022_colmap/sparse/0")
     ap.add_argument("--rewards-log", default=None)
+    ap.add_argument("--scannet-scene", default=None,
+                    help="ScanNet scene id (e.g. scene0772_00 or 0772_00) — "
+                         "adds a dense GT point-cloud panel")
+    ap.add_argument("--scannet-root",
+                    default="/scratch/kcwp264/data/megadepth/scannet_test_1500/scannet_test_1500")
+    ap.add_argument("--scannet-max-points", type=int, default=200000)
     ap.add_argument("--output", default="results/figures/qualitative.png")
     args = ap.parse_args()
 
@@ -92,12 +117,18 @@ def main():
     pair_idx = [(idx[i], idx[i + 1]) for i in range(0, len(idx) - 1, 2)]
     pair_idx = [(a % len(imgs), b % len(imgs)) for a, b in pair_idx][:2]
 
-    n_panels = len(pair_idx) + (1 if args.recon else 0) + (1 if args.rewards_log else 0)
-    fig = plt.figure(figsize=(7.2 * max(2, n_panels - 1), 6.4), dpi=150)
+    # Right column panels: sparse recon, ScanNet dense GT cloud, reward curve.
+    rewards = _parse_rewards(Path(args.rewards_log)) if args.rewards_log else []
+    n_right = sum([bool(args.recon), bool(args.scannet_scene), bool(rewards)])
+    n_rows = max(2, n_right)
+    n_panels = len(pair_idx) + n_right
+    fig = plt.figure(figsize=(7.2 * max(2, n_panels - 1), 6.4 * n_rows / 2), dpi=150)
     fig.patch.set_facecolor(FIG_BG)
 
-    # grid: left column = match panels (stacked), right = recon + curve
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], hspace=0.18, wspace=0.08)
+    # grid: left column = match panels (stacked), right = recon/GT/curve
+    gs = fig.add_gridspec(n_rows, 2, width_ratios=[1.15, 1.0],
+                          hspace=0.18, wspace=0.08)
+    right_row = 0  # next free slot in the right column
 
     # --- match panels (left column) ---
     for row, (a, b) in enumerate(pair_idx[:2]):
@@ -130,21 +161,42 @@ def main():
             buf = __import__("io").BytesIO()
             rf.savefig(buf, format="png", facecolor=FIG_BG, bbox_inches="tight")
             buf.seek(0)
-            ax = fig.add_subplot(gs[0, 1])
+            ax = fig.add_subplot(gs[right_row, 1]); right_row += 1
             ax.imshow(np.asarray(Image.open(buf)))
             ax.axis("off")
             plt.close(rf)
         except Exception as e:
             logger.warning(f"recon panel failed: {e}")
 
-    # --- reward curve (bottom right) ---
-    rewards = _parse_rewards(Path(args.rewards_log)) if args.rewards_log else []
+    # --- ScanNet dense GT point cloud ---
+    if args.scannet_scene:
+        try:
+            sn_dir = _scannet_scene_dir(Path(args.scannet_root), args.scannet_scene)
+            gtf = render_gt_pointcloud(
+                depth_dir=sn_dir / "depth",
+                color_dir=sn_dir / "color",
+                pose_dir=sn_dir / "pose",
+                intrinsic_path=sn_dir / "intrinsic" / "intrinsic_depth.txt",
+                scene_id=sn_dir.name,
+                max_points=args.scannet_max_points,
+            )
+            buf = __import__("io").BytesIO()
+            gtf.savefig(buf, format="png", facecolor=FIG_BG, bbox_inches="tight")
+            buf.seek(0)
+            ax = fig.add_subplot(gs[right_row, 1]); right_row += 1
+            ax.imshow(np.asarray(Image.open(buf)))
+            ax.axis("off")
+            plt.close(gtf)
+        except Exception as e:
+            logger.warning(f"scannet GT cloud panel failed: {e}")
+
+    # --- reward curve ---
     if rewards:
         cf = plot_training_curves(rewards, title="S-GRPO reward")
         buf = __import__("io").BytesIO()
         cf.savefig(buf, format="png", facecolor=FIG_BG, bbox_inches="tight")
         buf.seek(0)
-        ax = fig.add_subplot(gs[1, 1])
+        ax = fig.add_subplot(gs[right_row, 1]); right_row += 1
         ax.imshow(np.asarray(Image.open(buf)))
         ax.axis("off")
         plt.close(cf)

@@ -88,10 +88,16 @@ class ToolClient:
         image_dir: str,
         pair_list: list[tuple[str, str]] | None = None,
         output_dir: str = "./outputs/sfm_run",
+        use_agent_matches: bool = True,
     ) -> dict[str, Any]:
         r = self.client.post(
             "/sfm_run",
-            json={"image_dir": image_dir, "pair_list": pair_list, "output_dir": output_dir},
+            json={
+                "image_dir": image_dir,
+                "pair_list": pair_list,
+                "output_dir": output_dir,
+                "use_agent_matches": use_agent_matches,
+            },
         )
         r.raise_for_status()
         return r.json()

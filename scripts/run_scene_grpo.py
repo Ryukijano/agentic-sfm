@@ -96,6 +96,12 @@ def _subsample_scene(scene: dict[str, Any], max_images: int) -> dict[str, Any]:
     new["num_images"] = len(pos)
     if scene.get("image_indices") is not None:
         new["image_indices"] = [scene["image_indices"][i] for i in pos]
+    # Keep per-image auxiliary lists (ScanNet depth/pose paths, frame ids)
+    # aligned with the subsampled image_paths.
+    for key in ("depth_paths", "pose_paths", "frame_ids"):
+        val = scene.get(key)
+        if isinstance(val, (list, tuple)) and len(val) == n:
+            new[key] = [val[i] for i in pos]
     gt = scene.get("gt_recon")
     if isinstance(gt, dict) and isinstance(gt.get("poses"), dict):
         new["gt_recon"] = {
@@ -108,6 +114,168 @@ def _subsample_scene(scene: dict[str, Any], max_images: int) -> dict[str, Any]:
             },
         }
     return new
+
+
+def _read_mat(path: Path) -> np.ndarray:
+    """Read a whitespace-separated float matrix from a .txt file."""
+    return np.loadtxt(str(path), dtype=np.float64)
+
+
+def _normalize_scannet_ids(scene_ids: list[str] | None) -> set[str] | None:
+    """Normalize ScanNet scene ids for matching.
+
+    Accepts 'scene0772_00', '0772_00', '772_00' or '772' — all resolve to the
+    canonical ``sceneNNNN_MM`` name components.
+    """
+    if scene_ids is None:
+        return None
+    out: set[str] = set()
+    for sid in scene_ids:
+        s = str(sid)
+        out.add(s)
+        if s.startswith("scene"):
+            s = s[len("scene"):]
+        out.add(s)
+        head = s.split("_")[0]
+        out.add(head)
+        out.add(head.lstrip("0") or "0")
+    return out
+
+
+def _scannet_id_matches(scene_id: str, wanted: set[str]) -> bool:
+    """True if ``sceneNNNN_MM`` matches any normalized wanted form."""
+    stem = scene_id[len("scene"):] if scene_id.startswith("scene") else scene_id
+    head = stem.split("_")[0]
+    return (
+        scene_id in wanted
+        or stem in wanted
+        or head in wanted
+        or (head.lstrip("0") or "0") in wanted
+    )
+
+
+def _scannet_overlap_proxy(c2w_poses: np.ndarray) -> np.ndarray:
+    """Pose-similarity proxy overlap matrix for ScanNet frames.
+
+    ``c2w_poses`` is (N, 4, 4) camera-to-world.  ScanNet ships no
+    covisibility counts, so overlap is approximated as the mean of:
+
+      - view-direction agreement ``|dot(f_i, f_j)|`` where ``f`` is the
+        camera +Z axis in world coords (3rd column of the c2w rotation), and
+      - translation proximity ``exp(-||c_i - c_j|| / tau)`` with ``tau`` the
+        median pairwise camera distance (scale-free).
+
+    Returns an (N, N) matrix in [0, 1] with a unit diagonal.
+    """
+    n = len(c2w_poses)
+    om = np.eye(n, dtype=np.float64)
+    if n < 2:
+        return om
+    fwds = c2w_poses[:, :3, 2]   # camera +Z in world = forward view dir
+    centers = c2w_poses[:, :3, 3]
+    f_norm = fwds / (np.linalg.norm(fwds, axis=1, keepdims=True) + 1e-12)
+    ang = np.abs(f_norm @ f_norm.T)                       # (N, N) in [0, 1]
+    d = np.linalg.norm(centers[None, :, :] - centers[:, None, :], axis=-1)
+    iu = np.triu_indices(n, 1)
+    tau = float(np.median(d[iu])) if iu[0].size else 1.0
+    tau = max(tau, 1e-6)
+    prox = np.exp(-d / tau)
+    np.fill_diagonal(prox, 1.0)
+    om = 0.5 * np.clip(ang, 0.0, 1.0) + 0.5 * prox
+    np.fill_diagonal(om, 1.0)
+    return om
+
+
+def _load_scannet_scene(scene_dir: Path,
+                        max_images_per_scene: int = 20,
+                        min_images_per_scene: int = 5) -> dict[str, Any] | None:
+    """Build one scene dict from an extracted ``sceneNNNN_MM`` directory.
+
+    Returns None when fewer than ``min_images_per_scene`` frames have all of
+    color/depth/pose on disk.  See ``SceneDataset.from_scannet`` for the dict
+    contract and pose-convention notes.
+    """
+    color_dir = scene_dir / "color"
+    depth_dir = scene_dir / "depth"
+    pose_dir = scene_dir / "pose"
+    intrinsic_dir = scene_dir / "intrinsic"
+    if not color_dir.is_dir() or not pose_dir.is_dir():
+        return None
+
+    # Full valid frame list: color jpg + pose txt (+ depth png when present).
+    frames: list[tuple[int, Path, Path | None, Path]] = []
+    jpgs = [p for p in color_dir.glob("*.jpg") if p.stem.isdigit()]
+    for img in sorted(jpgs, key=lambda p: int(p.stem)):
+        fid = int(img.stem)
+        pose_f = pose_dir / f"{fid}.txt"
+        if not pose_f.exists():
+            continue
+        depth_f = depth_dir / f"{fid}.png"
+        frames.append((fid, img, depth_f if depth_f.exists() else None, pose_f))
+
+    if len(frames) < min_images_per_scene:
+        return None
+
+    # Intrinsics (both are 4x4 in the ScanNet export; keep the top-left 3x3
+    # for the per-image "intrinsics" slot used elsewhere).
+    k_color = None
+    k_depth = None
+    try:
+        k_color = _read_mat(intrinsic_dir / "intrinsic_color.txt")
+    except Exception:
+        pass
+    try:
+        k_depth = _read_mat(intrinsic_dir / "intrinsic_depth.txt")
+    except Exception:
+        pass
+
+    # Full-list c2w poses -> overlap proxy + cam-from-world GT.
+    all_c2w = np.stack([_read_mat(f[3]) for f in frames])       # (N,4,4)
+    overlap = _scannet_overlap_proxy(all_c2w)
+
+    # Deterministic even-spaced subsample (video frames are temporally
+    # ordered, so even spacing gives scene coverage).
+    n = len(frames)
+    k = min(n, max(1, int(max_images_per_scene)))
+    indices = sorted(set(np.linspace(0, n - 1, k).round().astype(int).tolist()))
+
+    image_paths = [str(frames[i][1].resolve()) for i in indices]
+    depth_paths = [
+        str(frames[i][2].resolve()) if frames[i][2] is not None else None
+        for i in indices
+    ]
+    pose_paths = [str(frames[i][3].resolve()) for i in indices]
+    frame_ids = [frames[i][0] for i in indices]
+
+    # GT poses keyed by str(position in image_paths), matching
+    # scene_eval._extract_gt_poses.  ScanNet pose files are camera-to-world;
+    # invert to the cam-from-world convention used by MegaDepth scene_info.
+    gt_poses = {
+        str(j): np.linalg.inv(all_c2w[i]).tolist()
+        for j, i in enumerate(indices)
+    }
+
+    return {
+        "scene_id": scene_dir.name,
+        "dataset": "scannet",
+        "image_paths": image_paths,
+        "num_images": len(image_paths),
+        "overlap_matrix": overlap,
+        "image_indices": indices,
+        "depth_paths": depth_paths,
+        "pose_paths": pose_paths,
+        "frame_ids": frame_ids,
+        "intrinsics": (
+            k_color[:3, :3].tolist() if k_color is not None else None
+        ),
+        "intrinsic_color": k_color.tolist() if k_color is not None else None,
+        "intrinsic_depth": k_depth.tolist() if k_depth is not None else None,
+        "scene_dir": str(scene_dir.resolve()),
+        "gt_recon": {
+            "num_images": len(image_paths),
+            "poses": gt_poses,
+        },
+    }
 
 
 @dataclass
@@ -196,6 +364,73 @@ class SceneDataset:
             except Exception as e:
                 logger.warning(f"Failed to load scene {scene_id}: {e}")
                 continue
+
+        return cls(scenes=scenes_out)
+
+    @classmethod
+    def from_scannet(cls, scannet_root: str,
+                     scene_ids: list[str] | None = None,
+                     max_images_per_scene: int = 20,
+                     min_images_per_scene: int = 5) -> "SceneDataset":
+        """Build scene dataset from extracted ScanNet test scenes.
+
+        Expects ``scannet_root`` to contain ``sceneNNNN_MM/`` directories in
+        the ``scannet_test_1500`` layout::
+
+            sceneNNNN_MM/
+                color/*.jpg            RGB frames (e.g. 105.jpg)
+                depth/*.png            uint16 depth, millimetres, 480x640
+                pose/*.txt             4x4 camera-to-world per frame
+                intrinsic/intrinsic_color.txt   (+ intrinsic_depth.txt,
+                                        extrinsic_color/depth.txt)
+
+        The produced scene dicts match the MegaDepth contract (``image_paths``
+        absolute, ``gt_recon.poses`` keyed by str(position-in-image_paths))
+        plus ScanNet extras: ``depth_paths``, ``pose_paths``, ``frame_ids``,
+        ``intrinsics`` (3x3 colour K), ``intrinsic_color``/``intrinsic_depth``
+        (full 4x4), ``scene_dir`` and ``dataset="scannet"``.
+
+        Pose-convention note: ScanNet ``pose/*.txt`` are **camera-to-world**;
+        the scene_eval/reward path expects **cam-from-world**, so the stored
+        ``gt_recon.poses`` are the *inverses* of the file matrices.
+
+        ``overlap_matrix`` is a pose-similarity proxy (no true covisibility
+        is shipped): for each frame pair it averages
+        ``|dot(forward_i, forward_j)|`` (forward = camera +Z in world) with a
+        translation-proximity term ``exp(-dist / median_pairwise_dist)``.
+        It is built over the full valid frame list; ``image_indices`` indexes
+        into it, matching the MegaDepth convention.
+        """
+        import numpy as np
+        from pathlib import Path
+
+        root = Path(scannet_root).expanduser()
+        # Tolerate being pointed one level above the nested
+        # ``scannet_test_1500/`` directory the tar creates.
+        if not list(root.glob("scene*_*")) and (root / "scannet_test_1500").is_dir():
+            root = root / "scannet_test_1500"
+
+        wanted = _normalize_scannet_ids(scene_ids)
+        scenes_out: list[dict[str, Any]] = []
+
+        for scene_dir in sorted(root.glob("scene*_*")):
+            if not scene_dir.is_dir():
+                continue
+            scene_id = scene_dir.name
+            if wanted and not _scannet_id_matches(scene_id, wanted):
+                continue
+
+            try:
+                scene = _load_scannet_scene(
+                    scene_dir,
+                    max_images_per_scene=max_images_per_scene,
+                    min_images_per_scene=min_images_per_scene,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load ScanNet scene {scene_id}: {e}")
+                continue
+            if scene is not None:
+                scenes_out.append(scene)
 
         return cls(scenes=scenes_out)
 
@@ -720,7 +955,10 @@ def main():
         for i in range(len(curriculum.stages)):
             logger.info(f"  {curriculum.describe(i)}")
 
-    # Build scene dataset
+    # Build scene dataset.  MegaDepth (outdoor landmarks) is always loaded
+    # from scene_info npz files; when ``data.scannet_root`` is set, the
+    # extracted ScanNet test scenes (indoor RGB-D) are concatenated so both
+    # domains train together.
     scene_dataset = SceneDataset.from_megadepth(
         scene_info_dir=data_cfg.get("scene_info_dir", "data/megadepth/scene_info_full/scene_info"),
         image_root=data_cfg.get("image_root", "data/megadepth/megadepth_test_1500"),
@@ -728,6 +966,28 @@ def main():
         max_images_per_scene=load_max_images,
         min_images_per_scene=data_cfg.get("min_images_per_scene", 5),
     )
+    scannet_root = data_cfg.get("scannet_root")
+    if scannet_root:
+        # ``data.scannet_scene_ids`` scopes which sceneNNNN_MM dirs load.
+        # When unset it falls back to ``scene_ids`` so single-scene smoke
+        # configs stay small across both sources; a literal "all"/"*" value
+        # also loads every extracted scene.
+        scannet_ids = data_cfg.get("scannet_scene_ids")
+        if scannet_ids is None:
+            scannet_ids = load_scene_ids
+        if isinstance(scannet_ids, str) and scannet_ids.lower() in ("all", "*"):
+            scannet_ids = None
+        scannet_dataset = SceneDataset.from_scannet(
+            scannet_root=scannet_root,
+            scene_ids=scannet_ids,
+            max_images_per_scene=data_cfg.get(
+                "scannet_max_images_per_scene", load_max_images),
+            min_images_per_scene=data_cfg.get("min_images_per_scene", 5),
+        )
+        logger.info(f"ScanNet dataset: {len(scannet_dataset.scenes)} scenes")
+        scene_dataset = SceneDataset(
+            scenes=scene_dataset.scenes + scannet_dataset.scenes
+        )
     logger.info(f"Scene dataset: {len(scene_dataset.scenes)} scenes")
     for s in scene_dataset.scenes:
         logger.info(f"  {s['scene_id']}: {s['num_images']} images")

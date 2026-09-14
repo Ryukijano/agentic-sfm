@@ -252,6 +252,229 @@ def render_point_cloud(
 
 
 # ---------------------------------------------------------------------------
+# Dense GT point cloud (ScanNet-style depth + pose -> world-space cloud)
+# ---------------------------------------------------------------------------
+def _load_intrinsic(path: Path) -> np.ndarray:
+    """Read a 3x3 or 4x4 whitespace-separated intrinsics matrix -> 3x3 K."""
+    K = np.loadtxt(str(path), dtype=np.float64)
+    if K.shape == (4, 4):
+        K = K[:3, :3]
+    return K
+
+
+def gt_pointcloud_arrays(
+    depth_dir: str | Path,
+    color_dir: str | Path,
+    pose_dir: str | Path,
+    intrinsic_path: str | Path,
+    max_points: int = 200000,
+    max_depth: float = 10.0,
+    depth_scale: float = 1000.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Back-project RGB-D frames into a world-frame coloured point cloud.
+
+    For every colour frame with a matching depth map + pose file:
+
+      1. unproject valid depth pixels (``depth / depth_scale`` metres, masked
+         to ``(0, max_depth]``) through the depth intrinsics into camera space
+      2. transform camera-space points into world space with the frame's
+         4x4 **camera-to-world** pose (the ScanNet ``pose/*.txt``
+         convention)
+      3. colour each point by projecting it into the colour image using
+         ``intrinsic_color.txt`` + ``extrinsic_color.txt`` discovered next to
+         ``intrinsic_path``; when those are absent the colour image is
+         resized to depth resolution and indexed directly.
+
+    Returns ``(points (N,3) float64, colours (N,3) float64 in [0,1],
+    camera_centres (M,3))``.  ``points`` is randomly subsampled to
+    ``max_points``; frames are sub-strided so the budget is spread evenly.
+    """
+    depth_dir = Path(depth_dir)
+    color_dir = Path(color_dir)
+    pose_dir = Path(pose_dir)
+    intrinsic_path = Path(intrinsic_path)
+
+    K_depth = _load_intrinsic(intrinsic_path)
+
+    # Optional colour calibration discovered alongside the depth intrinsics
+    # (``intrinsic/`` dir in the ScanNet layout).
+    K_color = None
+    T_color_from_depth = None
+    for cand in (intrinsic_path.parent / "intrinsic_color.txt",):
+        if cand.exists():
+            try:
+                K_color = _load_intrinsic(cand)
+            except Exception:
+                K_color = None
+    e_path = intrinsic_path.parent / "extrinsic_color.txt"
+    if e_path.exists():
+        try:
+            # ScanNet convention: extrinsic_color maps *depth* camera
+            # coordinates to *color* camera coordinates, so a depth-camera
+            # point projects into the colour image as
+            # ``K_color @ (E @ p_depth)``.
+            T_color_from_depth = np.loadtxt(str(e_path), dtype=np.float64)
+            if T_color_from_depth.shape != (4, 4):
+                T_color_from_depth = None
+        except Exception:
+            T_color_from_depth = None
+
+    frames = []
+    for img in sorted(color_dir.glob("*.jpg"),
+                      key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+        stem = img.stem
+        d_path, p_path = depth_dir / f"{stem}.png", pose_dir / f"{stem}.txt"
+        if d_path.exists() and p_path.exists():
+            frames.append((img, d_path, p_path))
+    if not frames:
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
+
+    # Per-frame pixel stride so the total lands near max_points.
+    try:
+        n_px = int(np.asarray(
+            Image.open(frames[0][1])).size) or 480 * 640
+    except Exception:
+        n_px = 480 * 640
+    stride = max(1, int(np.sqrt(n_px * len(frames) / max(max_points, 1))))
+
+    all_pts, all_cols, cam_centers = [], [], []
+    for img_path, d_path, p_path in frames:
+        try:
+            depth = np.asarray(Image.open(d_path), dtype=np.float64) / depth_scale
+            c2w = np.loadtxt(str(p_path), dtype=np.float64).reshape(4, 4)
+        except Exception as e:
+            logger.warning(f"gt cloud: skipping {d_path.name}: {e}")
+            continue
+        if not np.isfinite(c2w).all():
+            continue
+        cam_centers.append(c2w[:3, 3])
+
+        H, W = depth.shape
+        color_img = np.asarray(_to_pil(img_path), dtype=np.float64) / 255.0
+
+        ys, xs = np.mgrid[0:H:stride, 0:W:stride]
+        z = depth[ys, xs]
+        mask = (z > 0) & (z <= max_depth) & np.isfinite(z)
+        if not mask.any():
+            continue
+        xs, ys, z = xs[mask].astype(np.float64), ys[mask].astype(np.float64), z[mask]
+
+        fx, fy, cx, cy = K_depth[0, 0], K_depth[1, 1], K_depth[0, 2], K_depth[1, 2]
+        x_cam = (xs - cx) * z / fx
+        y_cam = (ys - cy) * z / fy
+        pts_cam = np.stack([x_cam, y_cam, z], axis=0)          # (3, M)
+        pts_w = (c2w[:3, :3] @ pts_cam).T + c2w[:3, 3]         # (M, 3)
+
+        # --- colours ---
+        if K_color is not None and T_color_from_depth is not None:
+            pts_col = (T_color_from_depth[:3, :3] @ pts_cam).T + \
+                T_color_from_depth[:3, 3]
+            zc = np.clip(pts_col[:, 2], 1e-6, None)
+            u = K_color[0, 0] * pts_col[:, 0] / zc + K_color[0, 2]
+            v = K_color[1, 1] * pts_col[:, 1] / zc + K_color[1, 2]
+        else:
+            # No colour calibration: rescale colour to depth resolution.
+            ch, cw = color_img.shape[:2]
+            u = xs * (cw / W)
+            v = ys * (ch / H)
+        ui = np.clip(np.round(u).astype(int), 0, color_img.shape[1] - 1)
+        vi = np.clip(np.round(v).astype(int), 0, color_img.shape[0] - 1)
+        all_pts.append(pts_w)
+        all_cols.append(color_img[vi, ui])
+
+    if not all_pts:
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.asarray(cam_centers)
+    pts = np.concatenate(all_pts, axis=0)
+    cols = np.concatenate(all_cols, axis=0)
+    cams = np.asarray(cam_centers) if cam_centers else np.zeros((0, 3))
+
+    if len(pts) > max_points:
+        sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
+        pts, cols = pts[sel], cols[sel]
+    return pts, cols, cams
+
+
+def render_gt_pointcloud(
+    depth_dir: str | Path,
+    color_dir: str | Path,
+    pose_dir: str | Path,
+    intrinsic_path: str | Path,
+    scene_id: str = "scene",
+    max_points: int = 200000,
+    title: str | None = None,
+    elev: float = 20.0,
+    azim: float = -60.0,
+) -> plt.Figure:
+    """Render a dense GT point cloud from depth maps + camera-to-world poses.
+
+    Same dark 3D style as ``render_point_cloud`` (``FIG_BG`` background,
+    ``C_TEXT`` labels, orange camera markers).  This is the "ground truth
+    reconstruction" figure — far denser than a COLMAP sparse model.
+
+    ``intrinsic_path`` should point at ``intrinsic_depth.txt``;
+    ``intrinsic_color.txt``/``extrinsic_color.txt`` are auto-discovered in
+    the same directory for colour projection.
+    """
+    pts, cols, cam_centers = gt_pointcloud_arrays(
+        depth_dir, color_dir, pose_dir, intrinsic_path,
+        max_points=max_points,
+    )
+
+    fig = plt.figure(figsize=(9, 8), dpi=140)
+    fig.patch.set_facecolor(FIG_BG)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor(FIG_BG)
+
+    if len(pts):
+        ax.scatter(pts[:, 0], pts[:, 2], -pts[:, 1],
+                   c=np.clip(cols, 0, 1), s=1.2, alpha=0.9,
+                   linewidths=0, depthshade=True)
+
+    if len(cam_centers):
+        ax.scatter(cam_centers[:, 0], cam_centers[:, 2], -cam_centers[:, 1],
+                   c=C_CAMERA, s=45, marker="^", edgecolors="k",
+                   linewidths=0.4, label="cameras", depthshade=False)
+
+    n_frames = len(cam_centers)
+    ax.set_title(
+        f"{title or f'{scene_id} — dense GT reconstruction'}\n"
+        f"{n_frames} frames · {len(pts):,} points",
+        color=C_TEXT, fontsize=13, fontweight="bold",
+    )
+    if len(pts):
+        mid = np.median(pts, axis=0)
+        rng = np.ptp(pts, axis=0).max()
+        ax.set_xlim(mid[0] - rng * 0.6, mid[0] + rng * 0.6)
+        ax.set_ylim(mid[2] - rng * 0.6, mid[2] + rng * 0.6)
+        ax.set_zlim(-mid[1] - rng * 0.6, -mid[1] + rng * 0.6)
+    ax.view_init(elev=elev, azim=azim)
+
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.set_facecolor(FIG_BG)
+        axis.pane.set_edgecolor("#30363d")
+        axis.label.set_color(C_TEXT)
+        axis._axinfo["grid"]["color"] = (0.3, 0.3, 0.35, 0.3)
+    ax.tick_params(colors=C_TEXT, labelsize=7)
+    ax.set_xlabel("X", color=C_TEXT)
+    ax.set_ylabel("Z", color=C_TEXT)
+    ax.set_zlabel("-Y", color=C_TEXT)
+    try:
+        if len(pts):
+            ax.set_box_aspect((np.ptp(pts[:, 0]) + 1e-6,
+                               np.ptp(pts[:, 2]) + 1e-6,
+                               np.ptp(pts[:, 1]) + 1e-6))
+    except Exception:
+        pass
+    if len(cam_centers):
+        ax.legend(facecolor="#161b22", edgecolor="#30363d",
+                  labelcolor=C_TEXT, fontsize=10, prop={"weight": "bold"})
+    fig.tight_layout()
+    # Handy for callers/tests that need the actual cloud size.
+    fig._gt_point_count = int(len(pts))  # type: ignore[attr-defined]
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Reward breakdown + training curves
 # ---------------------------------------------------------------------------
 def plot_reward_breakdown(components: dict[str, float], title: str = "Reward breakdown") -> plt.Figure:

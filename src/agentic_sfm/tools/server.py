@@ -31,6 +31,26 @@ _image_registry: dict[str, str] = {}
 # Crop metadata: image_id -> {"origin_xy": [x1, y1]} in parent-image pixels
 _crop_meta: dict[str, dict[str, Any]] = {}
 
+# Cache of the agent's own matcher correspondences per resolved image pair,
+# keyed by a canonical (sorted) tuple of absolute image paths. sfm_run can
+# import these into COLMAP instead of re-running SIFT matching, so the
+# reconstruction is driven by the agent's matcher choices directly.
+_match_store: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _record_agent_match(path_a: str, path_b: str, result: dict[str, Any]) -> None:
+    """Cache a match result's keypoints for later COLMAP import."""
+    if not (result.get("keypoints_a") and result.get("keypoints_b")):
+        return
+    _match_store[tuple(sorted((os.path.abspath(path_a), os.path.abspath(path_b))))] = {
+        "path_a": os.path.abspath(path_a),
+        "path_b": os.path.abspath(path_b),
+        "keypoints_a": result["keypoints_a"],
+        "keypoints_b": result["keypoints_b"],
+        "inlier_mask": result.get("inlier_mask") or [],
+        "matcher": result.get("matcher", "agent"),
+    }
+
 # Lazy-loaded matcher
 _matcher = None
 _matcher_device = "cuda:0" if os.environ.get("CUDA_VISIBLE_DEVICES", "0") == "0" else "cuda:0"
@@ -100,6 +120,10 @@ class SfMRequest(BaseModel):
     image_dir: str
     pair_list: list[list[str]] | None = None
     output_dir: str = "./outputs/sfm_run"
+    # When true, import the agent's own matcher correspondences (cached by
+    # earlier /match calls) into COLMAP instead of SIFT matching, so the
+    # reconstruction is driven by the agent's match quality.
+    use_agent_matches: bool = False
 
 
 class InspectRequest(BaseModel):
@@ -229,7 +253,7 @@ def match(req: MatchRequest):
         pose_result = estimate_relative_pose(
             pts0_hc, pts1_hc, (w_a, h_a), (w_b, h_b), K_a=Ka, K_b=Kb
         )
-        return {
+        result = {
             "num_matches": int(len(pts0)),
             "num_inliers": pose_result["num_inliers"],
             "inlier_ratio": pose_result["inlier_ratio"],
@@ -245,7 +269,18 @@ def match(req: MatchRequest):
             "keypoints_a": pts0_hc.tolist()[:100],
             "keypoints_b": pts1_hc.tolist()[:100],
             "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
+            "matcher": req.matcher,
         }
+        # Cache the FULL high-confidence correspondence set for the
+        # agent-matches → COLMAP importer (the API response keeps [:100] for
+        # visualisation; the recon needs denser keypoints to triangulate).
+        _record_agent_match(path_a, path_b, {
+            "keypoints_a": pts0_hc.tolist(),
+            "keypoints_b": pts1_hc.tolist(),
+            "inlier_mask": pose_result.get("inlier_mask") or [],
+            "matcher": req.matcher,
+        })
+        return result
     except Exception as e:
         logger.error(f"Match failed: {e}")
         return {"error": str(e), "num_inliers": 0, "inlier_ratio": 0.0}
@@ -355,6 +390,118 @@ def _match_pair_list(
     return len(lines)
 
 
+def _import_agent_matches(
+    database_path: str,
+    image_dir: str,
+    pair_list: list[list[str]] | None = None,
+) -> int:
+    """Import the agent's own matcher correspondences into COLMAP's database.
+
+    Instead of running SIFT ``match_exhaustive``/``match_image_pairs``, this
+    writes the keypoints the agent's matcher produced (cached in
+    ``_match_store`` by earlier ``/match`` calls) as the images' 2D keypoints,
+    then writes the verified inlier correspondences as two-view geometries.
+    ``incremental_mapping`` then triangulates the *agent's* matches directly —
+    so reconstruction quality reflects the agent's matcher choices.
+
+    Returns the number of verified pairs imported (0 → caller falls back to
+    SIFT matching).
+    """
+    import pycolmap
+    from PIL import Image
+
+    # Resolve the requested pairs (or all cached pairs when pair_list is None)
+    # to their cached match records.
+    records: list[dict[str, Any]] = []
+    if pair_list:
+        for pair in pair_list:
+            if len(pair) < 2:
+                continue
+            a = _image_registry.get(str(pair[0]), str(pair[0]))
+            b = _image_registry.get(str(pair[1]), str(pair[1]))
+            rec = _match_store.get(tuple(sorted((os.path.abspath(a), os.path.abspath(b)))))
+            if rec is not None:
+                records.append(rec)
+    else:
+        records = list(_match_store.values())
+    if not records:
+        return 0
+
+    db = pycolmap.Database.open(database_path)
+
+    # Per-image deduplicated keypoint table (match endpoints → global indices).
+    img_kpts: dict[str, list[list[float]]] = {}
+    img_index: dict[str, dict[tuple, int]] = {}
+
+    def kp_idx(name: str, xy) -> int:
+        key = (round(float(xy[0]), 1), round(float(xy[1]), 1))
+        m = img_index.setdefault(name, {})
+        if key not in m:
+            img_kpts.setdefault(name, []).append([float(xy[0]), float(xy[1])])
+            m[key] = len(img_kpts[name]) - 1
+        return m[key]
+
+    pair_matches: list[tuple[str, str, list[tuple[int, int, bool]]]] = []
+    for rec in records:
+        name_a = _resolve_image_name(rec["path_a"], image_dir)
+        name_b = _resolve_image_name(rec["path_b"], image_dir)
+        img_kpts.setdefault(name_a, [])
+        img_kpts.setdefault(name_b, [])
+        mask = rec.get("inlier_mask") or []
+        entries = []
+        for i, (ka, kb) in enumerate(zip(rec["keypoints_a"], rec["keypoints_b"])):
+            ia, ib = kp_idx(name_a, ka), kp_idx(name_b, kb)
+            inl = bool(mask[i]) if i < len(mask) else True
+            entries.append((ia, ib, inl))
+        pair_matches.append((name_a, name_b, entries))
+
+    # Register camera + image + keypoints for every referenced image.
+    img_id: dict[str, int] = {}
+    for name, kpts in img_kpts.items():
+        try:
+            w, h = Image.open(os.path.join(image_dir, name)).size
+        except Exception:
+            w, h = 1024, 1024
+        cam = pycolmap.Camera(
+            model="SIMPLE_PINHOLE", width=int(w), height=int(h),
+            params=[1.2 * max(w, h), w / 2.0, h / 2.0],
+        )
+        cam_id = db.write_camera(cam)
+        iid = db.write_image(pycolmap.Image(name=name, camera_id=cam_id))
+        img_id[name] = iid
+        db.write_keypoints(iid, np.asarray(kpts, dtype=np.float64))
+
+    # Write the raw correspondences, then run COLMAP's geometric verification
+    # so it estimates E / cam2_from_cam1 / inlier subsets itself (the mapper
+    # needs the verified two-view geometry, not just index pairs).
+    valid_pairs: list[tuple[str, str]] = []
+    for name_a, name_b, entries in pair_matches:
+        allpairs = np.asarray([[ia, ib] for ia, ib, _ in entries],
+                              dtype=np.uint32)
+        if len(allpairs) < 8:
+            continue
+        db.write_matches(img_id[name_a], img_id[name_b], allpairs)
+        valid_pairs.append((name_a, name_b))
+    db.close()
+
+    if not valid_pairs:
+        return 0
+
+    # Geometric verification over the imported raw matches.
+    list_fd, pairs_path = tempfile.mkstemp(suffix=".txt", prefix="verify_")
+    try:
+        with os.fdopen(list_fd, "w") as f:
+            for a, b in valid_pairs:
+                f.write(f"{a} {b}\n")
+        pycolmap.verify_matches(database_path, pairs_path)
+    finally:
+        try:
+            os.unlink(pairs_path)
+        except OSError:
+            pass
+    return len(valid_pairs)
+
+
 @app.post("/sfm_run")
 def sfm_run(req: SfMRequest):
     output_dir = Path(req.output_dir)
@@ -375,19 +522,37 @@ def sfm_run(req: SfMRequest):
         if os.path.exists(db_path):
             os.remove(db_path)
 
-        # pycolmap>=4.x: the database file must exist before import, and
-        # extract_features performs image import + SIFT extraction in one step
-        # (import_images alone leaves images with zero keypoints).
+        # pycolmap>=4.x: the database file must exist before import.
         db = pycolmap.Database.open(db_path)
         db.close()
-        reader_opts = pycolmap.ImageReaderOptions(camera_model="OPENCV")
-        pycolmap.extract_features(
-            database_path=db_path,
-            image_path=req.image_dir,
-            reader_options=reader_opts,
-        )
+
+        # Agent-matches path: import the agent's own correspondences into the
+        # DB (keypoints + verified two-view geometry) so incremental_mapping
+        # triangulates them directly. This couples reconstruction quality to
+        # the agent's matcher choices instead of an independent SIFT pass.
+        used_agent_matches = False
+        if req.use_agent_matches:
+            n_imported = _import_agent_matches(db_path, req.image_dir, req.pair_list)
+            if n_imported > 0:
+                used_agent_matches = True
+                logger.info(f"Imported {n_imported} agent-verified match pairs into COLMAP")
+            else:
+                logger.warning(
+                    "use_agent_matches set but no cached matches for the pairs; "
+                    "falling back to SIFT"
+                )
 
         num_pairs_requested = 0
+        if not used_agent_matches:
+            # extract_features performs image import + SIFT extraction in one
+            # step (import_images alone leaves images with zero keypoints).
+            reader_opts = pycolmap.ImageReaderOptions(camera_model="OPENCV")
+            pycolmap.extract_features(
+                database_path=db_path,
+                image_path=req.image_dir,
+                reader_options=reader_opts,
+            )
+
         if req.pair_list is not None:
             if len(req.pair_list) == 0:
                 # Agent filtered every pair as doppelganger — nothing to match.
@@ -398,17 +563,20 @@ def sfm_run(req: SfMRequest):
                     "num_points3d": 0,
                     "num_pairs_matched": 0,
                 }
-            # Restrict matching to the given pairs (doppelganger removal).
-            num_pairs_requested = _match_pair_list(
-                db_path, req.pair_list, req.image_dir
-            )
-            if num_pairs_requested == 0:
-                logger.warning(
-                    "pair_list given but no pairs resolved; "
-                    "falling back to exhaustive matching"
+            num_pairs_requested = len(req.pair_list)
+            if not used_agent_matches:
+                # Restrict SIFT matching to the given pairs (doppelganger removal).
+                num_pairs_requested = _match_pair_list(
+                    db_path, req.pair_list, req.image_dir
                 )
-                pycolmap.match_exhaustive(database_path=db_path)
-        else:
+                if num_pairs_requested == 0:
+                    logger.warning(
+                        "pair_list given but no pairs resolved; "
+                        "falling back to exhaustive matching"
+                    )
+                    pycolmap.match_exhaustive(database_path=db_path)
+        elif not used_agent_matches:
+            # pair_list is None and we did not import agent matches → SIFT.
             pycolmap.match_exhaustive(database_path=db_path)
 
         recons = pycolmap.incremental_mapping(

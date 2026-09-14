@@ -17,6 +17,10 @@ export PATH="${CONDA_ENV}/bin:/users/kcwp264/.local/bin:${PATH}"
 export CONDA_PREFIX="${CONDA_ENV}"
 export PYTHONPATH="${AGENTIC_SFM_ROOT}/src:${PYTHONPATH:-}"
 
+# vLLM 0.28 ships flashinfer-python 0.6.16.post3 with flashinfer-cubin 0.6.12.
+# Without this, EngineCore dies on import (pilot 7836623).
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+
 # Prefer pip-bundled CUDA libs over (missing) system libcudart.so.13.
 if [[ -d "${CONDA_ENV}/lib/python3.11/site-packages/nvidia" ]]; then
   _nv_libs=()

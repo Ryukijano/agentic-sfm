@@ -5,7 +5,7 @@ model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
   # Resume from Phase 1 checkpoint (or SFT adapter if Phase 1 not done)
-  checkpoint: "outputs/phase1/checkpoints/best"
+  checkpoint: "outputs/scene_sft/checkpoints/epoch_5"  # scene SFT warmup adapter
   sft_adapter: "outputs/sft/checkpoints/epoch_5"  # fallback
   lora:
     rank: 32
@@ -84,6 +84,11 @@ data:
   # Scene data from MegaDepth scene_info
   scene_info_dir: "/scratch/kcwp264/data/megadepth/scene_info_full/scene_info"
   image_root: "/scratch/kcwp264/data/megadepth/megadepth_test_1500"
+  # Indoor RGB-D scenes: extracted scannet_test_1500 scenes (sceneNNNN_MM
+  # dirs).  When set, ScanNet scenes are concatenated with MegaDepth for
+  # Phase 2 scene training.  Set to null to disable.
+  scannet_root: "/scratch/kcwp264/data/megadepth/scannet_test_1500/scannet_test_1500"
+  scannet_scene_ids: null    # e.g. ["scene0772_00"]; null = all extracted
   max_images_per_scene: 20   # images per scene episode (curriculum increases this)
   min_images_per_scene: 5
   matcher: "loftr"
