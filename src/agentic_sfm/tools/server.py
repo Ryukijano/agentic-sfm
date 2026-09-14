@@ -122,8 +122,10 @@ class SfMRequest(BaseModel):
     output_dir: str = "./outputs/sfm_run"
     # When true, import the agent's own matcher correspondences (cached by
     # earlier /match calls) into COLMAP instead of SIFT matching, so the
-    # reconstruction is driven by the agent's match quality.
-    use_agent_matches: bool = False
+    # reconstruction is driven by the agent's match quality. Defaults true so
+    # the agent's /match work automatically feeds the reconstruction; SIFT is
+    # used only as a fallback when no cached matches exist for the pairs.
+    use_agent_matches: bool = True
 
 
 class InspectRequest(BaseModel):

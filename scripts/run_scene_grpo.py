@@ -238,6 +238,8 @@ def _load_scannet_scene(scene_dir: Path,
     n = len(frames)
     k = min(n, max(1, int(max_images_per_scene)))
     indices = sorted(set(np.linspace(0, n - 1, k).round().astype(int).tolist()))
+    if len(indices) < min_images_per_scene:
+        return None
 
     image_paths = [str(frames[i][1].resolve()) for i in indices]
     depth_paths = [
