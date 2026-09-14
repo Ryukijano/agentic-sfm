@@ -294,13 +294,22 @@ class VLLMRolloutAgent:
             crop_path = result.get("path") or (result.get("crop") or {}).get("path")
             if not crop_b64 and crop_path and os.path.exists(crop_path):
                 crop_b64 = self._encode_image(crop_path)
+            # vLLM is launched with --limit-mm-per-prompt image:6. The prompt
+            # already carries img_a + img_b (2 images), so keep at most 4 crop
+            # images and drop the oldest once we exceed the cap — the policy
+            # only needs the most recent crop to decide the next call.
             if crop_b64:
-                image_b64s.append(crop_b64)
-                ep.images = image_b64s
-                obs_content = [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
-                    {"type": "text", "text": obs_text},
-                ]
+                n_crops = max(0, len(image_b64s) - 2)
+                if n_crops >= 4:
+                    # Too many crop images already in context; keep text only.
+                    crop_b64 = None
+                else:
+                    image_b64s.append(crop_b64)
+                    ep.images = image_b64s
+                    obs_content = [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{crop_b64}"}},
+                        {"type": "text", "text": obs_text},
+                    ]
             messages.append({"role": "user", "content": obs_content})
 
         ep.messages = messages

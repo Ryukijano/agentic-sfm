@@ -414,7 +414,12 @@ class AgenticSfMAgent:
                     {"type": "image", "image": img_b},
                     {
                         "type": "text",
-                        "text": 'Match these two images. Call tools to achieve the best matching result, then output {"tool": "done"}.',
+                        "text": (
+                            'Match these two images. The first image is registered as '
+                            '"img_a" and the second as "img_b" — use exactly these ids in '
+                            'your tool args (image_a/image_b/image_id). Call tools to '
+                            'achieve the best matching result, then output {"tool": "done"}.'
+                        ),
                     },
                 ],
             },
