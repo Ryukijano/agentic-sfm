@@ -964,7 +964,8 @@ class GRPOTrainer:
         if not episodes:
             logger.warning("All groups had zero variance after dynamic sampling — skipping.")
             return {"num_episodes": 0, "mean_reward": 0.0, "std_reward": 0.0,
-                    "mean_tool_calls": 0.0, "loss": 0.0}
+                    "mean_advantage": 0.0, "mean_tool_calls": 0.0,
+                    "max_reward": 0.0, "min_reward": 0.0, "loss": 0.0}
         advantages = self.compute_advantages(episodes)
 
         rewards = [ep.reward for ep in episodes]

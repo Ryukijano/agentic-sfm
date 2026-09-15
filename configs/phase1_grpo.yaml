@@ -4,7 +4,7 @@
 model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
-  sft_adapter: "outputs/sft/checkpoints/epoch_5"  # oracle SFT warmup (no zero-shot)
+  sft_adapter: "outputs/phase1/checkpoints/latest"  # resume from latest GRPO ckpt (was: outputs/sft/checkpoints/epoch_5)
   lora:
     rank: 32
     alpha: 64
