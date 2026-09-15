@@ -58,6 +58,9 @@ Structure-from-motion pipelines break on **hard pairs**: low overlap, extreme vi
 
 All inference outputs live under [`results/`](results/). See [`results/README.md`](results/README.md) for details.
 
+Trained LoRA adapters (pair SFT / Phase 1 GRPO / scene SFT) and figures:
+[huggingface.co/Ryukijano/agentic-sfm-qwen35-2b](https://huggingface.co/Ryukijano/agentic-sfm-qwen35-2b)
+
 ### Phase 0 — zero-shot feasibility
 
 Does stock Qwen3.5-2B cropping beat direct matching without RL?
