@@ -82,6 +82,10 @@ Does stock Qwen3.5-2B cropping beat direct matching without RL?
 Qualitative match visualizations on scenes `0015` and `0022`:
 
 <p align="center">
+  <img src="results/figures/result_clean_hero.png" alt="Match hero figure" width="800"/>
+</p>
+
+<p align="center">
   <img src="results/figures/result_matches_by_difficulty.png" alt="Matches by difficulty" width="700"/>
 </p>
 
@@ -91,13 +95,41 @@ Qualitative match visualizations on scenes `0015` and `0022`:
 
 Per-pair overlays: [`results/phase0_real/visualizations/`](results/phase0_real/visualizations/)
 
+### Phase 1 — S-GRPO training (running)
+
+Best-match episodes logged to W&B during GRPO on real hard pairs — green inlier /
+red outlier correspondences from the verifier, title reports full verified-inlier
+count and episode reward. Mean reward climbed `0.374 → 0.496` over the first
+30 logged steps (epoch-1 mean `0.388`).
+
+| Step 10 — Brandenburg Gate (432 inliers, 85%) | Step 20 — Brandenburg Gate (540 inliers, 93%) | Step 30 — St. Peter's (295 inliers, 67%) |
+|---|---|---|
+| <img src="results/figures/train_best_match_step10.png"/> | <img src="results/figures/train_best_match_step20.png"/> | <img src="results/figures/train_best_match_step30.png"/> |
+
+### Scene level — Phase 2 (pipeline built, training validating)
+
+102 scene environments: 2 MegaDepth outdoor + 100 ScanNet indoor RGB-D scenes
+(RGB + depth + intrinsics + poses, world-to-camera after c2w inversion).
+Dense ground-truth point cloud (~200k points) rendered from ScanNet depth+pose
+— shown as the **evaluation target**, not an agent output:
+
+<p align="center">
+  <img src="results/figures/scannet_gt_scene0772_00.png" alt="ScanNet dense GT cloud + camera trajectory" width="500"/>
+</p>
+
+Composite summary (hard pair, good pair, sparse COLMAP recon, ScanNet GT, reward curve):
+
+<p align="center">
+  <img src="results/figures/qualitative_final.png" alt="Composite qualitative figure" width="900"/>
+</p>
+
 ## Project phases
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| **0** | ✅ Done | Zero-shot crop feasibility + real MegaDepth eval |
-| **1** | 🟡 In progress | GRPO on hard-pair matching (custom loop + VeRL integration) |
-| **2** | ⬜ Planned | Full agentic SfM (COLMAP, doppelganger, scene rewards) |
+| **0** | ✅ Done | Zero-shot crop feasibility + real MegaDepth eval (negative result → motivates RL) |
+| **1** | 🟡 Running | S-GRPO on 1,535 hard pairs — reward climbing `0.374 → 0.496`, W&B media live |
+| **2** | 🟡 Validating | Scene SFT done (102 scenes: MegaDepth + ScanNet); agent-matches→COLMAP importer; scene GRPO training validating |
 | **3** | ⬜ Planned | Benchmark evaluation & write-up |
 
 ## Quick start
