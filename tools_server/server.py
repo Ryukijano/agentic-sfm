@@ -210,31 +210,40 @@ def image_to_base64(img: np.ndarray, max_size: int = 1024) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, int] | None:
-    """Convert a model bbox to a valid pixel crop box, or None if degenerate.
+def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, int] | str:
+    """Convert a model bbox to a valid pixel crop box, or an error string.
 
-    The policy sometimes emits mixed coordinates (normalized fractions for some
-    entries, absolute pixels for others). Interpret each entry independently:
-    values > 1.0 are pixels, <= 1.0 are fractions of the image dimension. Sort
-    the axes and clamp to the image so the box can never be inverted.
+    Accepts either an all-normalized [0,1] box or an all-pixel box. Mixed units
+    (e.g. [0.2, 0.3, 0.8, 937]) are rejected with a teaching message: silently
+    clamping mixed boxes previously made malformed output reward-equivalent to
+    a correct crop, and RL drifted into emitting pixel heights.
     """
     if len(bbox) != 4:
-        return None
-    x1, y1, x2, y2 = (float(v) for v in bbox)
-    px = sorted(max(0, min(w, int(v) if v > 1.0 else int(v * w))) for v in (x1, x2))
-    py = sorted(max(0, min(h, int(v) if v > 1.0 else int(v * h))) for v in (y1, y2))
+        return f"bbox must have 4 values, got {len(bbox)}"
+    vals = [float(v) for v in bbox]
+    normalized = all(v <= 1.0 for v in vals)
+    pixels = all(v > 1.0 for v in vals)
+    if not (normalized or pixels):
+        return (f"bbox units must be all-normalized [0,1] or all-pixels; got {bbox}. "
+                f"Normalized example: [0.2, 0.3, 0.8, 0.9]")
+    if normalized:
+        px = sorted(max(0, min(w, int(v * w))) for v in (vals[0], vals[2]))
+        py = sorted(max(0, min(h, int(v * h))) for v in (vals[1], vals[3]))
+    else:
+        px = sorted(max(0, min(w, int(v))) for v in (vals[0], vals[2]))
+        py = sorted(max(0, min(h, int(v))) for v in (vals[1], vals[3]))
     if px[1] - px[0] < 4 or py[1] - py[0] < 4:
-        return None
+        return f"degenerate bbox {bbox} -> ({px[0]}, {py[0]}, {px[1]}, {py[1]})"
     return px[0], py[0], px[1], py[1]
 
 
 def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
-    """Crop image to bbox [x1, y1, x2, y2]; tolerates mixed normalized/pixel coords."""
+    """Crop image to bbox [x1, y1, x2, y2]; accepts all-normalized or all-pixel."""
     img = get_image(image_id)
     h, w = img.shape[:2]
     box = _bbox_to_pixels(bbox, w, h)
-    if box is None:
-        return {"error": f"degenerate bbox {bbox} for {image_id}"}
+    if isinstance(box, str):
+        return {"error": box}
     px1, py1, px2, py2 = box
     cropped = img[py1:py2, px1:px2]
     new_id = f"{image_id}_crop_{uuid.uuid4().hex[:8]}"
@@ -253,6 +262,8 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
         "crop_id": new_id,
         "origin_xy": [ox, oy],
         "crop_size": [px2 - px1, py2 - py1],
+        "bbox_normalized": [round(px1 / w, 3), round(py1 / h, 3),
+                            round(px2 / w, 3), round(py2 / h, 3)],
         "path": crop_path,
         "image_b64": image_to_base64(cropped, max_size=512),
     }
