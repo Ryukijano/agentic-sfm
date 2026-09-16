@@ -41,6 +41,10 @@ _match_store: "OrderedDict[str, OrderedDict[tuple[str, str], dict[str, Any]]]" =
 _MATCH_STORE_MAX_SESSIONS = 64
 _DEFAULT_SESSION = "_default"
 
+# Shortest crop side, as a fraction of the image's shorter side. Rejects the
+# tiny-crop mode RL drifted into; far below any SFT/oracle box (>= 0.6).
+MIN_CROP_FRACTION = float(os.environ.get("AGENTIC_SFM_MIN_CROP_FRACTION", "0.25"))
+
 
 def _record_agent_match(
     path_a: str, path_b: str, result: dict[str, Any], session: str = ""
@@ -190,6 +194,17 @@ def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, i
         py = sorted(max(0, min(h, int(v))) for v in (vals[1], vals[3]))
     if px[1] - px[0] < 4 or py[1] - py[0] < 4:
         return f"degenerate bbox {bbox} -> ({px[0]}, {py[0]}, {px[1]}, {py[1]})"
+    # Tiny crops were a reward-hack attractor (Phase-1 epoch 2): on a hopeless
+    # pair they fail slightly less badly than a large crop, so group-relative
+    # advantage reinforced them until the policy slid into degenerate boxes.
+    # Every SFT box has a min side of 0.6-1.0, so this cannot reject a real crop.
+    min_side = MIN_CROP_FRACTION * min(w, h)
+    if (px[1] - px[0]) < min_side or (py[1] - py[0]) < min_side:
+        return (
+            f"crop too small: {bbox} -> {px[1] - px[0]}x{py[1] - py[0]} px; the "
+            f"shortest side must be >= {MIN_CROP_FRACTION:.0%} of the image "
+            f"({int(min_side)} px). Example: [0.2, 0.3, 0.8, 0.9]"
+        )
     return px[0], py[0], px[1], py[1]
 
 

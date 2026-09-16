@@ -57,11 +57,36 @@ TOOL_SERVER_PORT=$((19000 + SLURM_JOB_ID % 20000))
 export VLLM_PORT TOOL_SERVER_PORT
 echo "vLLM port: ${VLLM_PORT}  tool port: ${TOOL_SERVER_PORT}"
 
-if [[ ! -d outputs/sft/checkpoints/epoch_5 ]]; then
-  echo "ERROR: SFT adapter missing at outputs/sft/checkpoints/epoch_5"
-  echo "Run oracle SFT then SFT warmup first."
+# Warm-start adapter comes from the config — fail loudly if it is missing
+# rather than training from the base model by accident.
+ADAPTER_PATH="$(python - <<'PY'
+import yaml
+print(yaml.safe_load(open("configs/phase1_grpo.yaml"))["model"]["sft_adapter"])
+PY
+)"
+if [[ ! -d "${ADAPTER_PATH}" ]]; then
+  echo "ERROR: warm-start adapter missing at ${ADAPTER_PATH}"
+  echo "Run oracle SFT / Phase 1 first, or fix model.sft_adapter."
   exit 1
 fi
+echo "Warm-start adapter: ${ADAPTER_PATH}"
+if [[ ! -f "${ADAPTER_PATH}/adapter_model.safetensors" ]]; then
+  echo "ERROR: ${ADAPTER_PATH} has no adapter_model.safetensors"
+  exit 1
+fi
+
+# W&B: confirm auth + scratch-local dirs before burning GPUs on a run whose
+# curves we cannot see.
+echo "W&B dir: ${WANDB_DIR:-<unset>}  cache: ${WANDB_CACHE_DIR:-<unset>}"
+python - <<'PY'
+import os
+import wandb
+try:
+    user = wandb.api.viewer()["username"]
+except Exception as e:
+    raise SystemExit(f"ERROR: W&B auth failed ({type(e).__name__}: {e})")
+print(f"W&B authenticated as {user}; project={os.environ.get('WANDB_PROJECT', 'agentic-sfm')}")
+PY
 
 python - <<'PY'
 from agentic_sfm.constants import assert_qwen35_runtime

@@ -40,6 +40,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from agentic_sfm.agent.policy import (
+    MAX_IDENTICAL_TOOL_CALLS,
     Episode,
     SYSTEM_PROMPT,
     ToolCall,
@@ -47,6 +48,8 @@ from agentic_sfm.agent.policy import (
     execute_sfm_tool,
     format_observation,
     parse_tool_call,
+    repeat_breaker_message,
+    tool_call_signature,
 )
 from agentic_sfm.constants import DEFAULT_MATCHER, DEFAULT_POLICY_MODEL
 from agentic_sfm.data.hard_pairs import HardPairDataset
@@ -258,6 +261,7 @@ class VLLMRolloutAgent:
         ep.messages = messages
 
         num_invalid = 0
+        repeat_counts: dict[tuple, int] = {}
         for step in range(self.max_tool_calls):
             texts, token_lps = self._vllm_chat(messages, image_b64s, n=1)
             response = texts[0]
@@ -279,6 +283,16 @@ class VLLMRolloutAgent:
             ep.tool_calls.append(tc)
             if tc.tool == "done":
                 messages.append({"role": "assistant", "content": response})
+                break
+
+            # Identical-call loop guard: the model re-emitting the same rejected
+            # call burns the whole budget, makes every episode in the group fail
+            # identically, and leaves GRPO no contrast to learn from.
+            sig = tool_call_signature(tc)
+            repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
+            if repeat_counts[sig] > MAX_IDENTICAL_TOOL_CALLS:
+                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "user", "content": repeat_breaker_message(sig, repeat_counts[sig])})
                 break
 
             try:

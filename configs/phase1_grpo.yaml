@@ -4,7 +4,12 @@
 model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
-  sft_adapter: "outputs/sft/checkpoints/epoch_5"  # oracle SFT warmup (no zero-shot); latest/ was corrupted by the crop-500 run
+  # Warm start = Phase-1 epoch-1 adapter (mean reward 0.399). Epoch 2 was
+  # cancelled mid-flight after the policy drifted into tiny/degenerate crop
+  # boxes, so no epoch-2 checkpoint was written — best/ and latest/ are both
+  # this clean 0.399 adapter. The drift is now blocked by the crop floor and
+  # the identical-call repeat breaker.
+  sft_adapter: "outputs/phase1/checkpoints/best"
   lora:
     rank: 32
     alpha: 64
@@ -91,4 +96,4 @@ output:
   log_dir: "logs/phase1"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase1-grpo-qwen35-2b"
+  wandb_run_name: "phase1-grpo-qwen35-2b-r2"  # r2: crop floor + repeat breaker

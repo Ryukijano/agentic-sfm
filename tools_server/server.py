@@ -120,6 +120,10 @@ _DEFAULT_SESSION = "_default"
 # abort the server. Overridable for tests that simulate a crashing worker.
 _SFM_WORKER_PATH = Path(__file__).resolve().parent / "sfm_worker.py"
 
+# Shortest crop side, as a fraction of the image's shorter side. Rejects the
+# tiny-crop mode RL drifted into; far below any SFT/oracle box (>= 0.6).
+MIN_CROP_FRACTION = float(os.environ.get("AGENTIC_SFM_MIN_CROP_FRACTION", "0.25"))
+
 
 def colmap_matching_options():
     """FeatureMatchingOptions that avoid COLMAP's FAISS descriptor index.
@@ -289,6 +293,19 @@ def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, i
         py = sorted(max(0, min(h, int(v))) for v in (vals[1], vals[3]))
     if px[1] - px[0] < 4 or py[1] - py[0] < 4:
         return f"degenerate bbox {bbox} -> ({px[0]}, {py[0]}, {px[1]}, {py[1]})"
+    # Minimum-size floor. Tiny crops (e.g. [0.2,0.2,0.3,0.3]) were a reward-hack
+    # attractor: on a hopeless pair they fail slightly less badly than a large
+    # crop, so group-relative advantage reinforced them until the policy slid
+    # into degenerate boxes everywhere (Phase-1 epoch 2, 2026-09-16). Every SFT
+    # box has a min side of 0.6-1.0 and every oracle box >= 0.7, so this floor
+    # cannot reject a legitimate crop.
+    min_side = MIN_CROP_FRACTION * min(w, h)
+    if (px[1] - px[0]) < min_side or (py[1] - py[0]) < min_side:
+        return (
+            f"crop too small: {bbox} -> {px[1] - px[0]}x{py[1] - py[0]} px; the "
+            f"shortest side must be >= {MIN_CROP_FRACTION:.0%} of the image "
+            f"({int(min_side)} px). Example: [0.2, 0.3, 0.8, 0.9]"
+        )
     return px[0], py[0], px[1], py[1]
 
 

@@ -28,10 +28,13 @@ from typing import Any
 import numpy as np
 
 from agentic_sfm.agent.policy import (
+    MAX_IDENTICAL_TOOL_CALLS,
     ToolCall,
     execute_sfm_tool,
     format_observation,
     parse_tool_call,
+    repeat_breaker_message,
+    tool_call_signature,
 )
 from agentic_sfm.constants import DEFAULT_MATCHER
 from agentic_sfm.geometry import keep_best_match
@@ -378,6 +381,7 @@ def run_scene_episode(
     # Scene-level rollout loop
     num_tool_calls = 0
     num_invalid_calls = 0
+    repeat_counts: dict[tuple, int] = {}
     num_valid_calls = 0
     terminated = False
 
@@ -415,6 +419,18 @@ def run_scene_episode(
             terminated = True
             ep.done = True
             continue
+
+        # Identical-call loop guard: a repeated rejected call burns the budget
+        # and makes every episode in the group fail the same way, leaving GRPO
+        # no reward contrast to learn from.
+        sig = tool_call_signature(tc)
+        repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
+        if repeat_counts[sig] > MAX_IDENTICAL_TOOL_CALLS:
+            ep.messages.append({
+                "role": "user",
+                "content": repeat_breaker_message(sig, repeat_counts[sig]),
+            })
+            break
 
         # Execute the tool — never let an HTTP error kill the whole run.
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -86,6 +87,32 @@ class ToolCall:
 
     tool: str
     args: dict[str, Any]
+
+
+# How many times one identical (tool, args) call may repeat before the episode
+# is cut short. Phase-1 epoch 2 (2026-09-16) showed the failure this guards: a
+# small model that ignores the error observation re-emits the same rejected
+# call for all 10 tool calls, so every episode in a group died identically,
+# the group had no reward contrast, and the bad mode never got pushed down.
+MAX_IDENTICAL_TOOL_CALLS = int(os.environ.get("AGENTIC_SFM_MAX_IDENTICAL_CALLS", "3"))
+
+
+def tool_call_signature(tc: ToolCall) -> tuple[str, str]:
+    """Canonical identity of a call, for repeat-loop detection."""
+    try:
+        args = json.dumps(tc.args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        args = str(tc.args)
+    return (tc.tool, args)
+
+
+def repeat_breaker_message(sig: tuple[str, str], count: int) -> str:
+    """Teaching message when the same call keeps coming back."""
+    return (
+        f"You have now made this identical call {count} times and it will keep "
+        f"failing. Do something different: change the bbox, try another tool, "
+        f'or reply {{"tool": "done"}}.'
+    )
 
 
 @dataclass

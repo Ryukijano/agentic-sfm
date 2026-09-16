@@ -277,3 +277,62 @@ class TestIntrinsics:
     def test_k_for_image_validates_eagerly(self):
         with pytest.raises(ValueError):
             k_for_image([[0, 0, 0], [0, 0, 0], [0, 0, 0]], None, (640, 480))
+
+
+# ---------------------------------------------------------------------------
+# Tiny-crop floor: the mode RL drifted into during Phase-1 epoch 2
+# ---------------------------------------------------------------------------
+
+class TestMinCropFloor:
+    def test_tiny_box_rejected(self, two_images):
+        # The exact mode that took over epoch 2 (10% of the image).
+        r = TS.tool_crop("a", [0.2, 0.2, 0.3, 0.3])
+        assert "error" in r
+        assert "too small" in r["error"]
+
+    def test_sft_style_box_still_accepted(self, two_images):
+        # Smallest box the SFT data ever emits (min side 0.6).
+        r = TS.tool_crop("a", [0.2, 0.3, 0.8, 0.9])
+        assert "error" not in r
+
+    def test_oracle_style_box_still_accepted(self, two_images):
+        from agentic_sfm.geometry import ORACLE_CROP_BOXES
+
+        for box in ORACLE_CROP_BOXES:
+            r = TS.tool_crop("a", list(box))
+            assert "error" not in r, (box, r)
+
+    def test_floor_is_below_any_sft_box(self):
+        # Guard: the floor must never reject a box the SFT data taught.
+        assert TS.MIN_CROP_FRACTION < 0.6
+
+
+# ---------------------------------------------------------------------------
+# Identical-call loop guard
+# ---------------------------------------------------------------------------
+
+class TestRepeatBreaker:
+    def test_signature_is_order_insensitive_for_args(self):
+        from agentic_sfm.agent.policy import tool_call_signature
+
+        a = _TC("match", {"image_a": "x", "image_b": "y"})
+        b = _TC("match", {"image_b": "y", "image_a": "x"})
+        assert tool_call_signature(a) == tool_call_signature(b)
+
+    def test_signature_distinguishes_different_bboxes(self):
+        from agentic_sfm.agent.policy import tool_call_signature
+
+        a = _TC("crop_and_match", {"image_id": "i", "bbox": [0.2, 0.2, 0.3, 0.3]})
+        b = _TC("crop_and_match", {"image_id": "i", "bbox": [0.2, 0.3, 0.8, 0.9]})
+        assert tool_call_signature(a) != tool_call_signature(b)
+
+    def test_breaker_message_mentions_alternatives(self):
+        from agentic_sfm.agent.policy import repeat_breaker_message
+
+        msg = repeat_breaker_message(("crop", "{}"), 4)
+        assert "4 times" in msg and "bbox" in msg
+
+    def test_limit_is_small(self):
+        from agentic_sfm.agent.policy import MAX_IDENTICAL_TOOL_CALLS
+
+        assert 1 <= MAX_IDENTICAL_TOOL_CALLS < 10

@@ -262,3 +262,51 @@ class TestSceneRewardIntegration:
         assert "tool_cost" in rc
         assert "accumulative_tool_reward" in rc
         assert "total_reward" in rc
+
+
+class TestRepeatCallBreaker:
+    """A model that re-emits the same rejected call must not burn the budget."""
+
+    def test_identical_call_loop_is_cut_short(self):
+        bad = json.dumps({
+            "tool": "crop_and_match",
+            "args": {"image_id": "img_0000", "bbox": [0.2, 0.3, 0.2, 0.3],
+                     "image_b": "img_0001", "matcher": "loftr"},
+        })
+        agent = MockAgent(responses=[bad] * 10)
+        client = MockToolClient()
+        ep = run_scene_episode(
+            agent=agent,
+            scene_id="test",
+            image_paths=["a.jpg", "b.jpg"],
+            tool_client=client,
+            max_tool_calls=10,
+        )
+        from agentic_sfm.agent.policy import MAX_IDENTICAL_TOOL_CALLS
+
+        # Stops after the limit instead of using all 10 calls.
+        assert len(ep.tool_calls) == MAX_IDENTICAL_TOOL_CALLS + 1
+        assert not ep.done
+        # The model was told why, so the trajectory carries the signal.
+        assert any("identical call" in str(m.get("content"))
+                   for m in ep.messages if m.get("role") == "user")
+
+    def test_changing_the_bbox_keeps_the_episode_alive(self):
+        def box(x2):
+            return json.dumps({
+                "tool": "crop_and_match",
+                "args": {"image_id": "img_0000", "bbox": [0.2, 0.3, x2, 0.9],
+                         "image_b": "img_0001", "matcher": "loftr"},
+            })
+
+        agent = MockAgent(responses=[box(0.5), box(0.6), box(0.7), box(0.8),
+                                     json.dumps({"tool": "done", "args": {}})])
+        ep = run_scene_episode(
+            agent=agent,
+            scene_id="test",
+            image_paths=["a.jpg", "b.jpg"],
+            tool_client=MockToolClient(),
+            max_tool_calls=10,
+        )
+        assert ep.done
+        assert len(ep.tool_calls) == 5  # four distinct crops + done
