@@ -103,4 +103,4 @@ output:
   log_dir: "logs/phase2"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase2-scene-grpo-qwen35-2b"
+  wandb_run_name: "phase2-scene-grpo-qwen35-2b-r2"  # r2: COLMAP crash fix + watchdog

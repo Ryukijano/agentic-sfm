@@ -80,6 +80,19 @@ assert_qwen35_runtime()
 print("Policy runtime check passed")
 PY
 
+# W&B: confirm auth + scratch-local dirs before burning GPUs on a run whose
+# curves we cannot see (wandb.init failure is only a warning in the trainer).
+echo "W&B dir: ${WANDB_DIR:-<unset>}  cache: ${WANDB_CACHE_DIR:-<unset>}"
+python - <<'PY'
+import os
+import wandb
+try:
+    user = wandb.api.viewer()["username"]
+except Exception as e:
+    raise SystemExit(f"ERROR: W&B auth failed ({type(e).__name__}: {e})")
+print(f"W&B authenticated as {user}; project={os.environ.get('WANDB_PROJECT', 'agentic-sfm')}")
+PY
+
 cleanup() {
     echo "Cleaning up servers..."
     if [[ -n "${WATCH_PID:-}" ]]; then
