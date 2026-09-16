@@ -40,6 +40,55 @@ from agentic_sfm.tools.client import ToolClient
 
 logger = logging.getLogger(__name__)
 
+
+class ToolServerDown(RuntimeError):
+    """Tool server is unreachable (connection refused / dead process)."""
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, ConnectionRefusedError, TimeoutError, OSError)):
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) not in (111, 61, 104, None):
+            # Keep generic OSError only when the message looks like a transport fail.
+            msg = str(exc).lower()
+            return any(s in msg for s in ("connection refused", "errno 111", "connecterror", "timed out"))
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in (111, 61, 104):
+            return True
+        if isinstance(exc, (ConnectionError, ConnectionRefusedError, TimeoutError)):
+            return True
+    try:
+        import httpx
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TransportError)):
+            return True
+    except ImportError:
+        pass
+    msg = str(exc).lower()
+    return any(
+        s in msg
+        for s in ("connection refused", "errno 111", "connecterror", "all connection attempts failed")
+    )
+
+
+def _register_scene_images(
+    tool_client: ToolClient,
+    image_paths: list[str],
+    image_root: str = "",
+) -> dict[str, str]:
+    """Register scene images; abort immediately if the tool server is down."""
+    registered_ids: dict[str, str] = {}
+    for i, path in enumerate(image_paths):
+        img_id = f"img_{i:04d}"
+        full = str(Path(image_root) / path) if image_root else path
+        try:
+            tool_client.register_image(img_id, full)
+            registered_ids[path] = img_id
+        except Exception as e:
+            if _is_connection_error(e):
+                raise ToolServerDown(
+                    f"tool server unreachable while registering {full}: {e}"
+                ) from e
+            logger.warning(f"Failed to register {path}: {e}")
+    return registered_ids
+
 # Confidence at/above which a doppelganger_check flags a pair.
 DOPPELGANGER_CONFIDENCE_THRESHOLD = 0.5
 
@@ -296,14 +345,7 @@ def run_scene_episode(
     ep.session_id = f"{scene_id}-{uuid.uuid4().hex[:8]}"
 
     # Register all images with the tool server
-    registered_ids: dict[str, str] = {}  # path -> server_id
-    for i, path in enumerate(image_paths):
-        img_id = f"img_{i:04d}"
-        try:
-            tool_client.register_image(img_id, str(Path(image_root) / path) if image_root else path)
-            registered_ids[path] = img_id
-        except Exception as e:
-            logger.warning(f"Failed to register {path}: {e}")
+    registered_ids = _register_scene_images(tool_client, image_paths, image_root)
 
     # Build initial message with scene images (first N as thumbnails)
     n_show = min(len(image_paths), 8)  # show up to 8 images
@@ -518,14 +560,7 @@ def run_scene_oracle_episode(
     # Register images
     ep.session_id = f"{scene_id}-oracle-{uuid.uuid4().hex[:8]}"
 
-    registered_ids: dict[str, str] = {}
-    for i, path in enumerate(image_paths):
-        img_id = f"img_{i:04d}"
-        try:
-            tool_client.register_image(img_id, str(Path(image_root) / path) if image_root else path)
-            registered_ids[path] = img_id
-        except Exception:
-            pass
+    registered_ids = _register_scene_images(tool_client, image_paths, image_root)
 
     # Encode images for the prompt
     n_show = min(len(image_paths), 8)

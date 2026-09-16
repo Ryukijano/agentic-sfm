@@ -409,6 +409,30 @@ def doppelganger_check(req: DoppelgangerRequest):
     }
 
 
+def colmap_matching_options():
+    """FeatureMatchingOptions that avoid COLMAP's FAISS descriptor index.
+
+    pycolmap 4.x builds a per-image FAISS ``FeatureDescriptorIndex`` unless
+    ``sift.cpu_brute_force_matcher`` is set. That index SIGBUS'd inside
+    ``faiss::Clustering::train_encoded`` and killed the tool server (job
+    7882190, 2026-09-16). Brute-force matching sidesteps FAISS entirely; with
+    torch loaded in this process the FAISS/OpenMP region is also thread
+    contention sensitive (faiss#5294), so threads are pinned to 1.
+    """
+    import pycolmap
+
+    opts = pycolmap.FeatureMatchingOptions()
+    try:
+        opts.sift.cpu_brute_force_matcher = True
+    except AttributeError:
+        pass
+    try:
+        opts.num_threads = 1
+    except AttributeError:
+        pass
+    return opts
+
+
 def _resolve_image_name(id_or_path: str, image_dir: str) -> str:
     """Map a registered image id or path to its COLMAP image name.
 
@@ -464,7 +488,9 @@ def _match_pair_list(
             f.writelines(lines)
         pairing = pycolmap.ImportedPairingOptions(match_list_path=list_path)
         pycolmap.match_image_pairs(
-            database_path=database_path, pairing_options=pairing
+            database_path=database_path,
+            matching_options=colmap_matching_options(),
+            pairing_options=pairing,
         )
     finally:
         try:
@@ -676,7 +702,10 @@ def sfm_run(req: SfMRequest):
                     }
         elif not used_agent_matches:
             # pair_list is None and we did not import agent matches → SIFT.
-            pycolmap.match_exhaustive(database_path=db_path)
+            pycolmap.match_exhaustive(
+                database_path=db_path,
+                matching_options=colmap_matching_options(),
+            )
 
         recons = pycolmap.incremental_mapping(
             database_path=db_path,

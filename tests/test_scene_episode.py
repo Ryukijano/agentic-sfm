@@ -15,7 +15,9 @@ from agentic_sfm.agent.policy import ToolCall, parse_tool_call
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
     SCENE_SYSTEM_PROMPT,
+    ToolServerDown,
     _execute_scene_tool,
+    _is_connection_error,
     run_scene_episode,
     run_scene_oracle_episode,
 )
@@ -150,6 +152,29 @@ class TestSceneEpisode:
         )
         # Oracle should get at least failed_group_max_reward + epsilon
         assert ep.reward > 5.0
+
+    def test_connection_error_detection(self):
+        assert _is_connection_error(ConnectionRefusedError("errno 111"))
+        assert _is_connection_error(OSError(111, "Connection refused"))
+        assert not _is_connection_error(FileNotFoundError("/missing.jpg"))
+        assert not _is_connection_error(ValueError("bad bbox"))
+
+    def test_dead_tool_server_aborts_episode(self):
+        agent = MockAgent()
+
+        class DownClient(MockToolClient):
+            def register_image(self, img_id, path):
+                raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+        with pytest.raises(ToolServerDown, match="unreachable"):
+            run_scene_episode(
+                agent=agent,
+                scene_id="test",
+                image_paths=["a.jpg", "b.jpg"],
+                tool_client=DownClient(),
+                max_tool_calls=10,
+            )
+        assert agent._call_idx == 0
 
 
 class TestSceneToolExecution:

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from agentic_sfm.agent.policy import ToolCall  # noqa: E402
 from agentic_sfm.rl.scene_episode import SceneRolloutEpisode  # noqa: E402
-from scripts.run_scene_grpo import SceneGRPOTrainer  # noqa: E402
+from scripts.run_scene_grpo import SceneGRPOTrainer, _assert_tool_server  # noqa: E402
 from scripts.scene_smoke_test import MockToolClient, ScriptedSceneAgent  # noqa: E402
 
 
@@ -514,3 +514,20 @@ class TestEvaluate:
         trainer = _make_trainer(tmp_path)
         stats = trainer.evaluate(ScriptedSceneAgent())
         assert stats["mean_reward"] == 0.0 and stats["num_scenes"] == 0
+
+
+class TestToolServerHealthGate:
+    def test_ok(self):
+        class C:
+            def health(self):
+                return {"status": "ok"}
+        _assert_tool_server(C())
+
+    def test_connect_fail(self):
+        from agentic_sfm.rl.scene_episode import ToolServerDown
+
+        class C:
+            def health(self):
+                raise ConnectionRefusedError("[Errno 111] Connection refused")
+        with pytest.raises(ToolServerDown, match="health"):
+            _assert_tool_server(C())

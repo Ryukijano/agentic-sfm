@@ -36,6 +36,7 @@ sys.path.insert(0, str(_REPO))  # for `import scripts.run_grpo`
 from agentic_sfm.constants import DEFAULT_MATCHER, assert_qwen35_runtime
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
+    ToolServerDown,
     run_scene_episode,
     run_scene_oracle_episode,
 )
@@ -56,6 +57,16 @@ SCENE_REWARD_KEYS = (
     "ntep_intent_reward",
     "ntep_redundancy_penalty",
 )
+
+
+def _assert_tool_server(client: ToolClient) -> None:
+    """Fail fast if the matcher/COLMAP process is gone."""
+    try:
+        health = client.health()
+    except Exception as e:
+        raise ToolServerDown(f"tool server /health failed: {e}") from e
+    if isinstance(health, dict) and health.get("status") not in (None, "ok"):
+        raise ToolServerDown(f"tool server unhealthy: {health}")
 
 
 def _normalize_scene_ids(scene_ids: list[str] | None) -> set[str] | None:
@@ -1110,6 +1121,11 @@ def main():
         stage_tag = (f" [curriculum stage {current_stage + 1}/"
                      f"{len(curriculum.stages)}]" if curriculum is not None else "")
         logger.info(f"=== Epoch {epoch}{stage_tag} ===")
+        try:
+            _assert_tool_server(tool_client)
+        except ToolServerDown as e:
+            logger.error("%s — aborting Phase 2 instead of rolling out against a dead tool server", e)
+            sys.exit(2)
 
         scenes = list(active_dataset.scenes)
         if not scenes:
@@ -1129,10 +1145,14 @@ def main():
                 or (batch_start + batch_size >= len(scenes))
             )
 
-            stats = trainer.train_step(
-                batch, rollout_agent,
-                accum_step=micro_step, is_last_accum=is_last_accum,
-            )
+            try:
+                stats = trainer.train_step(
+                    batch, rollout_agent,
+                    accum_step=micro_step, is_last_accum=is_last_accum,
+                )
+            except ToolServerDown as e:
+                logger.error("%s — aborting Phase 2", e)
+                sys.exit(2)
             epoch_stats.append(stats)
 
             if is_last_accum:
@@ -1164,7 +1184,11 @@ def main():
         # Eval
         if (epoch + 1) % eval_freq == 0:
             logger.info(f"  Running eval at epoch {epoch}...")
-            eval_stats = trainer.evaluate(rollout_agent)
+            try:
+                eval_stats = trainer.evaluate(rollout_agent)
+            except ToolServerDown as e:
+                logger.error("%s — aborting Phase 2 eval", e)
+                sys.exit(2)
             logger.info(
                 f"  Eval: reward={eval_stats['mean_reward']:.3f}, "
                 f"success_rate={eval_stats.get('success_rate', 0.0):.3f}, "

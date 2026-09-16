@@ -82,7 +82,13 @@ PY
 
 cleanup() {
     echo "Cleaning up servers..."
-    kill ${VLLM_PID:-} ${TOOL_PID:-} 2>/dev/null || true
+    if [[ -n "${WATCH_PID:-}" ]]; then
+        kill ${WATCH_PID} 2>/dev/null || true
+    fi
+    kill ${VLLM_PID:-} ${TOOL_PID:-} ${TRAIN_PID:-} 2>/dev/null || true
+    if [[ -n "${TOOL_PID_FILE:-}" && -f "${TOOL_PID_FILE}" ]]; then
+        kill "$(cat "${TOOL_PID_FILE}")" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -114,22 +120,32 @@ for i in $(seq 1 240); do
     sleep 2
 done
 
-# Start tool server on GPU 2 (matchers + COLMAP)
+# Start tool server on GPU 2 (matchers + COLMAP). pycolmap/FAISS can SIGBUS
+# inside FeatureMatcherWorker (job 7882190 @ 08:17) and kill uvicorn; a
+# watchdog restarts it, and training abort if /health stays down.
 echo "Starting tool server on GPU 2..."
+TOOL_PID_FILE="${OUTPUT_DIR}/.tool_server_${TOOL_PORT}.pid"
+mkdir -p "${OUTPUT_DIR}"
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH="${PROJECT_ROOT}/src" python \
     "${PROJECT_ROOT}/tools_server/server.py" --port "${TOOL_PORT}" &
 TOOL_PID=$!
+echo "${TOOL_PID}" > "${TOOL_PID_FILE}"
 
 for i in $(seq 1 60); do
     if curl -s "http://localhost:${TOOL_PORT}/health" > /dev/null 2>&1; then
-        echo "Tool server ready on :${TOOL_PORT}"
+        echo "Tool server ready on :${TOOL_PORT} (pid ${TOOL_PID})"
         break
+    fi
+    if ! kill -0 ${TOOL_PID} 2>/dev/null; then
+        echo "ERROR: Tool server process died before bind"
+        exit 1
     fi
     if [ $i -eq 60 ]; then echo "ERROR: Tool server failed"; exit 1; fi
     sleep 2
 done
 
-# Run scene-level GRPO training on GPU 1
+# Run scene-level GRPO training on GPU 1 (background so the watchdog can
+# kill it if the tool server stays unrestorable).
 echo "Starting Phase 2 scene-level GRPO training..."
 set +e
 CUDA_VISIBLE_DEVICES=1 python scripts/run_scene_grpo.py \
@@ -137,9 +153,29 @@ CUDA_VISIBLE_DEVICES=1 python scripts/run_scene_grpo.py \
     --tool-server-url "http://localhost:${TOOL_PORT}" \
     --vllm-url "http://localhost:${VLLM_PORT}" \
     --output-dir "${OUTPUT_DIR}" \
-    2>&1 | tee "${LOG_DIR}/phase2_train_${SLURM_JOB_ID}.log"
-TRAIN_EXIT=${PIPESTATUS[0]}
+    > >(tee "${LOG_DIR}/phase2_train_${SLURM_JOB_ID}.log") 2>&1 &
+TRAIN_PID=$!
+
+chmod +x "${PROJECT_ROOT}/scripts/watch_tool_server.sh"
+"${PROJECT_ROOT}/scripts/watch_tool_server.sh" \
+    --port "${TOOL_PORT}" \
+    --project-root "${PROJECT_ROOT}" \
+    --protect-pid "${TRAIN_PID}" \
+    --pid-file "${TOOL_PID_FILE}" \
+    --gpu 2 \
+    --interval 10 \
+    --fail-threshold 3 \
+    --max-restarts 5 \
+    >> "${LOG_DIR}/phase2_${SLURM_JOB_ID}.out" 2>&1 &
+WATCH_PID=$!
+echo "Tool-server watchdog pid=${WATCH_PID} (interval 10s, fail after 30s, max 5 restarts)"
+
+wait ${TRAIN_PID}
+TRAIN_EXIT=$?
 set -e
+kill ${WATCH_PID} 2>/dev/null || true
+wait ${WATCH_PID} 2>/dev/null || true
+TOOL_PID="$(cat "${TOOL_PID_FILE}" 2>/dev/null || echo "${TOOL_PID}")"
 
 cleanup
 wait ${VLLM_PID} ${TOOL_PID} 2>/dev/null || true

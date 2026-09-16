@@ -52,3 +52,6 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: real COLMAP/GPU work; deselect with -m 'not slow'",
+]

@@ -16,6 +16,8 @@ import io
 import json
 import logging
 import os
+import signal
+import subprocess
 import tempfile
 import time
 import uuid
@@ -112,6 +114,41 @@ _CROP_META: dict[str, dict[str, Any]] = {}
 _match_store: "OrderedDict[str, OrderedDict[tuple[str, str], dict[str, Any]]]" = OrderedDict()
 _MATCH_STORE_MAX_SESSIONS = 64
 _DEFAULT_SESSION = "_default"
+
+
+# COLMAP runs in this child process so a native SIGBUS (FAISS matcher) can't
+# abort the server. Overridable for tests that simulate a crashing worker.
+_SFM_WORKER_PATH = Path(__file__).resolve().parent / "sfm_worker.py"
+
+
+def colmap_matching_options():
+    """FeatureMatchingOptions that avoid COLMAP's FAISS descriptor index.
+
+    pycolmap 4.x's SIFT matcher builds a per-image FAISS ``FeatureDescriptorIndex``
+    (IVF clustering) unless ``sift.cpu_brute_force_matcher`` is set. That index
+    SIGBUS'd inside ``faiss::Clustering::train_encoded`` on this cluster, killing
+    the whole tool server mid-run (job 7882190, 2026-09-16) — a native crash no
+    Python-level try/except can contain.
+
+    Brute-force matching sidesteps FAISS entirely. It is slower per pair, but our
+    scenes are tens of images, and a dead tool server costs far more than slow
+    matching. Threads are pinned to 1 as well: FAISS/COLMAP's OpenMP region
+    coexists badly with torch's OpenMP runtime in the same process, and the
+    crash is thread-contention sensitive (faiss#5294).
+    """
+    import pycolmap
+
+    opts = pycolmap.FeatureMatchingOptions()
+    try:
+        opts.sift.cpu_brute_force_matcher = True
+    except AttributeError:
+        # Older pycolmap without the FAISS matcher — nothing to disable.
+        pass
+    try:
+        opts.num_threads = 1
+    except AttributeError:
+        pass
+    return opts
 
 
 def _store_path(id_or_path: str) -> str | None:
@@ -714,7 +751,9 @@ def _match_pair_list(
             f.writelines(lines)
         pairing = pycolmap.ImportedPairingOptions(match_list_path=list_path)
         pycolmap.match_image_pairs(
-            database_path=database_path, pairing_options=pairing
+            database_path=database_path,
+            matching_options=colmap_matching_options(),
+            pairing_options=pairing,
         )
     finally:
         try:
@@ -845,6 +884,98 @@ def _import_agent_matches(
     return len(valid_pairs)
 
 
+def _run_colmap_subprocess(
+    db_path: str,
+    image_dir: str,
+    sparse_dir: str,
+    used_agent_matches: bool,
+    pair_list: list[list[str]] | None,
+    num_pairs_requested: int,
+    timeout_s: int = 1800,
+) -> dict[str, Any]:
+    """Run extract/match/mapping in a child process.
+
+    In-process pycolmap SIGBUS (FAISS FeatureMatcherWorker) aborts uvicorn.
+    Isolate native COLMAP so the tool server can keep serving /health.
+    Set AGENTIC_SFM_SFM_IN_PROCESS=1 to skip the sandbox (tests / debug).
+    """
+    worker = _SFM_WORKER_PATH
+    payload = {
+        "db_path": db_path,
+        "image_dir": image_dir,
+        "sparse_dir": sparse_dir,
+        "used_agent_matches": used_agent_matches,
+        "pair_list": pair_list,
+        "num_pairs_requested": num_pairs_requested,
+    }
+
+    def _in_process() -> dict[str, Any]:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sfm_worker", worker)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        return mod.run(payload)
+
+    if os.environ.get("AGENTIC_SFM_SFM_IN_PROCESS", "").strip() in ("1", "true", "yes"):
+        return _in_process()
+
+    env = os.environ.copy()
+    # COLMAP SIFT/FAISS must not share the matcher GPU with the parent.
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(worker)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(
+                json.dumps(payload), timeout=timeout_s
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait(timeout=5)
+            return {
+                "error": f"COLMAP worker timed out after {timeout_s}s",
+                "status": "timeout",
+                "num_registered": 0,
+                "num_points3d": 0,
+            }
+    except OSError as e:
+        logger.error("Failed to spawn COLMAP worker: %s", e)
+        return _in_process()
+
+    if proc.returncode not in (0, 1) or not (stdout or "").strip():
+        tail = (stderr or "")[-800:].strip()
+        return {
+            "error": (
+                f"COLMAP worker crashed (exit {proc.returncode})"
+                + (f": {tail}" if tail else "")
+            ),
+            "status": "crash",
+            "num_registered": 0,
+            "num_points3d": 0,
+        }
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return {
+            "error": f"COLMAP worker returned non-JSON (exit {proc.returncode}): "
+                     f"{(stdout or stderr or '')[-400:]}",
+            "status": "crash",
+            "num_registered": 0,
+            "num_points3d": 0,
+        }
+
+
 def tool_sfm_run(
     image_dir: str,
     pair_list: list[tuple[str, str]] | None = None,
@@ -914,85 +1045,53 @@ def tool_sfm_run(
                     "falling back to SIFT"
                 )
 
+        named_pairs: list[list[str]] | None = None
         num_pairs_requested = 0
-        if not used_agent_matches:
-            # extract_features performs image import + SIFT extraction in one
-            # step (import_images alone leaves images with zero keypoints).
-            reader_opts = pycolmap.ImageReaderOptions(camera_model="OPENCV")
-            pycolmap.extract_features(
-                database_path=db_path,
-                image_path=image_dir,
-                reader_options=reader_opts,
-            )
-
         if pair_list is not None:
-            num_pairs_requested = len(pair_list)
-            if not used_agent_matches:
-                # Restrict SIFT matching to the given pairs (doppelganger removal).
-                num_pairs_requested = _match_pair_list(
-                    db_path, pair_list, image_dir
-                )
-                if num_pairs_requested == 0:
-                    # Garbage pair_list must not silently get the baseline
-                    # exhaustive reconstruction — that's reward for a
-                    # malformed call.
-                    return {
-                        "error": "pair_list entries did not resolve to known images; "
-                                 "use registered image ids (e.g. img_0000)",
-                        "status": "no_pairs",
-                        "recon_id": recon_id,
-                        "num_registered": 0,
-                        "num_points3d": 0,
-                        "num_pairs_matched": 0,
-                    }
-        elif not used_agent_matches:
-            # pair_list is None and we did not import agent matches → SIFT.
-            pycolmap.match_exhaustive(database_path=db_path)
+            named_pairs = []
+            for pair in pair_list:
+                if len(pair) < 2:
+                    continue
+                name_a = _resolve_image_name(str(pair[0]), image_dir)
+                name_b = _resolve_image_name(str(pair[1]), image_dir)
+                if name_a and name_b:
+                    named_pairs.append([name_a, name_b])
+            num_pairs_requested = len(named_pairs)
+            if not used_agent_matches and num_pairs_requested == 0:
+                return {
+                    "error": "pair_list entries did not resolve to known images; "
+                             "use registered image ids (e.g. img_0000)",
+                    "status": "no_pairs",
+                    "recon_id": recon_id,
+                    "num_registered": 0,
+                    "num_points3d": 0,
+                    "num_pairs_matched": 0,
+                }
 
-        recons = pycolmap.incremental_mapping(
-            database_path=db_path,
-            image_path=image_dir,
-            output_path=str(outdir / "sparse"),
-        )
-
-        # pycolmap>=4.x returns {model_idx: Reconstruction}; take the largest.
-        recon = None
-        if recons:
-            recon = max(recons.values(), key=lambda r: len(r.images), default=None)
-
-        if recon is None:
-            return {
-                "error": "incremental_mapping produced no reconstruction",
-                "status": "no_convergence",
-                "recon_id": recon_id,
-                "num_registered": 0,
-                "num_points3d": 0,
-                "num_pairs_matched": num_pairs_requested,
-            }
-
-        num_registered = len(recon.images)
-        num_points = len(recon.points3D)
-
-        # Persist the selected reconstruction so inspect/eval can read it.
         sparse_dir = outdir / "sparse"
         sparse_dir.mkdir(parents=True, exist_ok=True)
-        # Clear stale contents to avoid confusing inspect with old subdirs.
-        for old in sparse_dir.iterdir():
-            if old.is_dir():
-                import shutil
-                shutil.rmtree(old)
-            else:
-                old.unlink()
-        # pycolmap's Reconstruction.write requires the model dir to exist.
-        model_dir = sparse_dir / "0"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        recon.write(str(model_dir))
-
-        mean_reproj_error = (
-            float(recon.compute_mean_reprojection_error())
-            if hasattr(recon, "compute_mean_reprojection_error")
-            else None
+        native = _run_colmap_subprocess(
+            db_path=db_path,
+            image_dir=image_dir,
+            sparse_dir=str(sparse_dir),
+            used_agent_matches=used_agent_matches,
+            pair_list=named_pairs,
+            num_pairs_requested=num_pairs_requested,
         )
+        if native.get("error"):
+            native.setdefault("recon_id", recon_id)
+            native.setdefault("num_registered", 0)
+            native.setdefault("num_points3d", 0)
+            return native
+
+        num_registered = int(native.get("num_registered") or 0)
+        num_points = int(native.get("num_points3d") or 0)
+        model_dir = native.get("output_dir") or str(sparse_dir / "0")
+        recon = None
+        try:
+            recon = pycolmap.Reconstruction(model_dir)
+        except Exception:
+            recon = None
 
         _RECON_STORE[recon_id].update({
             "num_images": num_registered,
@@ -1004,10 +1103,10 @@ def tool_sfm_run(
             "recon_id": recon_id,
             "num_registered": num_registered,
             "num_points3d": num_points,
-            "output_dir": str(sparse_dir / "0"),
-            "num_pairs_matched": num_pairs_requested,
-            "mean_reproj_error": mean_reproj_error,
-            "num_components": len(recons) if recons else 1,
+            "output_dir": model_dir,
+            "num_pairs_matched": native.get("num_pairs_matched", num_pairs_requested),
+            "mean_reproj_error": native.get("mean_reproj_error"),
+            "num_components": native.get("num_components", 1),
         }
     except ImportError:
         return {

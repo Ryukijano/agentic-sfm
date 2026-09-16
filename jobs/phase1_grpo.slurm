@@ -112,9 +112,12 @@ done
 
 # Start tool server on GPU 2 (LoFTR / MASt3R / LightGlue + MAGSAC pose)
 echo "Starting tool server on GPU 2..."
+TOOL_PID_FILE="${OUTPUT_DIR}/.tool_server_${TOOL_SERVER_PORT}.pid"
+mkdir -p "${OUTPUT_DIR}"
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH="${PROJECT_ROOT}/src" python \
     "${PROJECT_ROOT}/tools_server/server.py" --port "${TOOL_SERVER_PORT}" &
 TOOL_PID=$!
+echo "${TOOL_PID}" > "${TOOL_PID_FILE}"
 
 # Wait for tool server
 echo "Waiting for tool server..."
@@ -136,20 +139,41 @@ for i in $(seq 1 60); do
     sleep 2
 done
 
-# Run GRPO training on GPU 1
+# Run GRPO training on GPU 1 (background so a tool-server watchdog can stop it)
 echo "Starting GRPO training..."
+set +e
 CUDA_VISIBLE_DEVICES=1 python scripts/run_grpo.py \
     --config "${CONFIG}" \
     --tool-server-url "http://localhost:${TOOL_SERVER_PORT}" \
     --vllm-url "http://localhost:${VLLM_PORT}" \
     --output-dir "${OUTPUT_DIR}" \
-    2>&1 | tee "${LOG_DIR}/grpo_training_${SLURM_JOB_ID}.log"
+    > >(tee "${LOG_DIR}/grpo_training_${SLURM_JOB_ID}.log") 2>&1 &
+TRAIN_PID=$!
 
+chmod +x "${PROJECT_ROOT}/scripts/watch_tool_server.sh"
+"${PROJECT_ROOT}/scripts/watch_tool_server.sh" \
+    --port "${TOOL_SERVER_PORT}" \
+    --project-root "${PROJECT_ROOT}" \
+    --protect-pid "${TRAIN_PID}" \
+    --pid-file "${TOOL_PID_FILE}" \
+    --gpu 2 \
+    --interval 10 \
+    --fail-threshold 3 \
+    --max-restarts 5 \
+    >> "${LOG_DIR}/grpo_${SLURM_JOB_ID}.out" 2>&1 &
+WATCH_PID=$!
+echo "Tool-server watchdog pid=${WATCH_PID}"
+
+wait ${TRAIN_PID}
 TRAIN_EXIT=$?
+set -e
+kill ${WATCH_PID} 2>/dev/null || true
+wait ${WATCH_PID} 2>/dev/null || true
+TOOL_PID="$(cat "${TOOL_PID_FILE}" 2>/dev/null || echo "${TOOL_PID}")"
 
 # Cleanup
 echo "Cleaning up servers..."
-kill ${VLLM_PID} ${TOOL_PID} 2>/dev/null || true
+kill ${VLLM_PID} ${TOOL_PID} ${WATCH_PID} 2>/dev/null || true
 wait ${VLLM_PID} ${TOOL_PID} 2>/dev/null || true
 
 echo "Training exit code: ${TRAIN_EXIT}"
