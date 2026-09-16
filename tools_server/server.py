@@ -210,15 +210,32 @@ def image_to_base64(img: np.ndarray, max_size: int = 1024) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, int] | None:
+    """Convert a model bbox to a valid pixel crop box, or None if degenerate.
+
+    The policy sometimes emits mixed coordinates (normalized fractions for some
+    entries, absolute pixels for others). Interpret each entry independently:
+    values > 1.0 are pixels, <= 1.0 are fractions of the image dimension. Sort
+    the axes and clamp to the image so the box can never be inverted.
+    """
+    if len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    px = sorted(max(0, min(w, int(v) if v > 1.0 else int(v * w))) for v in (x1, x2))
+    py = sorted(max(0, min(h, int(v) if v > 1.0 else int(v * h))) for v in (y1, y2))
+    if px[1] - px[0] < 4 or py[1] - py[0] < 4:
+        return None
+    return px[0], py[0], px[1], py[1]
+
+
 def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
-    """Crop image to bbox [x1, y1, x2, y2] in normalized coords."""
+    """Crop image to bbox [x1, y1, x2, y2]; tolerates mixed normalized/pixel coords."""
     img = get_image(image_id)
     h, w = img.shape[:2]
-    x1, y1, x2, y2 = bbox
-    px1, py1 = int(x1 * w), int(y1 * h)
-    px2, py2 = int(x2 * w), int(y2 * h)
-    px1, px2 = max(0, px1), min(w, px2)
-    py1, py2 = max(0, py1), min(h, py2)
+    box = _bbox_to_pixels(bbox, w, h)
+    if box is None:
+        return {"error": f"degenerate bbox {bbox} for {image_id}"}
+    px1, py1, px2, py2 = box
     cropped = img[py1:py2, px1:px2]
     new_id = f"{image_id}_crop_{uuid.uuid4().hex[:8]}"
     _IMAGE_STORE[new_id] = cropped

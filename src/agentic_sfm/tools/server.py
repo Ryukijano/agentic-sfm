@@ -148,6 +148,24 @@ def register_image(req: RegisterRequest):
     return {"status": "ok", "image_id": req.image_id}
 
 
+def _bbox_to_pixels(bbox: list[float], w: int, h: int) -> tuple[int, int, int, int] | None:
+    """Convert a model bbox to a valid pixel crop box, or None if degenerate.
+
+    The policy sometimes emits mixed coordinates (normalized fractions for some
+    entries, absolute pixels for others). Interpret each entry independently:
+    values > 1.0 are pixels, <= 1.0 are fractions of the image dimension. Sort
+    the axes and clamp to the image so the box can never be inverted.
+    """
+    if len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    px = sorted(max(0, min(w, int(v) if v > 1.0 else int(v * w))) for v in (x1, x2))
+    py = sorted(max(0, min(h, int(v) if v > 1.0 else int(v * h))) for v in (y1, y2))
+    if px[1] - px[0] < 4 or py[1] - py[0] < 4:
+        return None
+    return px[0], py[0], px[1], py[1]
+
+
 @app.post("/crop")
 def crop(req: CropRequest):
     from PIL import Image
@@ -158,11 +176,10 @@ def crop(req: CropRequest):
 
     img = Image.open(path).convert("RGB")
     w, h = img.size
-    x1, y1, x2, y2 = req.bbox
-    x1 = max(0, int(x1 * w))
-    y1 = max(0, int(y1 * h))
-    x2 = min(w, int(x2 * w))
-    y2 = min(h, int(y2 * h))
+    box = _bbox_to_pixels(req.bbox, w, h)
+    if box is None:
+        return {"error": f"degenerate bbox {req.bbox} for {req.image_id}"}
+    x1, y1, x2, y2 = box
 
     cropped = img.crop((x1, y1, x2, y2))
     crop_id = f"{req.image_id}_crop_{x1}_{y1}_{x2}_{y2}"
