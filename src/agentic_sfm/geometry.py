@@ -11,11 +11,20 @@ def camera_matrix(
     size_wh: tuple[int, int],
     K: np.ndarray | list | None = None,
 ) -> np.ndarray:
-    """3x3 intrinsics. Falls back to a pinhole guess from image size."""
+    """3x3 intrinsics. Falls back to a pinhole guess from image size.
+
+    ``K=None`` -> heuristic pinhole guess. A *provided* but invalid K raises
+    ValueError instead of silently swapping in the guess — a bad intrinsics
+    argument must surface as an error, not produce a reward-equivalent pose.
+    """
     if K is not None:
-        arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        try:
+            arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"invalid intrinsics K: {e}") from e
         if np.isfinite(arr).all() and arr[0, 0] > 1.0:
             return arr
+        raise ValueError("invalid intrinsics K: non-finite entries or f <= 1")
     w, h = float(size_wh[0]), float(size_wh[1])
     f = 1.2 * max(w, h)
     return np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -170,7 +179,13 @@ def k_for_image(
     origin_xy: tuple[float, float] | list | None,
     size_wh: tuple[int, int],
 ) -> np.ndarray | list | None:
-    """Return K for the image actually being matched (full frame or crop)."""
+    """Return K for the image actually being matched (full frame or crop).
+
+    Validates a provided K eagerly (camera_matrix raises on provided-but-
+    invalid) so bad intrinsics surface as an error regardless of crop state.
+    """
+    if K_full is not None:
+        camera_matrix(size_wh, K_full)
     if origin_xy is None:
         return K_full
     adj = adjust_K_for_crop(K_full, (float(origin_xy[0]), float(origin_xy[1])), size_wh)

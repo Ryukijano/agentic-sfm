@@ -286,7 +286,9 @@ class AgenticSfmAgentLoop(AgentLoopBase):
                 kept = keep_best_match(final_match_result or None, result["match_result"])
                 final_match_result = kept or result["match_result"]
 
-            num_valid_calls += 1
+            # Errored calls are not "valid" — else rejection is reward-invisible.
+            if not (isinstance(result, dict) and result.get("error")):
+                num_valid_calls += 1
 
             # Format observation. Crops must insert image placeholder tokens so
             # vLLM's image_data stays 1:1 with the prompt (text-only encode
@@ -415,48 +417,54 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         tc: ToolCall,
         K_a: list | None = None,
         K_b: list | None = None,
+        session: str = "",
     ) -> dict[str, Any]:
         """Dispatch a parsed tool call to the tool server."""
         args = tc.args
 
+        def _require(*names: str) -> str | None:
+            missing = [n for n in names if args.get(n) is None]
+            return f"missing required args: {', '.join(missing)}" if missing else None
+
         if tc.tool == "match":
-            image_a = args.get("image_a", "img_a")
-            image_b = args.get("image_b", "img_b")
+            # No silent img_a/img_b defaults — malformed calls must error,
+            # not quietly produce the canonical reward-equivalent call.
+            if err := _require("image_a", "image_b"):
+                return {"error": err}
             matcher = args.get("matcher", self.matcher)
             max_size = args.get("max_size", self.match_max_size)
             return await tool_client.match(
-                image_a, image_b, matcher=matcher, max_size=max_size, K_a=K_a, K_b=K_b
+                args["image_a"], args["image_b"], matcher=matcher,
+                max_size=max_size, K_a=K_a, K_b=K_b, session=session
             )
 
         if tc.tool == "crop":
-            image_id = args.get("image_id", "img_a")
-            bbox = args.get("bbox")
-            if bbox is None:
-                raise ValueError("crop requires 'bbox'")
-            return await tool_client.crop(image_id, bbox)
+            if err := _require("image_id", "bbox"):
+                return {"error": err}
+            return await tool_client.crop(args["image_id"], args["bbox"])
 
         if tc.tool == "crop_and_match":
-            src_id = args.get("image_id", "img_a")
-            bbox = args.get("bbox")
-            image_b = args.get("image_b", "img_b")
-            if bbox is None:
-                raise ValueError("crop_and_match requires 'bbox'")
-            crop_res = await tool_client.crop(src_id, bbox)
-            cropped_id = crop_image_id(crop_res) or src_id
+            if err := _require("image_id", "bbox", "image_b"):
+                return {"error": err}
+            crop_res = await tool_client.crop(args["image_id"], args["bbox"])
+            if crop_res.get("error"):
+                # Propagate crop rejection — never fall back to a full-frame
+                # match, which would reward malformed bboxes.
+                return {"error": f"crop failed: {crop_res['error']}", "crop": crop_res}
             matcher = args.get("matcher", self.matcher)
             max_size = args.get("max_size", self.match_max_size)
             match_res = await tool_client.match(
-                cropped_id, image_b, matcher=matcher, max_size=max_size, K_a=K_a, K_b=K_b
+                crop_image_id(crop_res), args["image_b"], matcher=matcher,
+                max_size=max_size, K_a=K_a, K_b=K_b, session=session
             )
             match_res["crop"] = crop_res
-            if crop_image_id(crop_res):
-                match_res["cropped_image_id"] = crop_image_id(crop_res)
+            match_res["cropped_image_id"] = crop_image_id(crop_res)
             return match_res
 
         if tc.tool == "doppelganger_check":
-            image_a = args.get("image_a", "img_a")
-            image_b = args.get("image_b", "img_b")
-            return await tool_client.doppelganger_check(image_a, image_b)
+            if err := _require("image_a", "image_b"):
+                return {"error": err}
+            return await tool_client.doppelganger_check(args["image_a"], args["image_b"])
 
         if tc.tool == "retrieve":
             query_image = args.get("query_image", "img_a")
@@ -466,10 +474,13 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         if tc.tool == "sfm_run":
             image_dir = args.get("image_dir")
             pair_list = args.get("pair_list")
-            output_dir = args.get("output_dir", "./outputs/sfm_run")
+            output_dir = args.get("output_dir", "")
             if image_dir is None:
                 raise ValueError("sfm_run requires 'image_dir'")
-            return await tool_client.sfm_run(image_dir, pair_list=pair_list, output_dir=output_dir)
+            return await tool_client.sfm_run(
+                image_dir, pair_list=pair_list, output_dir=output_dir,
+                session=session
+            )
 
         if tc.tool == "inspect":
             recon_dir = args.get("recon_dir")

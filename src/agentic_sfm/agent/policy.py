@@ -255,36 +255,55 @@ def execute_sfm_tool(
     tool_client: Any,
     tc: ToolCall,
     match_kwargs: dict[str, Any] | None = None,
+    session: str = "",
 ) -> dict[str, Any]:
     """Dispatch crop / match / crop_and_match / doppelganger to the tool server."""
     match_kwargs = match_kwargs or {}
     args = tc.args
+    extra = {k: v for k, v in match_kwargs.items() if k not in ("matcher", "session")}
+
+    def _require(*names: str) -> str | None:
+        missing = [n for n in names if args.get(n) is None]
+        return f"missing required args: {', '.join(missing)}" if missing else None
+
     if tc.tool == "crop":
+        if err := _require("image_id", "bbox"):
+            return {"error": err}
         return tool_client.crop(args["image_id"], args["bbox"])
     if tc.tool == "match":
+        # No silent img_a/img_b defaults — a malformed call must error out,
+        # not quietly produce the canonical (reward-equivalent) baseline call.
+        if err := _require("image_a", "image_b"):
+            return {"error": err}
         return tool_client.match(
-            args.get("image_a", "img_a"),
-            args.get("image_b", "img_b"),
+            args["image_a"],
+            args["image_b"],
             args.get("matcher", match_kwargs.get("matcher", DEFAULT_MATCHER)),
-            **{k: v for k, v in match_kwargs.items() if k != "matcher"},
+            session=session,
+            **extra,
         )
     if tc.tool == "crop_and_match":
-        crop_res = tool_client.crop(args.get("image_id", "img_a"), args["bbox"])
-        cid = crop_image_id(crop_res) or args.get("image_id", "img_a")
+        if err := _require("image_id", "bbox", "image_b"):
+            return {"error": err}
+        crop_res = tool_client.crop(args["image_id"], args["bbox"])
+        if crop_res.get("error"):
+            # Propagate crop rejection — never fall back to a full-frame
+            # match, which would reward malformed bboxes.
+            return {"error": f"crop failed: {crop_res['error']}", "crop": crop_res}
         match_res = tool_client.match(
-            cid,
-            args.get("image_b", "img_b"),
+            crop_image_id(crop_res),
+            args["image_b"],
             args.get("matcher", match_kwargs.get("matcher", DEFAULT_MATCHER)),
-            **{k: v for k, v in match_kwargs.items() if k != "matcher"},
+            session=session,
+            **extra,
         )
         match_res["crop"] = crop_res
-        if crop_image_id(crop_res):
-            match_res["cropped_image_id"] = crop_image_id(crop_res)
+        match_res["cropped_image_id"] = crop_image_id(crop_res)
         return match_res
     if tc.tool == "doppelganger_check":
-        return tool_client.doppelganger_check(
-            args.get("image_a", "img_a"), args.get("image_b", "img_b")
-        )
+        if err := _require("image_a", "image_b"):
+            return {"error": err}
+        return tool_client.doppelganger_check(args["image_a"], args["image_b"])
     return {"error": f"Unknown tool: {tc.tool}"}
 
 

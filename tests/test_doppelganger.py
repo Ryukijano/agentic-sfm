@@ -319,7 +319,7 @@ class TestSceneEpisodeIntegration:
                 "inlier_ratio": 0.03 if is_d else 0.55,
             }
 
-        def sfm_run(self, image_dir, pair_list=None, output_dir="./o"):
+        def sfm_run(self, image_dir, pair_list=None, output_dir="./o", **kw):
             self.sfm_calls.append({"image_dir": image_dir, "pair_list": pair_list})
             return {"num_registered": 3, "num_points3d": 100,
                     "output_dir": "/tmp/recon"}

@@ -96,6 +96,9 @@ class RolloutEpisode:
     images: list[Any] = field(default_factory=list)
     K_a: Any = None
     K_b: Any = None
+    # True for injected S-GRPO oracle trajectories — excluded from media/metrics
+    # picks so wandb shows real policy rollouts, not synthetic demos.
+    is_oracle: bool = False
 
 
 class VLLMRolloutAgent:
@@ -284,7 +287,9 @@ class VLLMRolloutAgent:
                 result = {"error": str(e)}
 
             ep.results.append(result)
-            if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
+            if (not result.get("error")
+                    and (tc.tool in ("match", "crop_and_match")
+                         or result.get("pose") is not None)):
                 ep.final_match = keep_best_match(ep.final_match, result)
 
             messages.append({"role": "assistant", "content": response})
@@ -314,7 +319,14 @@ class VLLMRolloutAgent:
 
         ep.messages = messages
 
-        num_valid = sum(1 for tc in ep.tool_calls if tc.tool != "done")
+        # "Valid" = executed call whose result is non-error. Error results
+        # (bad args, server rejection) must NOT count — otherwise rejection
+        # is reward-invisible and spam calls inflate format/accumulative
+        # reward. ep.results parallels non-done tool calls.
+        num_valid = sum(
+            1 for res in ep.results
+            if not (isinstance(res, dict) and res.get("error"))
+        )
         pose_w = self.pose_weight
         format_w = self.format_weight
         if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
@@ -495,11 +507,18 @@ class VLLMRolloutAgent:
             use_ntep_rewards=self.use_ntep_rewards,
         )
         ep.reward = ep.reward_components["total_reward"]
+        ep.is_oracle = True
 
         # S-GRPO: guarantee oracle reward > all failed rollouts in the group
         # so it always yields positive advantage. Small epsilon ensures strictly
         # greater even when computed reward happens to tie.
-        if ep.reward <= failed_group_max_reward:
+        # Only crown an oracle that actually produced geometry — otherwise the
+        # floor would pay positive advantage for imitating a trajectory that
+        # produced nothing (e.g. during a tool-server outage).
+        oracle_has_geometry = bool(
+            ep.final_match and (ep.final_match.get("num_inliers") or 0) > 0
+        )
+        if oracle_has_geometry and ep.reward <= failed_group_max_reward:
             ep.reward = failed_group_max_reward + 0.1
             ep.reward_components["oracle_floor_boost"] = ep.reward - ep.reward_components["total_reward"]
 
@@ -594,6 +613,9 @@ class GRPOTrainer:
         self._lora_params = None
         self._optimizer = None
         self._wandb = None
+        self._best_epoch_reward = float("-inf")
+        self._best_eval_reward = float("-inf")
+        self._global_step = 0
 
         wandb_cfg = config.get("output", {})
         if wandb_cfg.get("wandb_enabled", True):
@@ -949,6 +971,41 @@ class GRPOTrainer:
 
         return results
 
+    @staticmethod
+    def _episode_diagnostics(episodes) -> dict:
+        """Tool-health metrics so reward hacking is visible in wandb.
+
+        A tolerant tool server can silently fix malformed calls and make
+        reward look clean; these stats expose the underlying failure mode
+        (tool errors, missing 'done', degraded format compliance).
+        """
+        results = [r for ep in episodes for r in ep.results]
+        n_err = sum(1 for r in results if isinstance(r, dict) and r.get("error"))
+        raw_rewards = [ep.reward for ep in episodes]
+        return {
+            "num_episodes_raw": len(episodes),
+            "mean_reward_raw": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
+            "cgi_injections": float(sum(1 for ep in episodes if ep.is_oracle)),
+            "oracle_floor_boost_mean": (
+                float(np.mean([
+                    float((ep.reward_components or {}).get("oracle_floor_boost", 0.0))
+                    for ep in episodes if ep.is_oracle
+                ])) if any(ep.is_oracle for ep in episodes) else 0.0
+            ),
+            "tool_error_rate": n_err / len(results) if results else 0.0,
+            "done_rate": (
+                sum(1 for ep in episodes
+                    if ep.tool_calls and ep.tool_calls[-1].tool == "done")
+                / len(episodes) if episodes else 0.0
+            ),
+            "format_reward_mean": (
+                float(np.mean([
+                    float((ep.reward_components or {}).get("format_reward", 0.0))
+                    for ep in episodes
+                ])) if episodes else 0.0
+            ),
+        }
+
     def train_step(self, pairs: list, rollout_agent: VLLMRolloutAgent,
                    accum_step: int = 0, is_last_accum: bool = True) -> dict:
         """One GRPO step: collect rollouts, compute advantages, update LoRA.
@@ -959,13 +1016,17 @@ class GRPOTrainer:
         """
         episodes = self.collect_rollouts(pairs, rollout_agent)
         self._last_episodes = episodes  # kept for wandb media logging
+        diag = self._episode_diagnostics(episodes)
         # DAPO Dynamic Sampling: filter zero-variance groups
         episodes = self._filter_zero_variance_groups(episodes)
         if not episodes:
             logger.warning("All groups had zero variance after dynamic sampling — skipping.")
+            if is_last_accum and self._optimizer is not None:
+                # Drop stale accumulated grads — no step ran this window.
+                self._optimizer.zero_grad(set_to_none=True)
             return {"num_episodes": 0, "mean_reward": 0.0, "std_reward": 0.0,
                     "mean_advantage": 0.0, "mean_tool_calls": 0.0,
-                    "max_reward": 0.0, "min_reward": 0.0, "loss": 0.0}
+                    "max_reward": 0.0, "min_reward": 0.0, "loss": 0.0, **diag}
         advantages = self.compute_advantages(episodes)
 
         rewards = [ep.reward for ep in episodes]
@@ -979,15 +1040,24 @@ class GRPOTrainer:
             "mean_tool_calls": float(np.mean(tool_calls)) if tool_calls else 0.0,
             "max_reward": float(np.max(rewards)) if rewards else 0.0,
             "min_reward": float(np.min(rewards)) if rewards else 0.0,
+            **diag,
         }
 
         if not episodes or all(ep.reward == 0 for ep in episodes):
             logger.warning("All episodes have zero reward — skipping update.")
+            if is_last_accum and self._optimizer is not None:
+                self._optimizer.zero_grad(set_to_none=True)
             return stats
 
         # Token-level GRPO on the LoRA model (same tokenizer both sides).
         # Mixing vLLM token logprobs with Transformers tokens is invalid.
-        # old = eval/no-grad (rollout-time weights); new = train/grad.
+        # NOTE: `old` is the current training model under no-grad — NOT the
+        # rollout-time adapter (vLLM serves the adapter saved at last epoch
+        # end, while `old` has already taken optimizer steps this epoch).
+        # So ratio = pi_now / pi_few-steps-ago, an approximation of the true
+        # PPO correction vs the sampling policy; the bias grows with
+        # steps-per-epoch. A proper fix would reuse ep.vllm_token_logprobs,
+        # but that needs careful vLLM<->HF token alignment.
         self._load_training_model()
         self._model.eval()
         old_results = self.compute_logprobs(episodes, requires_grad=False)
@@ -1040,13 +1110,16 @@ class GRPOTrainer:
                 continue
 
         stats["loss"] = (total_loss / valid_count) if valid_count > 0 else 0.0
-        if valid_count > 0 and is_last_accum:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self._model.parameters() if p.requires_grad],
-                self.max_grad_norm,
-            )
-            self._optimizer.step()
-            self._optimizer.zero_grad()
+        if is_last_accum:
+            if valid_count > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self._model.parameters() if p.requires_grad],
+                    self.max_grad_norm,
+                )
+                self._optimizer.step()
+            # Always clear grads at the window boundary — a skipped step must
+            # not leak accumulated grads into the next window.
+            self._optimizer.zero_grad(set_to_none=True)
 
         if is_last_accum:
             self._model.eval()
@@ -1067,7 +1140,10 @@ class GRPOTrainer:
         try:
             from agentic_sfm.eval.viz import episode_qualitative_media
             import wandb
-            best = max(eps, key=lambda e: getattr(e, "reward", 0.0))
+            # Prefer real policy rollouts — a CGI-injected oracle is a synthetic
+            # demo, not evidence of what the policy does.
+            policy_eps = [e for e in eps if not getattr(e, "is_oracle", False)]
+            best = max(policy_eps or eps, key=lambda e: getattr(e, "reward", 0.0))
             media = episode_qualitative_media(best, prefix=tag)
             if media:
                 self._wandb.log({k: wandb.Image(v) for k, v in media.items()},
@@ -1090,8 +1166,12 @@ class GRPOTrainer:
             episodes.append(ep)
         rewards = [ep.reward for ep in episodes]
         tool_calls = [len(ep.tool_calls) for ep in episodes]
-        # Count successful matches (non-zero reward)
-        success_count = sum(1 for r in rewards if r > 0)
+        # Success = the episode produced real geometry, not merely positive
+        # reward (format-only episodes can be > 0).
+        success_count = sum(
+            1 for ep in episodes
+            if ep.final_match and (ep.final_match.get("num_inliers") or 0) > 0
+        )
         stats = {
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "num_pairs": len(episodes),
@@ -1099,7 +1179,8 @@ class GRPOTrainer:
             "success_rate": success_count / len(episodes) if episodes else 0.0,
         }
         if self._wandb:
-            self._wandb.log({f"eval/{k}": v for k, v in stats.items()})
+            self._wandb.log({f"eval/{k}": v for k, v in stats.items()},
+                            step=self._global_step)
         return stats
 
     def save_lora_checkpoint(self, epoch: int | str, rollout_agent: VLLMRolloutAgent | None = None):
@@ -1227,24 +1308,51 @@ class GRPOTrainer:
                                 "train/reward_max": stats["max_reward"],
                                 "train/reward_min": stats["min_reward"],
                                 "train/tool_calls_mean": stats["mean_tool_calls"],
+                                "train/tool_error_rate": stats.get("tool_error_rate", 0.0),
+                                "train/done_rate": stats.get("done_rate", 0.0),
+                                "train/format_reward_mean": stats.get("format_reward_mean", 0.0),
+                                "train/num_episodes": stats.get("num_episodes", 0),
+                                "train/num_episodes_raw": stats.get("num_episodes_raw", 0),
+                                "train/mean_reward_raw": stats.get("mean_reward_raw", 0.0),
+                                "train/mean_advantage": stats.get("mean_advantage", 0.0),
+                                "train/cgi_injections": stats.get("cgi_injections", 0.0),
+                                "train/oracle_floor_boost_mean": stats.get("oracle_floor_boost_mean", 0.0),
                                 "train/loss": stats.get("loss", 0.0),
                                 "train/epoch": epoch + 1,
                                 "train/global_step": global_step,
                             }, step=global_step)
                             self._log_qualitative_media(global_step, tag="train")
 
-            mean_reward = np.mean([s["mean_reward"] for s in epoch_stats]) if epoch_stats else 0.0
+            # Gate `best` on the PRE-filter reward mean — post-filter stats
+            # exclude failed groups and are inflated exactly when the policy
+            # is degenerating.
+            mean_reward = np.mean(
+                [s.get("mean_reward_raw", s["mean_reward"]) for s in epoch_stats]
+            ) if epoch_stats else 0.0
             logger.info(f"Epoch {epoch+1} mean reward: {mean_reward:.3f}")
 
             if (epoch + 1) % self.eval_freq == 0:
                 eval_stats = self.evaluate(rollout_agent)
                 logger.info(f"  Eval: reward={eval_stats['mean_reward']:.3f}, "
                           f"success_rate={eval_stats.get('success_rate', 0.0):.3f}")
+                if eval_stats["mean_reward"] > self._best_eval_reward:
+                    self._best_eval_reward = eval_stats["mean_reward"]
+                    self.save_lora_checkpoint("best_eval")
+                    logger.info(f"  New best eval reward {eval_stats['mean_reward']:.3f} -> checkpoints/best_eval")
 
             # Always dump `latest` so vLLM rollouts track the LoRA policy.
             self.save_lora_checkpoint("latest", rollout_agent)
             if (epoch + 1) % self.save_freq == 0:
                 self.save_lora_checkpoint(epoch + 1, rollout_agent)
+
+            # `latest` tracks the *current* policy (needed for on-policy
+            # rollouts) — a regressed epoch will overwrite it. `best` (train,
+            # raw mean) and `best_eval` (held-out verifier) are the
+            # quality-gated resume points.
+            if mean_reward > self._best_epoch_reward:
+                self._best_epoch_reward = mean_reward
+                self.save_lora_checkpoint("best")
+                logger.info(f"  New best epoch mean reward {mean_reward:.3f} -> checkpoints/best")
 
         self.save_lora_checkpoint(self.total_epochs, rollout_agent)
         if self._wandb:

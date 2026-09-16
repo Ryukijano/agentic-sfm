@@ -682,10 +682,17 @@ class SceneGRPOTrainer(GRPOTrainer):
         return stats
 
     def _scene_metrics(self, episodes: list[SceneRolloutEpisode]) -> dict[str, float]:
-        """Mean scene-level reward components + reconstruction stats."""
+        """Mean scene-level reward components + reconstruction stats.
+
+        Oracle (CGI-injected) trajectories are excluded — they are synthetic
+        demos, not evidence of policy behavior — but their count is reported.
+        """
         if not episodes:
             return {}
-        metrics: dict[str, float] = {}
+        n_oracle = sum(1 for ep in episodes if getattr(ep, "is_oracle", False))
+        policy_eps = [ep for ep in episodes if not getattr(ep, "is_oracle", False)]
+        episodes = policy_eps or episodes  # fall back to all if every ep is oracle
+        metrics: dict[str, float] = {"scene/num_oracle_episodes": float(n_oracle)}
         for key in SCENE_REWARD_KEYS:
             vals = [
                 float(ep.reward_components[key])
@@ -756,6 +763,8 @@ class SceneGRPOTrainer(GRPOTrainer):
             return
 
         for ep in episodes:
+            if getattr(ep, "is_oracle", False):
+                continue  # synthetic demo — don't present it as policy output
             sid = getattr(ep, "scene_id", "scene")
             out_dir = (getattr(ep, "recon_result", None) or {}).get("output_dir")
             if out_dir:
@@ -1169,6 +1178,14 @@ def main():
         if (epoch + 1) % save_freq == 0:
             trainer.save_lora_checkpoint(epoch + 1, rollout_agent)
             logger.info(f"  Saved checkpoint at epoch {epoch + 1}")
+
+        # `latest` follows the current (possibly regressed) policy; `best`
+        # is the quality-gated resume point.
+        if epoch_stats:
+            if mean_reward > trainer._best_epoch_reward:
+                trainer._best_epoch_reward = mean_reward
+                trainer.save_lora_checkpoint("best")
+                logger.info(f"  New best epoch mean reward {mean_reward:.3f} -> checkpoints/best")
 
     trainer.save_lora_checkpoint(total_epochs, rollout_agent)
     if trainer._wandb:

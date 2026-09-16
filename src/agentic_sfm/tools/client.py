@@ -51,12 +51,14 @@ class ToolClient:
         max_size: int = 512,
         K_a: list | None = None,
         K_b: list | None = None,
+        session: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "image_a": image_a,
             "image_b": image_b,
             "matcher": matcher,
             "max_size": max_size,
+            "session": session,
         }
         if K_a is not None:
             payload["K_a"] = K_a
@@ -87,8 +89,9 @@ class ToolClient:
         self,
         image_dir: str,
         pair_list: list[tuple[str, str]] | None = None,
-        output_dir: str = "./outputs/sfm_run",
+        output_dir: str = "",
         use_agent_matches: bool = True,
+        session: str = "",
     ) -> dict[str, Any]:
         r = self.client.post(
             "/sfm_run",
@@ -97,6 +100,7 @@ class ToolClient:
                 "pair_list": pair_list,
                 "output_dir": output_dir,
                 "use_agent_matches": use_agent_matches,
+                "session": session,
             },
         )
         r.raise_for_status()

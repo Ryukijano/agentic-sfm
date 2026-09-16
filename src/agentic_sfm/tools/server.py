@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import uuid
+from collections import OrderedDict
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -31,18 +33,27 @@ _image_registry: dict[str, str] = {}
 # Crop metadata: image_id -> {"origin_xy": [x1, y1]} in parent-image pixels
 _crop_meta: dict[str, dict[str, Any]] = {}
 
-# Cache of the agent's own matcher correspondences per resolved image pair,
-# keyed by a canonical (sorted) tuple of absolute image paths. sfm_run can
-# import these into COLMAP instead of re-running SIFT matching, so the
-# reconstruction is driven by the agent's matcher choices directly.
-_match_store: dict[tuple[str, str], dict[str, Any]] = {}
+# Cache of the agent's own matcher correspondences per resolved image pair.
+# Session-scoped so sfm_run imports only the calling episode's matches — a
+# global store let later rollouts free-ride on matches made by earlier
+# episodes over the same image paths (reward for work never done).
+_match_store: "OrderedDict[str, OrderedDict[tuple[str, str], dict[str, Any]]]" = OrderedDict()
+_MATCH_STORE_MAX_SESSIONS = 64
+_DEFAULT_SESSION = "_default"
 
 
-def _record_agent_match(path_a: str, path_b: str, result: dict[str, Any]) -> None:
+def _record_agent_match(
+    path_a: str, path_b: str, result: dict[str, Any], session: str = ""
+) -> None:
     """Cache a match result's keypoints for later COLMAP import."""
     if not (result.get("keypoints_a") and result.get("keypoints_b")):
         return
-    _match_store[tuple(sorted((os.path.abspath(path_a), os.path.abspath(path_b))))] = {
+    sess = session or _DEFAULT_SESSION
+    bucket = _match_store.setdefault(sess, OrderedDict())
+    _match_store.move_to_end(sess)
+    while len(_match_store) > _MATCH_STORE_MAX_SESSIONS:
+        _match_store.popitem(last=False)
+    bucket[tuple(sorted((os.path.abspath(path_a), os.path.abspath(path_b))))] = {
         "path_a": os.path.abspath(path_a),
         "path_b": os.path.abspath(path_b),
         "keypoints_a": result["keypoints_a"],
@@ -109,6 +120,7 @@ class MatchRequest(BaseModel):
     max_size: int = 512
     K_a: list[float] | list[list[float]] | None = None
     K_b: list[float] | list[list[float]] | None = None
+    session: str = ""
 
 
 class DoppelgangerRequest(BaseModel):
@@ -119,7 +131,10 @@ class DoppelgangerRequest(BaseModel):
 class SfMRequest(BaseModel):
     image_dir: str
     pair_list: list[list[str]] | None = None
-    output_dir: str = "./outputs/sfm_run"
+    # Empty -> server creates a unique per-call dir (a shared fixed dir lets
+    # rollouts wipe each other's reconstruction).
+    output_dir: str = ""
+    session: str = ""
     # When true, import the agent's own matcher correspondences (cached by
     # earlier /match calls) into COLMAP instead of SIFT matching, so the
     # reconstruction is driven by the agent's match quality. Defaults true so
@@ -144,6 +159,9 @@ def health():
 
 @app.post("/register_image")
 def register_image(req: RegisterRequest):
+    if not os.path.exists(req.path):
+        return {"status": "error", "error": f"image path does not exist: {req.path}",
+                "image_id": req.image_id}
     _image_registry[req.image_id] = req.path
     return {"status": "ok", "image_id": req.image_id}
 
@@ -222,11 +240,41 @@ def crop(req: CropRequest):
 
 @app.post("/match")
 def match(req: MatchRequest):
+    # Only LoFTR is wired here — reject unknown matcher names instead of
+    # silently running a different matcher than requested.
+    if req.matcher != "loftr":
+        return {"error": f"unknown matcher '{req.matcher}'; valid: loftr",
+                "num_inliers": 0, "inlier_ratio": 0.0}
+    if req.image_a == req.image_b:
+        return {"error": "image_a and image_b are the same — self-match is not informative",
+                "num_inliers": 0, "inlier_ratio": 0.0}
     path_a = _image_registry.get(req.image_a, req.image_a)
     path_b = _image_registry.get(req.image_b, req.image_b)
 
     if not os.path.exists(path_a) or not os.path.exists(path_b):
         return {"error": f"Image not found: {path_a} or {path_b}"}
+    if os.path.abspath(path_a) == os.path.abspath(path_b):
+        return {"error": "image_a and image_b resolve to the same file — self-match is not informative",
+                "num_inliers": 0, "inlier_ratio": 0.0}
+
+    # Validate provided intrinsics before spending a matcher forward pass.
+    from PIL import Image
+
+    from agentic_sfm.geometry import k_for_image
+
+    try:
+        pil_a_sz = Image.open(path_a).size
+        pil_b_sz = Image.open(path_b).size
+    except Exception as e:
+        return {"error": f"cannot read image: {e}", "num_inliers": 0,
+                "inlier_ratio": 0.0}
+    try:
+        k_for_image(req.K_a, _crop_meta.get(req.image_a, {}).get("origin_xy"),
+                    (pil_a_sz[0], pil_a_sz[1]))
+        k_for_image(req.K_b, _crop_meta.get(req.image_b, {}).get("origin_xy"),
+                    (pil_b_sz[0], pil_b_sz[1]))
+    except ValueError as e:
+        return {"error": str(e), "num_inliers": 0, "inlier_ratio": 0.0}
 
     matcher = _get_matcher()
     if matcher is None:
@@ -299,7 +347,7 @@ def match(req: MatchRequest):
             "keypoints_a": pts0_hc.tolist()[:100],
             "keypoints_b": pts1_hc.tolist()[:100],
             "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
-            "matcher": req.matcher,
+            "matcher": "loftr",
         }
         # Cache the FULL high-confidence correspondence set for the
         # agent-matches → COLMAP importer (the API response keeps [:100] for
@@ -308,8 +356,8 @@ def match(req: MatchRequest):
             "keypoints_a": pts0_hc.tolist(),
             "keypoints_b": pts1_hc.tolist(),
             "inlier_mask": pose_result.get("inlier_mask") or [],
-            "matcher": req.matcher,
-        })
+            "matcher": "loftr",
+        }, session=req.session)
         return result
     except Exception as e:
         logger.error(f"Match failed: {e}")
@@ -399,6 +447,12 @@ def _match_pair_list(
         # COLMAP match lists are whitespace-separated; skip names with spaces.
         if not name_a or not name_b or " " in name_a or " " in name_b:
             continue
+        # Skip entries that don't resolve to an actual file in image_dir —
+        # garbage ids would be written to the match list, match nothing, and
+        # die later with a misleading "no_convergence".
+        if not (os.path.exists(os.path.join(image_dir, name_a))
+                and os.path.exists(os.path.join(image_dir, name_b))):
+            continue
         lines.append(f"{name_a} {name_b}\n")
 
     if not lines:
@@ -424,6 +478,7 @@ def _import_agent_matches(
     database_path: str,
     image_dir: str,
     pair_list: list[list[str]] | None = None,
+    session: str = "",
 ) -> int:
     """Import the agent's own matcher correspondences into COLMAP's database.
 
@@ -442,6 +497,7 @@ def _import_agent_matches(
 
     # Resolve the requested pairs (or all cached pairs when pair_list is None)
     # to their cached match records.
+    store = _match_store.get(session or _DEFAULT_SESSION, {})
     records: list[dict[str, Any]] = []
     if pair_list:
         for pair in pair_list:
@@ -449,11 +505,11 @@ def _import_agent_matches(
                 continue
             a = _image_registry.get(str(pair[0]), str(pair[0]))
             b = _image_registry.get(str(pair[1]), str(pair[1]))
-            rec = _match_store.get(tuple(sorted((os.path.abspath(a), os.path.abspath(b)))))
+            rec = store.get(tuple(sorted((os.path.abspath(a), os.path.abspath(b)))))
             if rec is not None:
                 records.append(rec)
     else:
-        records = list(_match_store.values())
+        records = list(store.values())
     if not records:
         return 0
 
@@ -534,7 +590,10 @@ def _import_agent_matches(
 
 @app.post("/sfm_run")
 def sfm_run(req: SfMRequest):
-    output_dir = Path(req.output_dir)
+    # Unique per-call dir unless the caller pinned one — a shared fixed dir
+    # lets one sfm_run wipe another episode's reconstruction.
+    out = req.output_dir or f"./outputs/sfm_run_{uuid.uuid4().hex[:8]}"
+    output_dir = Path(out)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not os.path.isdir(req.image_dir):
@@ -542,6 +601,17 @@ def sfm_run(req: SfMRequest):
             "error": f"image_dir does not exist: {req.image_dir}",
             "num_registered": 0,
             "num_points3d": 0,
+        }
+
+    if req.pair_list is not None and len(req.pair_list) == 0:
+        # Agent filtered every pair — a decision, not a baseline request.
+        # Check before any feature extraction.
+        return {
+            "error": "pair_list is empty (all pairs filtered)",
+            "status": "no_pairs",
+            "num_registered": 0,
+            "num_points3d": 0,
+            "num_pairs_matched": 0,
         }
 
     try:
@@ -562,7 +632,9 @@ def sfm_run(req: SfMRequest):
         # the agent's matcher choices instead of an independent SIFT pass.
         used_agent_matches = False
         if req.use_agent_matches:
-            n_imported = _import_agent_matches(db_path, req.image_dir, req.pair_list)
+            n_imported = _import_agent_matches(
+                db_path, req.image_dir, req.pair_list, session=req.session
+            )
             if n_imported > 0:
                 used_agent_matches = True
                 logger.info(f"Imported {n_imported} agent-verified match pairs into COLMAP")
@@ -584,15 +656,6 @@ def sfm_run(req: SfMRequest):
             )
 
         if req.pair_list is not None:
-            if len(req.pair_list) == 0:
-                # Agent filtered every pair as doppelganger — nothing to match.
-                return {
-                    "error": "pair_list is empty (all pairs filtered)",
-                    "status": "no_pairs",
-                    "num_registered": 0,
-                    "num_points3d": 0,
-                    "num_pairs_matched": 0,
-                }
             num_pairs_requested = len(req.pair_list)
             if not used_agent_matches:
                 # Restrict SIFT matching to the given pairs (doppelganger removal).
@@ -600,11 +663,17 @@ def sfm_run(req: SfMRequest):
                     db_path, req.pair_list, req.image_dir
                 )
                 if num_pairs_requested == 0:
-                    logger.warning(
-                        "pair_list given but no pairs resolved; "
-                        "falling back to exhaustive matching"
-                    )
-                    pycolmap.match_exhaustive(database_path=db_path)
+                    # Garbage pair_list must not silently get the baseline
+                    # exhaustive reconstruction — that's reward for a
+                    # malformed call.
+                    return {
+                        "error": "pair_list entries did not resolve to known images; "
+                                 "use registered image ids (e.g. img_0000)",
+                        "status": "no_pairs",
+                        "num_registered": 0,
+                        "num_points3d": 0,
+                        "num_pairs_matched": 0,
+                    }
         elif not used_agent_matches:
             # pair_list is None and we did not import agent matches → SIFT.
             pycolmap.match_exhaustive(database_path=db_path)

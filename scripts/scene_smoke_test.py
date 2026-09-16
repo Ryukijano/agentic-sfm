@@ -147,7 +147,7 @@ class MockToolClient:
         }
 
     def sfm_run(self, image_dir: str, pair_list: list | None = None,
-                output_dir: str = "./outputs/sfm_run") -> dict[str, Any]:
+                output_dir: str = "", session: str = "") -> dict[str, Any]:
         self.sfm_pair_lists.append(pair_list)
         n_pairs = len(pair_list) if pair_list else 0
         self.call_log.append(f"sfm_run:{image_dir}:{n_pairs}")
@@ -155,7 +155,8 @@ class MockToolClient:
             "num_registered": len(self.registered),
             "num_points3d": 100 * len(self.registered),
             "mean_reproj_error": 1.1,
-            "output_dir": output_dir,
+            # Real server generates a unique dir when output_dir is empty
+            "output_dir": output_dir or f"./outputs/sfm_mock_{id(self):x}",
             "num_pairs_matched": n_pairs,
             "num_components": 1,
         }
@@ -213,12 +214,12 @@ class InstrumentedToolClient(ToolClient):
         return super().doppelganger_check(image_a, image_b)
 
     def sfm_run(self, image_dir: str, pair_list: list | None = None,
-                output_dir: str = "./outputs/sfm_run") -> dict[str, Any]:
+                output_dir: str = "", session: str = "") -> dict[str, Any]:
         self.sfm_pair_lists.append(pair_list)
         self.call_log.append(
             f"sfm_run:{image_dir}:{len(pair_list) if pair_list else 0}")
         return super().sfm_run(image_dir=image_dir, pair_list=pair_list,
-                               output_dir=output_dir)
+                               output_dir=output_dir, session=session)
 
     def inspect(self, recon_dir: str) -> dict[str, Any]:
         self.call_log.append(f"inspect:{recon_dir}")

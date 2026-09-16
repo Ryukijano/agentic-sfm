@@ -41,7 +41,9 @@ reward:
   registration_weight: 0.5   # fraction of images registered
   pose_weight: 1.0           # mean pose error (1 - err/20)
   split_penalty: 0.5         # penalty when 0 images registered
-  doppelganger_weight: 0.3   # reward for filtering doppelgangers
+  doppelganger_weight: 0.0   # DISABLED: self-certified bonus (+0.3 for flagging
+                           # any pair, no GT labels) was reward-hackable; recon
+                           # quality already rewards correct exclusions
   # Accumulative tool reward (replaces per-call penalty)
   tool_cost: 0.0             # legacy (disabled)
   accumulative_tool_coef: 0.1

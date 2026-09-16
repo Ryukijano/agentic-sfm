@@ -66,7 +66,7 @@ class TestAgentMatchesImport:
         # populate match store for a chain
         for i in range(3):
             pa, pb = S._image_registry[f"im{i}"], S._image_registry[f"im{i+1}"]
-            S._match_store[tuple(sorted((pa, pb)))] = _record(pa, pb)
+            S._record_agent_match(pa, pb, _record(pa, pb))
         dbp = os.path.join(d, "m.db")
         n = S._import_agent_matches(dbp, d, None)
         assert n == 3
@@ -80,7 +80,7 @@ class TestAgentMatchesImport:
         d, names = scene
         for i in range(3):
             pa, pb = S._image_registry[f"im{i}"], S._image_registry[f"im{i+1}"]
-            S._match_store[tuple(sorted((pa, pb)))] = _record(pa, pb)
+            S._record_agent_match(pa, pb, _record(pa, pb))
         dbp = os.path.join(d, "m2.db")
         # only request im0-im1 → only that pair imported
         n = S._import_agent_matches(dbp, d, [["im0", "im1"]])
@@ -89,14 +89,14 @@ class TestAgentMatchesImport:
     def test_sub8_pairs_not_written(self, scene):
         d, names = scene
         pa, pb = S._image_registry["im0"], S._image_registry["im1"]
-        S._match_store[tuple(sorted((pa, pb)))] = _record(pa, pb, n=5, inliers=5)
+        S._record_agent_match(pa, pb, _record(pa, pb, n=5, inliers=5))
         assert S._import_agent_matches(os.path.join(d, "m3.db"), d, None) == 0
 
     def test_record_agent_match_populates_store(self, scene):
         d, _ = scene
         a, b = "/abs/x.jpg", "/abs/y.jpg"
         S._record_agent_match(a, b, {"keypoints_a": [[1, 2]], "keypoints_b": [[3, 4]], "inlier_mask": [True]})
-        assert tuple(sorted((a, b))) in S._match_store
+        assert tuple(sorted((a, b))) in S._match_store[S._DEFAULT_SESSION]
         # no keypoints → not cached
         S._match_store.clear()
         S._record_agent_match(a, b, {"num_inliers": 3})

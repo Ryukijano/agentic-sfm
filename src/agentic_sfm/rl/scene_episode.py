@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -119,8 +120,6 @@ def _inject_pose_error(
     """
     recon = ep.recon_result
     if not isinstance(recon, dict) or recon.get("error"):
-        return
-    if recon.get("mean_pose_error_deg") is not None:
         return
     if not gt_recon or not gt_recon.get("poses"):
         return
@@ -262,6 +261,12 @@ class SceneRolloutEpisode:
     # Ground truth
     gt_recon: dict[str, Any] | None = None
 
+    # True for injected S-GRPO oracle trajectories (excluded from media picks).
+    is_oracle: bool = False
+    # Unique per-episode id — scopes the server's match store so sibling
+    # rollouts / earlier epochs can't subsidize this episode's sfm_run.
+    session_id: str = ""
+
 
 def run_scene_episode(
     agent: Any,
@@ -288,6 +293,7 @@ def run_scene_episode(
         num_images=len(image_paths),
         gt_recon=gt_recon,
     )
+    ep.session_id = f"{scene_id}-{uuid.uuid4().hex[:8]}"
 
     # Register all images with the tool server
     registered_ids: dict[str, str] = {}  # path -> server_id
@@ -368,14 +374,19 @@ def run_scene_episode(
             ep.done = True
             continue
 
-        # Execute the tool
-        result = _execute_scene_tool(
-            tool_client, tc, registered_ids, ep,
-            overlap_matrix=overlap_matrix,
-            image_indices=image_indices,
-        )
+        # Execute the tool — never let an HTTP error kill the whole run.
+        try:
+            result = _execute_scene_tool(
+                tool_client, tc, registered_ids, ep,
+                overlap_matrix=overlap_matrix,
+                image_indices=image_indices,
+            )
+        except Exception as exc:
+            result = {"error": str(exc)}
         ep.results.append(result)
-        num_valid_calls += 1
+        # Errored calls are not "valid" — else rejection is reward-invisible.
+        if not (isinstance(result, dict) and result.get("error")):
+            num_valid_calls += 1
 
         # Track pair-level matches for keep_best_match
         if tc.tool in ("match", "crop_and_match") and not result.get("error"):
@@ -505,6 +516,8 @@ def run_scene_oracle_episode(
     )
 
     # Register images
+    ep.session_id = f"{scene_id}-oracle-{uuid.uuid4().hex[:8]}"
+
     registered_ids: dict[str, str] = {}
     for i, path in enumerate(image_paths):
         img_id = f"img_{i:04d}"
@@ -566,7 +579,11 @@ def run_scene_oracle_episode(
         response = json.dumps({"tool": "match", "args": tc.args})
         oracle_responses.append(response)
         try:
-            result = execute_sfm_tool(tool_client, tc, {"matcher": getattr(agent, "matcher", DEFAULT_MATCHER)})
+            result = execute_sfm_tool(
+                tool_client, tc,
+                {"matcher": getattr(agent, "matcher", DEFAULT_MATCHER)},
+                session=ep.session_id,
+            )
             oracle_results.append(result)
             if not result.get("error"):
                 kept = keep_best_match(best_match, result)
@@ -588,7 +605,9 @@ def run_scene_oracle_episode(
             image_dir = str(image_root)
         else:
             image_dir = ""
-        recon_result = tool_client.sfm_run(image_dir=image_dir)
+        recon_result = tool_client.sfm_run(
+            image_dir=image_dir, session=ep.session_id
+        )
         oracle_results.append(recon_result)
     except Exception as e:
         recon_result = {"error": str(e), "num_registered": 0}
@@ -646,9 +665,15 @@ def run_scene_oracle_episode(
         use_ntep_rewards=agent_reward_cfg.get("use_ntep_rewards", False),
     )
     ep.reward = ep.reward_components["total_reward"]
+    ep.is_oracle = True
 
-    # Guarantee oracle reward > failed group max
-    if ep.reward <= failed_group_max_reward:
+    # Guarantee oracle reward > failed group max — but only when the oracle
+    # actually produced a reconstruction. Otherwise the floor pays positive
+    # advantage for imitating a trajectory that built nothing.
+    oracle_has_geometry = bool(
+        ep.recon_result and (ep.recon_result.get("num_registered") or 0) > 0
+    )
+    if oracle_has_geometry and ep.reward <= failed_group_max_reward:
         ep.reward = failed_group_max_reward + 0.1
         ep.reward_components["oracle_floor_boost"] = ep.reward - ep.reward_components["total_reward"]
 
@@ -690,7 +715,9 @@ def _execute_scene_tool(
         else:
             image_dir = ""
         pair_list, n_present, n_filtered = _sfm_pair_list(ep, registered_ids)
-        result = tool_client.sfm_run(image_dir=image_dir, pair_list=pair_list)
+        result = tool_client.sfm_run(
+            image_dir=image_dir, pair_list=pair_list, session=ep.session_id
+        )
         if isinstance(result, dict):
             result.setdefault("num_doppelgangers_present", n_present)
             result.setdefault("num_doppelgangers_filtered", n_filtered)
@@ -702,5 +729,6 @@ def _execute_scene_tool(
             return {"error": "No reconstruction to inspect"}
         return tool_client.inspect(recon_dir)
 
-    # Pair-level tools: delegate to execute_sfm_tool
-    return execute_sfm_tool(tool_client, tc)
+    # Pair-level tools: delegate to execute_sfm_tool (session-scoped so the
+    # server match cache only credits this episode's own matches)
+    return execute_sfm_tool(tool_client, tc, session=ep.session_id)
