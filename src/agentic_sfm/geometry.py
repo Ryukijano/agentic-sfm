@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -142,6 +143,33 @@ def match_quality(result: dict[str, Any] | None) -> float:
 
 
 # Heuristic overlap boxes for oracle SFT (normalized [x1,y1,x2,y2]).
+# Reward-side crop validity floor — mirrors the tool server's rejection rule
+# (tools_server/server.py MIN_CROP_FRACTION) so the reward treats the same
+# boxes as invalid that the server rejects. Reward- and tool-side must agree,
+# otherwise a "least-bad" degenerate trajectory can still outscore its group.
+MIN_CROP_FRACTION = 0.25
+
+
+def is_semantically_valid_bbox(bbox: Any, min_fraction: float = MIN_CROP_FRACTION) -> bool:
+    """True iff bbox is a parseable, normalized, non-degenerate, large-enough box."""
+    try:
+        vals = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return False
+    if len(vals) != 4:
+        return False
+    if not all(math.isfinite(v) for v in vals):
+        return False
+    if not all(0.0 <= v <= 1.0 for v in vals):
+        return False
+    x1, y1, x2, y2 = vals
+    if not (x2 > x1 and y2 > y1):
+        return False
+    if min(x2 - x1, y2 - y1) < min_fraction:
+        return False
+    return True
+
+
 ORACLE_CROP_BOXES: list[list[float]] = [
     [0.15, 0.15, 0.85, 0.85],
     [0.00, 0.00, 0.70, 0.70],

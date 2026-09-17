@@ -112,17 +112,90 @@ class TestRewards:
         assert reward["total_reward"] > -1.0
 
     def test_pair_reward_empty_match_still_has_format(self):
+        # Binary format reward: partial validity gets NOTHING (a rejected call
+        # must not earn format credit, or the degenerate mode stays alive).
         reward = compute_pair_reward(
             {}, gt_pose=None, num_tool_calls=2, num_valid_calls=1, num_invalid_calls=1
         )
         assert reward["pose_reward"] == 0.0
-        assert reward["format_reward"] > 0
+        assert reward["format_reward"] == 0.0
         assert reward["invalid_penalty"] < 0
         assert abs(reward["total_reward"] - (
             reward["format_reward"] + reward["invalid_penalty"]
             + reward["inlier_reward"] + reward["pose_reward"] + reward["tool_cost"]
-            + reward["accumulative_tool_reward"]
+            + reward["accumulative_tool_reward"] + reward["first_call_validity_reward"]
         )) < 1e-6
+
+    def test_format_reward_binary_all_valid(self):
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=3, num_valid_calls=3
+        )
+        assert reward["format_reward"] == pytest.approx(0.1)
+
+    def test_format_reward_binary_any_invalid(self):
+        reward = compute_pair_reward(
+            {}, gt_pose=None, num_tool_calls=3, num_valid_calls=2, num_invalid_calls=1
+        )
+        assert reward["format_reward"] == 0.0
+
+    def test_first_call_valid_gets_bonus(self):
+        from agentic_sfm.agent.policy import ToolCall
+
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.3, 0.8, 0.9],
+                            "image_b": "b", "matcher": "loftr"})
+        result = {"num_inliers": 5, "inlier_ratio": 0.1}
+        reward = compute_pair_reward(
+            result, gt_pose=None, num_tool_calls=1, num_valid_calls=1,
+            tool_calls=[tc], tool_results=[result],
+        )
+        assert reward["first_call_validity_reward"] == pytest.approx(0.5)
+        assert reward["validity_gated"] is False
+
+    def test_first_call_degenerate_gates_geometry(self):
+        """A rejected/degenerate first call must zero ALL geometry reward."""
+        from agentic_sfm.agent.policy import ToolCall
+
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.2, 0.3, 0.3],
+                            "image_b": "b", "matcher": "loftr"})
+        # Even a *perfect* match result cannot rescue a degenerate first crop.
+        good_match = {"num_inliers": 200, "inlier_ratio": 0.9,
+                      "pose": {"R": np.eye(3).tolist(), "t": [0, 0, 1]}}
+        gt_pose = {"R": np.eye(3).tolist(), "t": [0, 0, 1]}
+        reward = compute_pair_reward(
+            good_match, gt_pose, num_tool_calls=1, num_valid_calls=0, num_invalid_calls=1,
+            tool_calls=[tc], tool_results=[{"error": "degenerate bbox"}],
+        )
+        assert reward["first_call_validity_reward"] == pytest.approx(-1.0)
+        assert reward["validity_gated"] is True
+        assert reward["pose_reward"] == 0.0
+        assert reward["inlier_reward"] == 0.0
+        assert reward["accumulative_tool_reward"] == 0.0
+        assert reward["format_reward"] == 0.0
+
+    def test_first_call_error_gates_geometry(self):
+        from agentic_sfm.agent.policy import ToolCall
+
+        tc = ToolCall(tool="match", args={"image_a": "a", "image_b": "b"})
+        reward = compute_pair_reward(
+            {"num_inliers": 50, "inlier_ratio": 0.5}, gt_pose=None,
+            num_tool_calls=1, num_valid_calls=0, num_invalid_calls=1,
+            tool_calls=[tc], tool_results=[{"error": "server rejected"}],
+        )
+        assert reward["first_call_validity_reward"] == pytest.approx(-1.0)
+        assert reward["validity_gated"] is True
+        assert reward["inlier_reward"] == 0.0
+
+    def test_bbox_validity_checker(self):
+        from agentic_sfm.geometry import is_semantically_valid_bbox
+
+        assert is_semantically_valid_bbox([0.2, 0.3, 0.8, 0.9])
+        assert not is_semantically_valid_bbox([0.2, 0.2, 0.3, 0.3])  # too small
+        assert not is_semantically_valid_bbox([0.2, 0.3, 0.2, 0.3])  # zero width
+        assert not is_semantically_valid_bbox([0.2, 0.3, 0.8, 937])  # pixel units
+        assert not is_semantically_valid_bbox([0.2, 0.3, 0.8])       # 3 values
+        assert not is_semantically_valid_bbox("nonsense")
 
     def test_pair_reward_ignores_unknown_kwargs(self):
         match_result = {"num_inliers": 10, "inlier_ratio": 0.2}
@@ -164,7 +237,7 @@ class TestRewards:
             reward["format_reward"] + reward["invalid_penalty"]
             + reward["inlier_reward"] + reward["pose_reward"] + reward["tool_cost"]
             + reward["accumulative_tool_reward"] + reward["ntep_intent_reward"]
-            + reward["ntep_redundancy_penalty"]
+            + reward["ntep_redundancy_penalty"] + reward["first_call_validity_reward"]
         )
 
     def test_ntep_intent_requires_nonerror_result(self):

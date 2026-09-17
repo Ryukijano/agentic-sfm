@@ -44,6 +44,8 @@ REWARD_TOTAL_KEYS = (
     # NTEP process rewards (arXiv 2609.03493) — 0 unless use_ntep_rewards=True
     "ntep_intent_reward",
     "ntep_redundancy_penalty",
+    # First-call validity gate — the policy's most controllable decision
+    "first_call_validity_reward",
 )
 
 

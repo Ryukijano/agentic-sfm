@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Hashable
 import numpy as np
 
 from agentic_sfm.constants import REWARD_TOTAL_KEYS
+from agentic_sfm.geometry import is_semantically_valid_bbox
 
 if TYPE_CHECKING:
     from agentic_sfm.agent.policy import ToolCall
@@ -174,6 +175,30 @@ def _ntep_intent_satisfied(tool: str, args: dict[str, Any], result: Any) -> bool
     return False
 
 
+def _first_call_validity(
+    tool_calls: list[ToolCall] | None,
+    tool_results: list[dict[str, Any]] | None,
+) -> tuple[bool | None, int]:
+    """Validity of the FIRST non-done tool call: (is_valid | None, n_rejected).
+
+    ``None`` means "unknown" (no calls / no results — e.g. legacy callers),
+    ``True`` = accepted and (if it carries a bbox) semantically valid,
+    ``False`` = rejected by the server or carrying a degenerate/tiny bbox.
+    """
+    if not tool_calls or not tool_results:
+        return None, 0
+    tc = tool_calls[0]
+    if getattr(tc, "tool", None) in (None, "done"):
+        return None, 0
+    res = tool_results[0] if tool_results else {}
+    if isinstance(res, dict) and res.get("error"):
+        return False, 1
+    bbox = (getattr(tc, "args", None) or {}).get("bbox")
+    if bbox is not None and not is_semantically_valid_bbox(bbox):
+        return False, 1
+    return True, 0
+
+
 def _ntep_process_reward_counts(
     tool_calls: list[ToolCall],
     tool_results: list[dict[str, Any]] | None,
@@ -241,6 +266,14 @@ def compute_pair_reward(
     ntep_intent_coef: float = 0.05,
     ntep_redundancy_penalty: float = 0.05,
     use_ntep_rewards: bool = False,
+    # First-call validity gate: the policy's most controllable decision is its
+    # FIRST tool call. Reward an accepted, non-degenerate first call and make a
+    # rejected one expensive, then gate all geometry reward behind it. This
+    # kills the "least-bad-wins" trap where a degenerate trajectory outscores
+    # its all-failed group by a hair and gets reinforced.
+    first_call_validity_weight: float = 0.5,
+    first_call_invalid_penalty: float = 1.0,
+    gate_geometry_on_validity: bool = True,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a pair-level matching episode.
@@ -265,10 +298,21 @@ def compute_pair_reward(
     """
     components: dict[str, Any] = {}
 
-    if num_tool_calls > 0:
-        components["format_reward"] = format_weight * (
-            num_valid_calls / max(num_tool_calls, 1)
-        )
+    # First-call validity: the one decision the policy fully controls.
+    first_valid, _ = _first_call_validity(tool_calls, tool_results)
+    validity_known = first_valid is not None
+    if first_valid is True:
+        components["first_call_validity_reward"] = first_call_validity_weight
+    elif first_valid is False:
+        components["first_call_validity_reward"] = -first_call_invalid_penalty
+    else:
+        components["first_call_validity_reward"] = 0.0
+
+    # Binary format reward: all calls accepted (no rejection) or nothing.
+    # Partial credit for parseable-but-rejected calls let the degenerate mode
+    # stay alive — a rejected call is an invalid call, full stop.
+    if num_tool_calls > 0 and num_valid_calls >= num_tool_calls:
+        components["format_reward"] = format_weight
     else:
         components["format_reward"] = 0.0
 
@@ -316,6 +360,19 @@ def compute_pair_reward(
     else:
         components["ntep_intent_reward"] = 0.0
         components["ntep_redundancy_penalty"] = 0.0
+
+    # Validity gate: if the first call was rejected/degenerate, the episode
+    # never earned the right to geometry reward. Without this, a rejected-first
+    # trajectory can still "hedge" with a later full-frame match and collect
+    # pose/inlier reward, making rejection cheap.
+    if gate_geometry_on_validity and first_valid is False:
+        components["inlier_reward"] = 0.0
+        components["pose_reward"] = 0.0
+        components["accumulative_tool_reward"] = 0.0
+        components["tool_cost"] = 0.0
+        components["validity_gated"] = True
+    else:
+        components["validity_gated"] = False
 
     components["total_reward"] = float(
         sum(float(components[k]) for k in REWARD_TOTAL_KEYS if k in components)

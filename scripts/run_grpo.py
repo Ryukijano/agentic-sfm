@@ -109,6 +109,7 @@ class VLLMRolloutAgent:
 
     def __init__(self, vllm_url: str, model_name: str, max_new_tokens: int = 512,
                  max_tool_calls: int = 10, temperature: float = 1.0, top_p: float = 0.95,
+                 min_p: float = 0.05, top_k: int = 50,
                  pose_weight: float = 1.0, inlier_weight: float = 0.1,
                  tool_cost: float = 0.02, format_weight: float = 0.1,
                  invalid_penalty: float = 0.2, reward_schedule: str = "static",
@@ -126,6 +127,8 @@ class VLLMRolloutAgent:
         self.max_tool_calls = max_tool_calls
         self.temperature = temperature
         self.top_p = top_p
+        self.min_p = min_p
+        self.top_k = top_k
         # Reward config (needed in run_episode)
         self.pose_weight = pose_weight
         self.inlier_weight = inlier_weight
@@ -195,27 +198,31 @@ class VLLMRolloutAgent:
             else:
                 oai_messages.append(msg)
 
+        sampling_kwargs = {}
+        if self.min_p is not None:
+            sampling_kwargs["min_p"] = self.min_p
+        if self.top_k is not None:
+            sampling_kwargs["top_k"] = self.top_k
+
+        def _create():
+            return client.chat.completions.create(
+                model=self.vllm_model,
+                messages=oai_messages,
+                max_tokens=self.max_new_tokens,
+                temperature=temp,
+                top_p=self.top_p,
+                n=n,
+                logprobs=True,
+                **sampling_kwargs,
+            )
+
         try:
             try:
-                resp = client.chat.completions.create(
-                    model=self.vllm_model,
-                    messages=oai_messages,
-                    max_tokens=self.max_new_tokens,
-                    temperature=temp,
-                    top_p=self.top_p,
-                    n=n,
-                    logprobs=True,
-                )
+                resp = _create()
             except TypeError:
-                resp = client.chat.completions.create(
-                    model=self.vllm_model,
-                    messages=oai_messages,
-                    max_tokens=self.max_new_tokens,
-                    temperature=temp,
-                    top_p=self.top_p,
-                    n=n,
-                    logprobs=True,
-                )
+                # Older vLLM without min_p/top_k — retry without the extras.
+                sampling_kwargs.clear()
+                resp = _create()
             texts = []
             all_logprobs = []
             for choice in resp.choices:
@@ -595,7 +602,24 @@ class GRPOTrainer:
         self.use_ntep_rewards = config.get("reward", {}).get("use_ntep_rewards", False)
         # S-GRPO: Conditional Ground-Truth Trajectory Injection
         self.sgrpo_cgi = config.get("rl", {}).get("sgrpo_cgi", True)
+        # KL penalty to the frozen SFT reference (anchors the policy to the
+        # distribution that writes clean tool JSON). 0 disables.
+        self.kl_coef = config.get("training", {}).get("kl_coef", 0.0)
+        # μ-GRPO off-support veto: for negative advantages, skip tokens the
+        # policy already finds implausible (old_logp < threshold). None disables.
+        self.off_support_threshold = config.get("training", {}).get("off_support_threshold")
+        # On-policy rollouts: hot-reload the LoRA into vLLM after every global
+        # step so rollouts track the policy instead of lagging a whole epoch.
+        self.on_policy_reload = config.get("training", {}).get("on_policy_reload", False)
+        # Where to stage the per-step LoRA snapshots (fast local storage).
+        # Empty -> /dev/shm (node-local RAM).
+        self.lora_staging_dir = config.get("training", {}).get("lora_staging_dir", "")
+        # Rollout sampling hardening — cut the long tail that seeds repetition.
+        self.min_p = config.get("rollout", {}).get("min_p", 0.05)
+        self.top_k = config.get("rollout", {}).get("top_k", 50)
         self._global_step = 0
+        self._ref_model = None
+        self._adapter_version = 0
 
         self.curriculum_stages = config.get("curriculum", {}).get("stages", [])
 
@@ -692,6 +716,22 @@ class GRPOTrainer:
         trainable = [p for p in self._model.parameters() if p.requires_grad]
         self._optimizer = torch.optim.AdamW(trainable, lr=self.lr, weight_decay=self.config["training"]["weight_decay"])
         logger.info("Training model ready with LoRA.")
+
+        # Frozen SFT reference for the KL anchor: the same warm-start adapter
+        # the policy began from. Prevents the policy drifting into the
+        # degenerate/repetitive modes RL without any anchor discovers.
+        if self.kl_coef > 0 and self.sft_adapter and os.path.isdir(self.sft_adapter):
+            try:
+                from peft import PeftModel
+                ref = PeftModel.from_pretrained(self._model.get_base_model(), self.sft_adapter, is_trainable=False)
+                ref.eval()
+                for p in ref.parameters():
+                    p.requires_grad = False
+                self._ref_model = ref
+                logger.info(f"Reference (KL anchor) model loaded from {self.sft_adapter}")
+            except Exception as e:
+                logger.warning(f"Reference model load failed — KL disabled: {e}")
+                self._ref_model = None
 
     def get_curriculum_difficulties(self, epoch: int) -> list[str]:
         if not self.curriculum_stages:
@@ -931,13 +971,18 @@ class GRPOTrainer:
         return out, used or images[:2]
 
     def compute_logprobs(self, episodes: list[RolloutEpisode], 
-                          requires_grad: bool = False) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Compute per-episode (token_logps, assistant_mask) under current LoRA policy.
-        
+                          requires_grad: bool = False,
+                          model: torch.nn.Module | None = None) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Compute per-episode (token_logps, assistant_mask) under a LoRA policy.
+
+        ``model`` defaults to the current trainable model; pass ``self._ref_model``
+        to score the same episodes under the frozen SFT reference for the KL term.
         Returns list of (per_token_logps_tensor, mask_bool_tensor) for each episode.
         Only assistant token positions are masked True.
         """
-        self._load_training_model()
+        if model is None:
+            self._load_training_model()
+            model = self._model
         results = []
 
         for ep in episodes:
@@ -962,7 +1007,7 @@ class GRPOTrainer:
 
                 ctx_manager = torch.enable_grad() if requires_grad else torch.no_grad()
                 with ctx_manager:
-                    outputs = self._model(**inputs)
+                    outputs = model(**inputs)
 
                 logits = outputs.logits[:, :-1, :]
                 target_ids = inputs["input_ids"][:, 1:]
@@ -1075,6 +1120,12 @@ class GRPOTrainer:
         self._load_training_model()
         self._model.eval()
         old_results = self.compute_logprobs(episodes, requires_grad=False)
+        # Reference (SFT) logprobs for the KL anchor — frozen, no grad.
+        ref_results = None
+        if self.kl_coef > 0 and self._ref_model is not None:
+            ref_results = self.compute_logprobs(
+                episodes, requires_grad=False, model=self._ref_model
+            )
         self._model.train()
 
         total_loss = 0.0  # Python float accumulator — avoids holding GPU tensors across episodes
@@ -1107,10 +1158,40 @@ class GRPOTrainer:
 
                 new_tok = new_logps[:n][mask].to(torch.float32)
                 old_tok = old_logps[:n][mask].to(torch.float32).detach()
+
+                # μ-GRPO off-support veto: with a negative advantage, do not
+                # keep pushing down tokens the policy already finds implausible
+                # (old_logp very negative) — that pressure is what shoves the
+                # model into narrow degenerate modes.
+                keep = None
+                if adv < 0 and self.off_support_threshold is not None:
+                    keep = old_tok >= self.off_support_threshold
+                    if int(keep.sum()) == 0:
+                        continue
+                    new_tok = new_tok[keep]
+                    old_tok = old_tok[keep]
+
                 ratio = torch.exp(new_tok - old_tok)
                 clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high)
                 adv_tensor = torch.tensor(adv, device=ratio.device, dtype=ratio.dtype)
                 loss = -torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor).mean()
+
+                # KL(pi_theta || pi_SFT) per token (k3 estimator, >= 0). Anchors
+                # the policy to the distribution that writes clean tool JSON so
+                # RL cannot drift into degenerate/repetitive modes. The same
+                # veto subset is applied to the reference tokens so all three
+                # sequences stay aligned.
+                if ref_results is not None:
+                    ref_logps, ref_mask = ref_results[i]
+                    if ref_logps.ndim > 0 and ref_mask.numel() > 0:
+                        nr = min(ref_logps.shape[0], ref_mask.shape[0])
+                        ref_full = ref_logps[:nr][ref_mask[:nr]].to(torch.float32).detach()
+                        if keep is not None:
+                            ref_full = ref_full[: keep.shape[0]][keep]
+                        k = min(new_tok.shape[0], ref_full.shape[0])
+                        if k > 0:
+                            kl = torch.exp(ref_full[:k] - new_tok[:k]) - (ref_full[:k] - new_tok[:k]) - 1.0
+                            loss = loss + self.kl_coef * kl.mean()
 
                 # Scale by 1/grad_accum for gradient accumulation
                 loss = loss / self.grad_accum
@@ -1131,6 +1212,13 @@ class GRPOTrainer:
                     self.max_grad_norm,
                 )
                 self._optimizer.step()
+                # On-policy rollouts: push the fresh LoRA into vLLM NOW so the
+                # next batch samples the policy that just updated — not a
+                # one-epoch-stale snapshot. This is what makes the 0.399-style
+                # measurement artifact impossible: the measured policy IS the
+                # trained policy.
+                if self.on_policy_reload:
+                    self._push_policy_to_vllm(rollout_agent)
             # Always clear grads at the window boundary — a skipped step must
             # not leak accumulated grads into the next window.
             self._optimizer.zero_grad(set_to_none=True)
@@ -1138,6 +1226,26 @@ class GRPOTrainer:
         if is_last_accum:
             self._model.eval()
         return stats
+
+    def _push_policy_to_vllm(self, rollout_agent: VLLMRolloutAgent) -> None:
+        """Save the current LoRA to fast local storage and hot-reload vLLM.
+
+        Uses a unique adapter name per push + a prefix/encoder cache flush so
+        vLLM cannot serve stale KV blocks from a same-name reload (vLLM #42125,
+        #44939). Staging on /dev/shm keeps the per-step write off Lustre.
+        """
+        if self._model is None:
+            return
+        staging = self.lora_staging_dir or "/dev/shm"
+        ckpt_dir = Path(staging) / "agentic-sfm-live"
+        try:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            self._model.save_pretrained(str(ckpt_dir))
+        except Exception as e:
+            logger.warning(f"Per-step LoRA staging failed (staying on last adapter): {e}")
+            return
+        self._adapter_version += 1
+        self._reload_vllm_lora(ckpt_dir, rollout_agent, version=self._adapter_version)
 
     def _log_qualitative_media(self, step: int, tag: str = "qual") -> None:
         """Render the best episode's match figure + log to wandb.
@@ -1209,12 +1317,20 @@ class GRPOTrainer:
         else:
             logger.warning("  No model loaded — skipping checkpoint save.")
 
-    def _reload_vllm_lora(self, ckpt_path: Path, rollout_agent: VLLMRolloutAgent) -> None:
-        """Hot-load the latest LoRA into vLLM so the next rollouts are on-policy."""
+    def _reload_vllm_lora(self, ckpt_path: Path, rollout_agent: VLLMRolloutAgent,
+                          version: int | None = None) -> None:
+        """Hot-load the latest LoRA into vLLM so the next rollouts are on-policy.
+
+        Each load uses a UNIQUE adapter name and flushes the prefix/encoder
+        caches afterwards — a same-name reload can reuse stale KV blocks
+        (vLLM #42125, #44939) and silently serve the previous policy.
+        """
         import urllib.error
         import urllib.request
 
-        adapter = "agentic-sfm-policy"
+        if version is None:
+            version = getattr(self, "_adapter_version", 0)
+        adapter = f"agentic-sfm-policy-v{version}"
         base = rollout_agent.vllm_url.rstrip("/")
         headers = {
             "Content-Type": "application/json",
@@ -1232,12 +1348,6 @@ class GRPOTrainer:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp.read()
 
-        if rollout_agent._lora_loaded:
-            try:
-                _post("/v1/unload_lora_adapter", {"lora_name": adapter}, timeout=60)
-            except Exception as e:
-                logger.warning(f"vLLM unload LoRA ({adapter}): {e}")
-
         try:
             _post("/v1/load_lora_adapter", {"lora_name": adapter, "lora_path": path})
             rollout_agent.vllm_model = adapter
@@ -1245,6 +1355,14 @@ class GRPOTrainer:
             logger.info(f"vLLM serving LoRA adapter {adapter} from {path}")
         except Exception as e:
             logger.warning(f"vLLM load LoRA failed (rollouts stay on {rollout_agent.vllm_model}): {e}")
+            return
+
+        # A reloaded adapter must not reuse KV blocks from the previous policy.
+        for route in ("/v1/reset_prefix_cache", "/v1/reset_encoder_cache"):
+            try:
+                _post(route, {}, timeout=60)
+            except Exception as e:
+                logger.debug(f"vLLM {route} failed (non-fatal): {e}")
 
     def train(self):
         """Main GRPO training loop with gradient accumulation."""
@@ -1256,6 +1374,8 @@ class GRPOTrainer:
             max_tool_calls=self.max_tool_calls,
             temperature=self.temperature,
             top_p=self.top_p,
+            min_p=self.min_p,
+            top_k=self.top_k,
             pose_weight=self.pose_weight,
             inlier_weight=self.inlier_weight,
             tool_cost=self.tool_cost,

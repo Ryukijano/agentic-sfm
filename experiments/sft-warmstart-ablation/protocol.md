@@ -80,3 +80,28 @@ estimated from run A) are declared a screen tie and promoted to seeded runs.
 
 - [x] Checklist complete (2026-09-16): primary outcome fixed, conditions
       fixed, data snapshot hashed, stopping rules set.
+
+## Findings update (2026-09-17) — the trained adapters were degenerate all along
+
+Offline verification (HF+PEFT, real images, rollout sampling settings) proved:
+
+- `outputs/phase1/checkpoints/best` (the "0.399" epoch-1 adapter): **6/6 samples
+  degenerate** — tiny/degenerate bboxes, duplicated JSON keys, leaked args,
+  chat-template markers, token repetition.
+- `outputs/sft/checkpoints/epoch_5`: **clean tool JSON with valid bboxes**.
+
+Mechanism (4 independent literature reviews + code audit):
+1. The GRPO importance ratio was vacuous (`old`/`new` logprobs both computed
+   under the current model at the same instant -> ratio ~= 1 -> clip dead).
+2. Rollouts lagged the policy by a full epoch (vLLM reloaded only at epoch
+   end), so the epoch-1 "0.399" measured the SFT policy, not the trained one.
+3. No KL anchor let the policy drift into degenerate/repetitive modes.
+4. "Least-bad-wins": degenerate tokens were exclusive to the least-bad group
+   winner, while clean-box tokens had their gradient cancelled by appearing
+   in both failed episodes and the CGI oracle.
+
+Consequently the SFT-vs-RL ablation is now framed as: **SFT epoch_5 is the
+policy anchor (KL reference + warm start)**, and the ablation's remaining
+question is how fast/stable RL can move away from it with the new stabilizers
+(on-policy reload, KL coef, off-support veto, first-call validity gate,
+binary format reward, NTEP redundancy penalty, min-p/top-k sampling).

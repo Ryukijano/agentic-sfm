@@ -4,12 +4,11 @@
 model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
-  # Warm start = Phase-1 epoch-1 adapter (mean reward 0.399). Epoch 2 was
-  # cancelled mid-flight after the policy drifted into tiny/degenerate crop
-  # boxes, so no epoch-2 checkpoint was written — best/ and latest/ are both
-  # this clean 0.399 adapter. The drift is now blocked by the crop floor and
-  # the identical-call repeat breaker.
-  sft_adapter: "outputs/phase1/checkpoints/best"
+  # Warm start = SFT epoch_5, the ONLY adapter proven to generate clean tool
+  # JSON (verified offline: 6/6 clean; the trained phase1 "best" is 6/6
+  # degenerate). The trained adapter was RL-degenerate all along — see
+  # experiments/sft-warmstart-ablation/protocol.md and the KL/on-policy fixes.
+  sft_adapter: "outputs/sft/checkpoints/epoch_5"
   lora:
     rank: 32
     alpha: 64
@@ -46,13 +45,21 @@ reward:
   tool_cost: 0.0          # legacy per-call penalty (disabled — set to 0)
   accumulative_tool_coef: 0.1  # reward productive tool calls only when pose is correct
   use_accumulative_tool_reward: true
-  format_weight: 0.1      # format compliance (valid JSON tool calls)
+  format_weight: 0.1      # BINARY: 1.0 only if every call accepted, else 0
   invalid_penalty: 0.2    # per-invalid-call penalty
+  # First-call validity gate: the policy's most controllable decision.
+  # A rejected/degenerate FIRST call is catastrophically expensive and gates
+  # off all geometry reward — kills the "least-bad-wins" degenerate trap.
+  first_call_validity_weight: 0.5
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
   pose_auc_thresholds: [5, 10, 20]  # degrees
-  # NTEP process rewards (arXiv 2609.03493) — Phase 2 opt-in:
-  # use_ntep_rewards: false       # per-call intent-evidence alignment + non-repeated-goal penalty
-  # ntep_intent_coef: 0.05        # +coef per call with aligned intent & non-error result
-  # ntep_redundancy_penalty: 0.05 # -penalty per call revisiting a prior evidence goal
+  # NTEP process rewards (arXiv 2609.03493): per-call intent alignment +
+  # non-repeated-goal penalty. On now — penalizes the "slightly different
+  # tiny box" alternation that the identical-call breaker cannot catch.
+  use_ntep_rewards: true
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
 
 curriculum:
   enabled: true
@@ -74,6 +81,18 @@ training:
   save_freq: 5           # save checkpoint every N epochs
   eval_freq: 5
   log_freq: 10
+  # KL(pi || pi_SFT) per-token penalty (k3 estimator). Anchors the policy to
+  # the SFT distribution that writes clean tool JSON; the trained policy
+  # previously drifted degenerate because nothing held it near SFT.
+  kl_coef: 0.03
+  # mu-GRPO off-support veto: for negative advantages, skip tokens whose
+  # old-policy logp is below this (they are already implausible — suppressing
+  # them further is what shoves the policy into narrow degenerate modes).
+  off_support_threshold: -9.0
+  # On-policy rollouts: hot-reload the LoRA into vLLM after every global step
+  # (staged on /dev/shm) so the measured policy IS the trained policy.
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"
 
 rollout:
   # GPU allocation on 3x L40S
@@ -84,6 +103,10 @@ rollout:
   tool_server_port: 8765
   num_rollout_workers: 4  # CPU workers for tool execution
   batch_size: 4           # pairs per batch
+  # Sampling hardening: cut the long token tail that seeds repetition loops
+  # in a 2B model (the "0.1, 0.2, 0.1, 0.8" fragments came from tail tokens).
+  min_p: 0.05
+  top_k: 50
 
 data:
   train_pairs: "data/hard_pairs_train.json"
@@ -96,4 +119,4 @@ output:
   log_dir: "logs/phase1"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase1-grpo-qwen35-2b-r2"  # r2: crop floor + repeat breaker
+  wandb_run_name: "phase1-grpo-qwen35-2b-r3"  # r3: on-policy reload + KL anchor + validity gate
