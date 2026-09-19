@@ -676,3 +676,65 @@ class TestPolicyDefaults:
             ToolCall(tool="match", args={"image_a": "img_a", "image_b": "img_b"}),
         )
         assert result["matcher"] == "loftr"
+
+
+class TestFormatRewardDoneExclusion:
+    def test_clean_episode_with_done_gets_format(self):
+        """num_tool_calls includes `done` (no result) — it must not block the
+        binary format reward for an otherwise clean episode."""
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.0, 0.8, 1.0],
+                            "image_b": "b", "matcher": "loftr"})
+        done = ToolCall(tool="done", args={})
+        result = {"num_inliers": 40, "inlier_ratio": 0.5}
+        reward = compute_pair_reward(
+            result, gt_pose=None,
+            num_tool_calls=2, num_valid_calls=1,  # crop + done, one result
+            tool_calls=[tc, done], tool_results=[result],
+        )
+        assert reward["format_reward"] == pytest.approx(0.1)
+        assert reward["first_call_validity_reward"] == pytest.approx(0.5)
+
+    def test_rejected_episode_still_zero_format(self):
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.2, 0.3, 0.3],
+                            "image_b": "b", "matcher": "loftr"})
+        done = ToolCall(tool="done", args={})
+        reward = compute_pair_reward(
+            {}, gt_pose=None,
+            num_tool_calls=2, num_valid_calls=0, num_invalid_calls=1,
+            tool_calls=[tc, done], tool_results=[{"error": "degenerate bbox"}],
+        )
+        assert reward["format_reward"] == 0.0
+        assert reward["first_call_validity_reward"] == pytest.approx(-1.0)
+
+
+class TestFormatRewardDoneExclusion:
+    def test_clean_episode_with_done_gets_format(self):
+        """num_tool_calls includes `done` (no result) — it must not block the
+        binary format reward for an otherwise clean episode."""
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.0, 0.8, 1.0],
+                            "image_b": "b", "matcher": "loftr"})
+        done = ToolCall(tool="done", args={})
+        result = {"num_inliers": 40, "inlier_ratio": 0.5}
+        reward = compute_pair_reward(
+            result, gt_pose=None,
+            num_tool_calls=2, num_valid_calls=1,  # crop + done, one result
+            tool_calls=[tc, done], tool_results=[result],
+        )
+        assert reward["format_reward"] == pytest.approx(0.1)
+        assert reward["first_call_validity_reward"] == pytest.approx(0.5)
+
+    def test_rejected_episode_still_zero_format(self):
+        tc = ToolCall(tool="crop_and_match",
+                      args={"image_id": "a", "bbox": [0.2, 0.2, 0.3, 0.3],
+                            "image_b": "b", "matcher": "loftr"})
+        done = ToolCall(tool="done", args={})
+        reward = compute_pair_reward(
+            {}, gt_pose=None,
+            num_tool_calls=2, num_valid_calls=0, num_invalid_calls=1,
+            tool_calls=[tc, done], tool_results=[{"error": "degenerate bbox"}],
+        )
+        assert reward["format_reward"] == 0.0
+        assert reward["first_call_validity_reward"] == pytest.approx(-1.0)

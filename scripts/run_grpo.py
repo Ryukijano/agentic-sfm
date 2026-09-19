@@ -1329,7 +1329,11 @@ class GRPOTrainer:
         import urllib.request
 
         if version is None:
-            version = getattr(self, "_adapter_version", 0)
+            # Every reload needs a fresh name — reusing a name that is already
+            # loaded (e.g. the epoch-end "latest" reload right after a per-step
+            # push with the same version) makes vLLM 400.
+            self._adapter_version += 1
+            version = self._adapter_version
         adapter = f"agentic-sfm-policy-v{version}"
         base = rollout_agent.vllm_url.rstrip("/")
         headers = {

@@ -308,10 +308,16 @@ def compute_pair_reward(
     else:
         components["first_call_validity_reward"] = 0.0
 
-    # Binary format reward: all calls accepted (no rejection) or nothing.
-    # Partial credit for parseable-but-rejected calls let the degenerate mode
-    # stay alive — a rejected call is an invalid call, full stop.
-    if num_tool_calls > 0 and num_valid_calls >= num_tool_calls:
+    # Binary format reward: all EXECUTED calls accepted (no rejection) or
+    # nothing. Partial credit for parseable-but-rejected calls let the
+    # degenerate mode stay alive — a rejected call is an invalid call, full
+    # stop. The terminal `done` call has no result, so it is excluded from
+    # the expected count (callers include it in num_tool_calls).
+    n_done = 0
+    if tool_calls:
+        n_done = sum(1 for tc in tool_calls if getattr(tc, "tool", None) == "done")
+    expected_calls = max(num_tool_calls - n_done, 0)
+    if expected_calls > 0 and num_valid_calls >= expected_calls:
         components["format_reward"] = format_weight
     else:
         components["format_reward"] = 0.0
