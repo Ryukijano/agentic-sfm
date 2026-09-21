@@ -403,6 +403,10 @@ def compute_scene_reward(
     ntep_intent_coef: float = 0.05,
     ntep_redundancy_penalty: float = 0.05,
     use_ntep_rewards: bool = False,
+    first_call_validity_weight: float = 0.5,
+    first_call_invalid_penalty: float = 1.0,
+    gate_geometry_on_validity: bool = True,
+    **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a scene-level SfM episode.
 
@@ -411,6 +415,14 @@ def compute_scene_reward(
     scene-specific components (registration, split, doppelganger filtering).
     """
     components: dict[str, Any] = {}
+
+    first_valid, _ = _first_call_validity(tool_calls, tool_results)
+    if first_valid is True:
+        components["first_call_validity_reward"] = first_call_validity_weight
+    elif first_valid is False:
+        components["first_call_validity_reward"] = -first_call_invalid_penalty
+    else:
+        components["first_call_validity_reward"] = 0.0
 
     num_registered = recon_result.get("num_registered", 0)
 
@@ -462,6 +474,16 @@ def compute_scene_reward(
         components["ntep_intent_reward"] = 0.0
         components["ntep_redundancy_penalty"] = 0.0
 
+    if gate_geometry_on_validity and first_valid is False:
+        components["registration_reward"] = 0.0
+        components["pose_reward"] = 0.0
+        components["accumulative_tool_reward"] = 0.0
+        components["doppelganger_reward"] = 0.0
+        components["tool_cost"] = 0.0
+        components["validity_gated"] = True
+    else:
+        components["validity_gated"] = False
+
     components["total_reward"] = float(
         components["registration_reward"]
         + components["split_penalty"]
@@ -471,6 +493,7 @@ def compute_scene_reward(
         + components["accumulative_tool_reward"]
         + components["ntep_intent_reward"]
         + components["ntep_redundancy_penalty"]
+        + components["first_call_validity_reward"]
     )
     return components
 

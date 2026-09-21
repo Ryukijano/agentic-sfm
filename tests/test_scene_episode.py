@@ -261,6 +261,7 @@ class TestSceneRewardIntegration:
         assert "doppelganger_reward" in rc
         assert "tool_cost" in rc
         assert "accumulative_tool_reward" in rc
+        assert "first_call_validity_reward" in rc
         assert "total_reward" in rc
 
 

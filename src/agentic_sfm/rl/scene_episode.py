@@ -320,6 +320,26 @@ class SceneRolloutEpisode:
     session_id: str = ""
 
 
+def _scene_reward_kwargs(agent: Any) -> dict[str, Any]:
+    """Keyword args for ``compute_scene_reward`` from the rollout agent's config."""
+    cfg = getattr(agent, "reward_config", {}) or {}
+    return {
+        "tool_cost": cfg.get("tool_cost", 0.05),
+        "registration_weight": cfg.get("registration_weight", 0.5),
+        "pose_weight": cfg.get("pose_weight", 1.0),
+        "split_penalty": cfg.get("split_penalty", 0.5),
+        "doppelganger_weight": cfg.get("doppelganger_weight", 0.3),
+        "accumulative_tool_coef": cfg.get("accumulative_tool_coef", 0.1),
+        "use_accumulative_tool_reward": cfg.get("use_accumulative_tool_reward", True),
+        "ntep_intent_coef": cfg.get("ntep_intent_coef", 0.05),
+        "ntep_redundancy_penalty": cfg.get("ntep_redundancy_penalty", 0.05),
+        "use_ntep_rewards": cfg.get("use_ntep_rewards", False),
+        "first_call_validity_weight": cfg.get("first_call_validity_weight", 0.5),
+        "first_call_invalid_penalty": cfg.get("first_call_invalid_penalty", 1.0),
+        "gate_geometry_on_validity": cfg.get("gate_geometry_on_validity", True),
+    }
+
+
 def run_scene_episode(
     agent: Any,
     scene_id: str,
@@ -474,24 +494,14 @@ def run_scene_episode(
     _inject_pose_error(ep, gt_recon)
 
     # Compute scene-level reward
-    agent_reward_cfg = getattr(agent, "reward_config", {})
     ep.reward_components = compute_scene_reward(
         ep.recon_result or {},
         gt_recon=gt_recon,
         num_tool_calls=num_tool_calls,
-        tool_cost=agent_reward_cfg.get("tool_cost", 0.05),
-        registration_weight=agent_reward_cfg.get("registration_weight", 0.5),
-        pose_weight=agent_reward_cfg.get("pose_weight", 1.0),
-        split_penalty=agent_reward_cfg.get("split_penalty", 0.5),
-        doppelganger_weight=agent_reward_cfg.get("doppelganger_weight", 0.3),
-        accumulative_tool_coef=agent_reward_cfg.get("accumulative_tool_coef", 0.1),
-        use_accumulative_tool_reward=agent_reward_cfg.get("use_accumulative_tool_reward", True),
         num_valid_calls=num_valid_calls,
         tool_calls=ep.tool_calls,
         tool_results=ep.results,
-        ntep_intent_coef=agent_reward_cfg.get("ntep_intent_coef", 0.05),
-        ntep_redundancy_penalty=agent_reward_cfg.get("ntep_redundancy_penalty", 0.05),
-        use_ntep_rewards=agent_reward_cfg.get("use_ntep_rewards", False),
+        **_scene_reward_kwargs(agent),
     )
     ep.reward = ep.reward_components["total_reward"]
 
@@ -697,23 +707,13 @@ def run_scene_oracle_episode(
     recon_result = ep.recon_result  # may now contain mean_pose_error_deg
 
     # Compute reward
-    agent_reward_cfg = getattr(agent, "reward_config", {})
     n_valid = len(oracle_calls) - 1  # exclude done
     ep.reward_components = compute_scene_reward(
         recon_result, gt_recon=gt_recon,
         num_tool_calls=len(oracle_calls), num_valid_calls=n_valid,
-        tool_cost=agent_reward_cfg.get("tool_cost", 0.05),
-        registration_weight=agent_reward_cfg.get("registration_weight", 0.5),
-        pose_weight=agent_reward_cfg.get("pose_weight", 1.0),
-        split_penalty=agent_reward_cfg.get("split_penalty", 0.5),
-        doppelganger_weight=agent_reward_cfg.get("doppelganger_weight", 0.3),
-        accumulative_tool_coef=agent_reward_cfg.get("accumulative_tool_coef", 0.1),
-        use_accumulative_tool_reward=agent_reward_cfg.get("use_accumulative_tool_reward", True),
         tool_calls=oracle_calls,
         tool_results=oracle_results,
-        ntep_intent_coef=agent_reward_cfg.get("ntep_intent_coef", 0.05),
-        ntep_redundancy_penalty=agent_reward_cfg.get("ntep_redundancy_penalty", 0.05),
-        use_ntep_rewards=agent_reward_cfg.get("use_ntep_rewards", False),
+        **_scene_reward_kwargs(agent),
     )
     ep.reward = ep.reward_components["total_reward"]
     ep.is_oracle = True

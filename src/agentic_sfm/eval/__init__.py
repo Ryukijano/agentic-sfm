@@ -5,6 +5,8 @@ from agentic_sfm.eval.evaluate import (
     evaluate_agent,
     evaluate_direct_matching,
     save_results,
+    select_eval_pairs,
+    summarize_pair_eval,
 )
 from agentic_sfm.eval.scene_eval import (
     aggregate_scene_metrics,
@@ -20,4 +22,6 @@ __all__ = [
     "evaluate_agent",
     "evaluate_direct_matching",
     "save_results",
+    "select_eval_pairs",
+    "summarize_pair_eval",
 ]

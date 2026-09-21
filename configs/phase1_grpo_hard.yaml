@@ -1,0 +1,97 @@
+# Phase 1b: continue GRPO on medium+hard pairs.
+#
+# Do NOT sbatch until job 7894645 finishes. The slurm script snapshots
+# outputs/phase1/checkpoints/best_eval (fallback: best) into
+# outputs/phase1_hard/warmstart so this run never reads a live checkpoint.
+#
+# Skip the 10 medium-only warmup epochs — that is what 7894645 already did.
+# KL stays on SFT epoch_5 (clean JSON), not on the RL adapter.
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  sft_adapter: "outputs/phase1_hard/warmstart"
+  kl_adapter: "outputs/sft/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "verl"
+  group_size: 8
+  max_tool_calls: 10
+  max_turns: 15
+  temperature: 1.0
+  top_p: 0.95
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 10
+  sgrpo_cgi: true
+
+reward:
+  pose_weight: 1.0
+  inlier_weight: 0.1
+  tool_cost: 0.0
+  accumulative_tool_coef: 0.1
+  use_accumulative_tool_reward: true
+  format_weight: 0.1
+  invalid_penalty: 0.2
+  first_call_validity_weight: 0.5
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
+  pose_auc_thresholds: [5, 10, 20]
+  use_ntep_rewards: true
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
+
+curriculum:
+  enabled: true
+  schedule: "overlap_bins"
+  stages:
+    - {epochs: 15, difficulties: ["medium", "hard"]}
+    - {epochs: 20, difficulties: ["medium", "hard", "extreme", "easy"]}
+
+training:
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  total_epochs: 35
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 5
+  eval_freq: 5
+  log_freq: 10
+  eval_max_pairs: null          # full 153-pair val, shuffled
+  kl_coef: 0.03
+  off_support_threshold: -9.0
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"
+
+rollout:
+  vllm_gpu: 0
+  training_gpu: 1
+  matcher_gpu: 2
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 4
+  batch_size: 4
+  min_p: 0.05
+  top_k: 50
+
+data:
+  train_pairs: "data/hard_pairs_train.json"
+  val_pairs: "data/hard_pairs_val.json"
+  matcher: "loftr"
+
+output:
+  checkpoint_dir: "outputs/phase1_hard/checkpoints"
+  results_dir: "outputs/phase1_hard"
+  log_dir: "logs/phase1_hard"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase1-grpo-hard-r1"

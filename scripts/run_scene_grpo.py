@@ -56,6 +56,7 @@ SCENE_REWARD_KEYS = (
     "accumulative_tool_reward",
     "ntep_intent_reward",
     "ntep_redundancy_penalty",
+    "first_call_validity_reward",
 )
 
 

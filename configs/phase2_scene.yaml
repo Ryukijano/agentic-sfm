@@ -4,9 +4,11 @@
 model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
-  # Resume from Phase 1 checkpoint (or SFT adapter if Phase 1 not done)
-  checkpoint: "outputs/scene_sft/checkpoints/epoch_5"  # scene SFT warmup adapter
-  sft_adapter: "outputs/sft/checkpoints/epoch_5"  # fallback
+  # Scene SFT is the JSON contract for retrieve/sfm_run. After Phase-1 hard
+  # lands, optionally point sft_adapter at outputs/phase1_hard/checkpoints/best_eval.
+  checkpoint: "outputs/scene_sft/checkpoints/epoch_5"
+  sft_adapter: "outputs/scene_sft/checkpoints/epoch_5"
+  kl_adapter: "outputs/scene_sft/checkpoints/epoch_5"
   lora:
     rank: 32
     alpha: 64
@@ -50,7 +52,12 @@ reward:
   use_accumulative_tool_reward: true
   format_weight: 0.1
   invalid_penalty: 0.2
-  # NTEP process rewards — opt-in
+  # Same first-call gate as Phase 1: a rejected first retrieve/crop zeros
+  # registration/pose so degenerate calls cannot win the group.
+  first_call_validity_weight: 0.5
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
+  # NTEP off: many legitimate scene matches revisit the same pair.
   use_ntep_rewards: false
   ntep_intent_coef: 0.05
   ntep_redundancy_penalty: 0.05
@@ -72,6 +79,11 @@ training:
   save_freq: 5
   eval_freq: 5
   log_freq: 10
+  # Phase-1 collapse fixes — SceneGRPOTrainer inherits these from GRPOTrainer.
+  kl_coef: 0.03
+  off_support_threshold: -9.0
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"
 
 rollout:
   vllm_gpu: 0
@@ -81,6 +93,8 @@ rollout:
   tool_server_port: 8765
   num_rollout_workers: 4
   batch_size: 2             # scenes per batch (fewer than pairs — more expensive)
+  min_p: 0.05
+  top_k: 50
 
 data:
   # Scene data from MegaDepth scene_info
@@ -103,4 +117,4 @@ output:
   log_dir: "logs/phase2"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase2-scene-grpo-qwen35-2b-r2"  # r2: COLMAP crash fix + watchdog
+  wandb_run_name: "phase2-scene-grpo-qwen35-2b-r3"  # r3: KL + on-policy + first-call gate

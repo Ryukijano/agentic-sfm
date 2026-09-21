@@ -81,6 +81,7 @@ training:
   save_freq: 5           # save checkpoint every N epochs
   eval_freq: 5
   log_freq: 10
+  eval_max_pairs: null   # full shuffled val; first-50 was all-hard
   # KL(pi || pi_SFT) per-token penalty (k3 estimator). Anchors the policy to
   # the SFT distribution that writes clean tool JSON; the trained policy
   # previously drifted degenerate because nothing held it near SFT.

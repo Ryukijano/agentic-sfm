@@ -633,6 +633,33 @@ class TestSceneReward:
         assert rc["ntep_intent_reward"] == 0.0
         assert rc["ntep_redundancy_penalty"] == 0.0
 
+    def test_scene_first_call_valid_gets_bonus(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        tc = ToolCall(tool="retrieve", args={"top_k": 10})
+        rc = compute_scene_reward(
+            self._recon(),
+            gt_recon={"num_images": 100},
+            tool_calls=[tc],
+            tool_results=[{"pairs": []}],
+        )
+        assert rc["first_call_validity_reward"] == pytest.approx(0.5)
+        assert rc["validity_gated"] is False
+
+    def test_scene_first_call_error_gates_geometry(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        tc = ToolCall(tool="crop", args={"image_id": "a", "bbox": [0.2, 0.2, 0.3, 0.3]})
+        rc = compute_scene_reward(
+            self._recon(),
+            gt_recon={"num_images": 100},
+            tool_calls=[tc],
+            tool_results=[{"error": "crop too small"}],
+        )
+        assert rc["first_call_validity_reward"] == pytest.approx(-1.0)
+        assert rc["validity_gated"] is True
+        assert rc["registration_reward"] == 0.0
+        assert rc["pose_reward"] == 0.0
+        assert rc["accumulative_tool_reward"] == 0.0
+
 
 class TestSceneEpisode:
     """Tests for the scene-level episode runner."""

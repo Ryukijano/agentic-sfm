@@ -105,32 +105,80 @@ def evaluate_agent(
     return _summarize_results(results, "agent")
 
 
+def select_eval_pairs(
+    pairs: list[ImagePair],
+    max_pairs: int | None = None,
+    seed: int = 0,
+) -> list[ImagePair]:
+    """Shuffle then optionally cap so ``[:N]`` is not a single difficulty bin.
+
+    The val JSON is difficulty-ordered (hard, then medium, …). Taking the
+    first 50 pairs therefore evaluated only hard pairs. A fixed seed keeps
+    the subset reproducible across evals.
+    """
+    if not pairs:
+        return []
+    rng = np.random.RandomState(seed)
+    order = rng.permutation(len(pairs))
+    selected = [pairs[int(i)] for i in order]
+    if max_pairs is not None and int(max_pairs) > 0:
+        selected = selected[: int(max_pairs)]
+    return selected
+
+
+def summarize_pair_eval(results: list[dict[str, Any]], method: str = "eval") -> dict[str, Any]:
+    """Summarize pair eval rows, including a per-difficulty breakdown.
+
+    Optional keys: ``geometric_reward`` (pose+inlier, comparable to matcher
+    baselines that do not get the first-call bonus) and ``success``.
+    """
+    return _summarize_results(results, method)
+
+
 def _summarize_results(results: list[dict[str, Any]], method: str) -> dict[str, Any]:
     """Summarize evaluation results."""
     if not results:
-        return {"method": method, "total": 0}
+        return {"method": method, "total": 0, "mean_reward": 0.0, "num_pairs": 0}
 
     summary = {
         "method": method,
         "total": len(results),
+        "num_pairs": len(results),
         "mean_reward": float(np.mean([r["reward"] for r in results])),
-        "mean_inliers": float(np.mean([r["num_inliers"] for r in results])),
-        "mean_inlier_ratio": float(np.mean([r["inlier_ratio"] for r in results])),
-        "mean_pose_auc": float(np.mean([r["pose_auc"] for r in results])),
-        "mean_rot_error": float(np.mean([r["rotation_error"] for r in results if r["rotation_error"] >= 0])),
-        "mean_trans_error": float(np.mean([r["translation_error"] for r in results if r["translation_error"] >= 0])),
+        "mean_inliers": float(np.mean([r.get("num_inliers", 0) for r in results])),
+        "mean_inlier_ratio": float(np.mean([r.get("inlier_ratio", 0.0) for r in results])),
+        "mean_pose_auc": float(np.mean([r.get("pose_auc", 0.0) for r in results])),
+        "mean_rot_error": float(np.mean([r["rotation_error"] for r in results if r.get("rotation_error", -1) >= 0] or [0.0])),
+        "mean_trans_error": float(np.mean([r["translation_error"] for r in results if r.get("translation_error", -1) >= 0] or [0.0])),
     }
+    if any("geometric_reward" in r for r in results):
+        summary["mean_geometric_reward"] = float(
+            np.mean([r.get("geometric_reward", 0.0) for r in results])
+        )
+    if any("success" in r for r in results):
+        summary["success_rate"] = float(np.mean([1.0 if r.get("success") else 0.0 for r in results]))
+    if any("num_tool_calls" in r for r in results):
+        summary["mean_tool_calls"] = float(np.mean([r.get("num_tool_calls", 0) for r in results]))
 
-    # Per-difficulty breakdown
     for diff in ["easy", "medium", "hard", "extreme"]:
-        subset = [r for r in results if r["difficulty"] == diff]
+        subset = [r for r in results if r.get("difficulty") == diff]
         if subset:
             summary[f"{diff}_count"] = len(subset)
             summary[f"{diff}_mean_reward"] = float(np.mean([r["reward"] for r in subset]))
-            summary[f"{diff}_mean_inliers"] = float(np.mean([r["num_inliers"] for r in subset]))
-            summary[f"{diff}_mean_pose_auc"] = float(np.mean([r["pose_auc"] for r in subset]))
+            summary[f"{diff}_mean_inliers"] = float(np.mean([r.get("num_inliers", 0) for r in subset]))
+            summary[f"{diff}_mean_pose_auc"] = float(np.mean([r.get("pose_auc", 0.0) for r in subset]))
+            if any("geometric_reward" in r for r in subset):
+                summary[f"{diff}_mean_geometric_reward"] = float(
+                    np.mean([r.get("geometric_reward", 0.0) for r in subset])
+                )
+            if any("success" in r for r in subset):
+                summary[f"{diff}_success_rate"] = float(
+                    np.mean([1.0 if r.get("success") else 0.0 for r in subset])
+                )
 
-    if method == "agent":
+    if method == "agent" and "mean_tool_calls" not in summary and any(
+        "num_tool_calls" in r for r in results
+    ):
         summary["mean_tool_calls"] = float(np.mean([r["num_tool_calls"] for r in results]))
 
     summary["raw_results"] = results

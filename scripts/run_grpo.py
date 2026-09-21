@@ -53,6 +53,7 @@ from agentic_sfm.agent.policy import (
 )
 from agentic_sfm.constants import DEFAULT_MATCHER, DEFAULT_POLICY_MODEL
 from agentic_sfm.data.hard_pairs import HardPairDataset
+from agentic_sfm.eval.evaluate import select_eval_pairs, summarize_pair_eval
 from agentic_sfm.geometry import keep_best_match
 from agentic_sfm.rewards.pose_rewards import compute_pair_reward
 from agentic_sfm.tools.client import ToolClient
@@ -372,6 +373,9 @@ class VLLMRolloutAgent:
             ntep_intent_coef=self.ntep_intent_coef,
             ntep_redundancy_penalty=self.ntep_redundancy_penalty,
             use_ntep_rewards=self.use_ntep_rewards,
+            first_call_validity_weight=self.first_call_validity_weight,
+            first_call_invalid_penalty=self.first_call_invalid_penalty,
+            gate_geometry_on_validity=self.gate_geometry_on_validity,
         )
         ep.reward = ep.reward_components["total_reward"]
 
@@ -526,6 +530,9 @@ class VLLMRolloutAgent:
             ntep_intent_coef=self.ntep_intent_coef,
             ntep_redundancy_penalty=self.ntep_redundancy_penalty,
             use_ntep_rewards=self.use_ntep_rewards,
+            first_call_validity_weight=self.first_call_validity_weight,
+            first_call_invalid_penalty=self.first_call_invalid_penalty,
+            gate_geometry_on_validity=self.gate_geometry_on_validity,
         )
         ep.reward = ep.reward_components["total_reward"]
         ep.is_oracle = True
@@ -600,6 +607,15 @@ class GRPOTrainer:
         self.ntep_intent_coef = config.get("reward", {}).get("ntep_intent_coef", 0.05)
         self.ntep_redundancy_penalty = config.get("reward", {}).get("ntep_redundancy_penalty", 0.05)
         self.use_ntep_rewards = config.get("reward", {}).get("use_ntep_rewards", False)
+        self.first_call_validity_weight = config.get("reward", {}).get(
+            "first_call_validity_weight", 0.5
+        )
+        self.first_call_invalid_penalty = config.get("reward", {}).get(
+            "first_call_invalid_penalty", 1.0
+        )
+        self.gate_geometry_on_validity = config.get("reward", {}).get(
+            "gate_geometry_on_validity", True
+        )
         # S-GRPO: Conditional Ground-Truth Trajectory Injection
         self.sgrpo_cgi = config.get("rl", {}).get("sgrpo_cgi", True)
         # KL penalty to the frozen SFT reference (anchors the policy to the
@@ -639,6 +655,10 @@ class GRPOTrainer:
         self.model_name = config["model"].get("name", DEFAULT_POLICY_MODEL)
         self.lora_config = config["model"]["lora"]
         self.sft_adapter = config["model"].get("sft_adapter")
+        # Frozen KL reference. Defaults to the warm-start adapter; set
+        # kl_adapter separately when resuming RL from a trained LoRA while
+        # still anchoring JSON style to SFT.
+        self.kl_adapter = config["model"].get("kl_adapter") or self.sft_adapter
         # Use cuda:0 if CUDA_VISIBLE_DEVICES is set (only 1 GPU visible)
         # Otherwise use the configured training GPU (default cuda:1)
         if os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -720,15 +740,15 @@ class GRPOTrainer:
         # Frozen SFT reference for the KL anchor: the same warm-start adapter
         # the policy began from. Prevents the policy drifting into the
         # degenerate/repetitive modes RL without any anchor discovers.
-        if self.kl_coef > 0 and self.sft_adapter and os.path.isdir(self.sft_adapter):
+        if self.kl_coef > 0 and self.kl_adapter and os.path.isdir(self.kl_adapter):
             try:
                 from peft import PeftModel
-                ref = PeftModel.from_pretrained(self._model.get_base_model(), self.sft_adapter, is_trainable=False)
+                ref = PeftModel.from_pretrained(self._model.get_base_model(), self.kl_adapter, is_trainable=False)
                 ref.eval()
                 for p in ref.parameters():
                     p.requires_grad = False
                 self._ref_model = ref
-                logger.info(f"Reference (KL anchor) model loaded from {self.sft_adapter}")
+                logger.info(f"Reference (KL anchor) model loaded from {self.kl_adapter}")
             except Exception as e:
                 logger.warning(f"Reference model load failed — KL disabled: {e}")
                 self._ref_model = None
@@ -1273,11 +1293,15 @@ class GRPOTrainer:
         except Exception as e:
             logger.warning(f"qualitative media log failed: {e}")
 
-    def evaluate(self, rollout_agent: VLLMRolloutAgent, max_pairs: int = 50) -> dict:
+    def evaluate(self, rollout_agent: VLLMRolloutAgent, max_pairs: int | None = None) -> dict:
         if len(self.val_dataset) == 0:
             return {"mean_reward": 0.0, "num_pairs": 0}
-        eval_pairs = self.val_dataset.pairs[:max_pairs]
+        if max_pairs is None:
+            max_pairs = self.config.get("training", {}).get("eval_max_pairs")
+        eval_pairs = select_eval_pairs(self.val_dataset.pairs, max_pairs=max_pairs, seed=0)
         episodes = []
+        rows = []
+        pose_w = float(self.pose_weight) or 1.0
         for pair in eval_pairs:
             gt_pose = {"R": pair.gt_R.tolist(), "t": pair.gt_t.tolist()} if pair.gt_R is not None else None
             ep = rollout_agent.run_episode(
@@ -1286,22 +1310,30 @@ class GRPOTrainer:
                 K_a=pair.K_a, K_b=pair.K_b,
             )
             episodes.append(ep)
-        rewards = [ep.reward for ep in episodes]
-        tool_calls = [len(ep.tool_calls) for ep in episodes]
-        # Success = the episode produced real geometry, not merely positive
-        # reward (format-only episodes can be > 0).
-        success_count = sum(
-            1 for ep in episodes
-            if ep.final_match and (ep.final_match.get("num_inliers") or 0) > 0
-        )
-        stats = {
-            "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
-            "num_pairs": len(episodes),
-            "mean_tool_calls": float(np.mean(tool_calls)) if tool_calls else 0.0,
-            "success_rate": success_count / len(episodes) if episodes else 0.0,
-        }
+            rc = ep.reward_components or {}
+            n_inliers = int((ep.final_match or {}).get("num_inliers") or 0)
+            rows.append({
+                "pair_id": pair.pair_id,
+                "difficulty": pair.difficulty,
+                "reward": float(ep.reward),
+                "geometric_reward": float(rc.get("pose_reward") or 0.0) + float(rc.get("inlier_reward") or 0.0),
+                "num_inliers": n_inliers,
+                "inlier_ratio": float((ep.final_match or {}).get("inlier_ratio") or 0.0),
+                "pose_auc": float(rc.get("pose_reward") or 0.0) / pose_w,
+                "num_tool_calls": len(ep.tool_calls),
+                "rotation_error": float(rc["rotation_error_deg"]) if "rotation_error_deg" in rc else -1.0,
+                "translation_error": float(rc["translation_error_deg"]) if "translation_error_deg" in rc else -1.0,
+                "success": n_inliers > 0,
+            })
+        stats = summarize_pair_eval(rows, method="grpo_val")
+        stats["num_pairs"] = stats.get("total", len(rows))
+        stats["success_rate"] = float(stats.get("success_rate", 0.0))
         if self._wandb:
-            self._wandb.log({f"eval/{k}": v for k, v in stats.items()},
+            flat = {
+                k: v for k, v in stats.items()
+                if isinstance(v, (int, float)) and k != "raw_results"
+            }
+            self._wandb.log({f"eval/{k}": v for k, v in flat.items()},
                             step=self._global_step)
         return stats
 
