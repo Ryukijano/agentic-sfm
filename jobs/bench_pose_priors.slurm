@@ -55,7 +55,7 @@ export CONDA_DEFAULT_ENV=agentic-sfm
 
 cd "${PROJECT_ROOT}"
 
-export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:/scratch/kcwp264/src/mast3r:/scratch/kcwp264/src/mast3r/dust3r:/scratch/kcwp264/src/mast3r/dust3r/croco:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 export TORCH_HOME="${SCRATCH}/.cache/torch"

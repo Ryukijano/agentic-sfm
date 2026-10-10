@@ -244,8 +244,8 @@ What this shows, and what it does not:
 
 - **VGGT's extrinsics head gives the best pose we measured.** It returned a pose for every pair, and its median error is 6.8°, against 69.4° for LoFTR.
 - **VGGT's correspondence path is starved.** 862 of 1,170 pairs had zero correspondences left after filtering. The confidence threshold (5.0, taken from VGGT's demo) is the likely cause. Lowering it needs another GPU run, and we have not made that change.
-- **The MASt3R row is not a result.** MASt3R is not installed, so all 1,170 pairs fell back to LoFTR, and the `ship*` columns show LoFTR numbers under the MASt3R name. The benchmark marks this row invalid.
-- **The VGGT prior result is not yet a clean comparison.** VGGT's training data may overlap with ScanNet, and we have not checked this. The median rotation error is small, but translation-direction error dominates the numbers on small indoor baselines, for every matcher.
+- **The MASt3R row is not a result.** In job 8213282 MASt3R was not importable, so all 1,170 pairs fell back to LoFTR, and the `ship*` columns show LoFTR numbers under the MASt3R name. The benchmark marks this row invalid. MASt3R has since been installed and imports cleanly (PYTHONPATH from `/scratch/kcwp264/src/mast3r`, no CUDA build). Its checkpoint is cached. It has not been benchmarked yet.
+- **The VGGT prior result is not yet a clean comparison.** VGGT's paper lists ScanNet among its training datasets (arXiv 2503.11651, section 3.4). For its own ScanNet-1500 matching comparison, the authors say they excluded the corresponding ScanNet scenes from training. Our frozen scenes come from the same ScanNet-1500 test folder, but the paper does not list the excluded scene IDs, and the released training code has no ScanNet loader. Overlap is unlikely but unconfirmed. The median rotation error is small, but translation-direction error dominates the numbers on small indoor baselines, for every matcher.
 
 Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
@@ -424,7 +424,7 @@ Research use of the components below is permitted under their stated terms. Comm
 
 ## Roadmap
 
-1. Check whether VGGT's training data overlaps the ScanNet evaluation scenes. Then decide whether to rerun the VGGT correspondence path with a lower confidence threshold, and install MASt3R so it is measured rather than skipped.
+1. Run the VGGT confidence diagnostic (`jobs/diagnose_vggt_conf.slurm`, job 8214266, queued), then rerun the benchmark with a threshold chosen from it. MASt3R is now installed and its checkpoint is cached, so the rerun will measure it instead of skipping it. The paper does not list the excluded ScanNet scene IDs, so overlap with our frozen scenes stays unconfirmed until that is resolved.
 2. Add the SFT-only arm and equal-budget consecutive and random baselines to the held-out evaluation.
 3. Run the held-out scene evaluation on the frozen manifest, at least 30 scenes, using the protocol above.
 4. Run further RL only after the gates in the protocol pass.
