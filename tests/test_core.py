@@ -565,22 +565,102 @@ class TestOracleCrops:
 class TestSceneReward:
     """Tests for compute_scene_reward with accumulative + NTEP framework."""
 
-    def _recon(self, registered=80, points=5000, pose_err=5.0, doppel_filtered=2, doppel_present=3):
+    def _recon(self, registered=80, points=5000, pose_err=5.0, doppel_filtered=2,
+               doppel_present=3, pairs_matched=0):
         return {
             "num_registered": registered,
             "num_points3d": points,
             "mean_pose_error_deg": pose_err,
             "num_doppelgangers_filtered": doppel_filtered,
             "num_doppelgangers_present": doppel_present,
+            "num_pairs_matched": pairs_matched,
         }
 
     def test_scene_reward_positive(self):
         from agentic_sfm.rewards.pose_rewards import compute_scene_reward
-        rc = compute_scene_reward(self._recon(), gt_recon={"num_images": 100})
+        rc = compute_scene_reward(
+            self._recon(),
+            gt_recon={"num_images": 100},
+            allow_self_certified_doppelganger=True,
+        )
         assert rc["total_reward"] > 0
         assert rc["registration_reward"] > 0
         assert rc["pose_reward"] > 0
-        assert rc["doppelganger_reward"] > 0  # 2/3 filtered
+        assert rc["doppelganger_reward"] > 0  # 2/3 filtered (self-certified opt-in)
+        assert rc["doppelganger_scored"] is False  # no GT labels -> not scored
+
+    def test_scene_reward_gt_impostors_scored(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # GT impostor labels present: prune_edges args are scored against GT.
+        gt = {"num_images": 100, "impostors": [
+            ["img_0001", "img_0002"], ["img_0005", "img_0007"]]}
+        calls = [ToolCall(tool="prune_edges", args={"pairs": [
+            ["img_0002", "img_0001"],  # order-insensitive
+            ["img_0005", "img_0007"],
+        ]})]
+        rc = compute_scene_reward(
+            self._recon(), gt_recon=gt, tool_calls=calls,
+            tool_results=[{"num_pruned": 2}],
+        )
+        assert rc["doppelganger_scored"] is True
+        assert rc["doppelganger_reward"] == pytest.approx(0.3)  # perfect F1
+
+    def test_scene_reward_gt_impostors_penalize_wrong_prunes(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        gt = {"num_images": 100, "impostors": [["img_0001", "img_0002"]]}
+        calls = [ToolCall(tool="prune_edges", args={"pairs": [
+            ["img_0001", "img_0002"],   # TP
+            ["img_0003", "img_0004"],   # FP — flagging arbitrary pairs must hurt
+        ]})]
+        rc = compute_scene_reward(
+            self._recon(), gt_recon=gt, tool_calls=calls,
+            tool_results=[{"num_pruned": 2}],
+        )
+        assert rc["doppelganger_scored"] is True
+        # tp=1, fp=1 -> precision=0.5, recall=1.0 -> F1=2/3
+        assert rc["doppelganger_reward"] == pytest.approx(0.3 * (2 / 3))
+
+    def test_scene_reward_no_self_certified_bonus_by_default(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # Agent claims it filtered every doppelganger, but without GT labels
+        # both num_doppelgangers_* fields are self-certified -> no bonus.
+        rc = compute_scene_reward(
+            self._recon(doppel_filtered=3, doppel_present=3),
+            gt_recon={"num_images": 100},
+        )
+        assert rc["doppelganger_reward"] == 0.0
+        assert rc["doppelganger_scored"] is False
+
+    def test_scene_reward_self_certified_opt_in(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        rc = compute_scene_reward(
+            self._recon(doppel_filtered=2, doppel_present=3),
+            gt_recon={"num_images": 100},
+            allow_self_certified_doppelganger=True,
+        )
+        assert rc["doppelganger_reward"] == pytest.approx(0.3 * (2 / 3))
+        assert rc["doppelganger_scored"] is False
+
+    def test_scene_reward_graph_cost_weight_kwarg(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # cov = 80/100 = 0.8 >= 0.70; exhaustive = 100*99/2 = 4950
+        rc = compute_scene_reward(
+            self._recon(registered=80, pairs_matched=1000),
+            gt_recon={"num_images": 100},
+            graph_cost_weight=0.2,
+        )
+        assert rc["graph_cost"] == pytest.approx(-0.2 * (1000 / 4950))
+        assert rc["graph_cost"] < 0.0
+
+    def test_scene_reward_graph_cost_gated_on_coverage(self):
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+        # cov = 20/100 = 0.2 < 0.70 -> sparsity penalty stays off
+        rc = compute_scene_reward(
+            self._recon(registered=20, pairs_matched=1000),
+            gt_recon={"num_images": 100},
+            graph_cost_weight=0.2,
+        )
+        assert rc["graph_cost"] == 0.0
 
     def test_scene_reward_zero_registered(self):
         from agentic_sfm.rewards.pose_rewards import compute_scene_reward

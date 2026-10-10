@@ -256,6 +256,9 @@ class TestSceneCurriculum:
         assert cur.stages[0].scenes == ["0015"]
         assert cur.stages[2].scenes is None
         assert cur.total_epochs == 50
+        assert all(
+            (s.max_images is None) or (s.max_images <= 20) for s in cur.stages
+        )
 
     def test_progression_over_epoch_loop(self, megadepth_tmp):
         """Simulate the training-loop filtering over all stage boundaries."""

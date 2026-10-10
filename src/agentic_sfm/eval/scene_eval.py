@@ -50,6 +50,64 @@ logger = logging.getLogger(__name__)
 
 _POSE_AUC_THRESHOLDS = (5, 10, 20)
 
+# Pose-aligned reconstruction success. One registered camera is not a win.
+SCENE_SUCCESS_MIN_REGISTERED_FRAC = 0.5
+SCENE_SUCCESS_MAX_POSE_ERROR_DEG = 20.0
+
+
+def registered_fraction(num_registered: float, num_images: float) -> float:
+    return min(1.0, float(num_registered) / max(float(num_images), 1.0))
+
+
+def scene_reconstruction_success(
+    num_registered: float,
+    num_images: float,
+    mean_pose_error_deg: float | None,
+    *,
+    min_registered_frac: float = SCENE_SUCCESS_MIN_REGISTERED_FRAC,
+    max_pose_error_deg: float = SCENE_SUCCESS_MAX_POSE_ERROR_DEG,
+) -> bool:
+    """Enough of the scene is in COLMAP *and* mean pose error is under 20°.
+
+    ``num_registered > 0`` is not success — a 1-camera model is degenerate.
+    Missing / non-finite pose error is a failure (no geometry to claim).
+    """
+    if registered_fraction(num_registered, num_images) < float(min_registered_frac):
+        return False
+    if mean_pose_error_deg is None:
+        return False
+    try:
+        err = float(mean_pose_error_deg)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(err):
+        return False
+    return err < float(max_pose_error_deg)
+
+
+def scene_eval_score(
+    mean_registered_frac: float,
+    mean_pose_error_deg: float | None,
+    *,
+    max_pose_error_deg: float = SCENE_SUCCESS_MAX_POSE_ERROR_DEG,
+) -> float:
+    """Higher is better for ``best_eval``. ``frac * max(0, 1 - err/20)``.
+
+    Missing pose → 0, so a high train reward with no reconstruction cannot
+    promote a checkpoint.
+    """
+    frac = max(0.0, float(mean_registered_frac))
+    if mean_pose_error_deg is None:
+        return 0.0
+    try:
+        err = float(mean_pose_error_deg)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(err):
+        return 0.0
+    pose_term = max(0.0, 1.0 - err / float(max_pose_error_deg))
+    return frac * pose_term
+
 
 # ---------------------------------------------------------------------------
 # Pose representation helpers
@@ -213,6 +271,7 @@ def _index_lookup(ep: SceneRolloutEpisode) -> dict[str, int]:
         p_str = str(p)
         lookup.setdefault(str(i), i)
         lookup.setdefault(f"img_{i:04d}", i)
+        lookup.setdefault(f"img_{i:04d}{os.path.splitext(p_str)[1] or '.jpg'}", i)
         lookup.setdefault(p_str, i)
         lookup.setdefault(os.path.basename(p_str), i)
     return lookup
@@ -756,6 +815,22 @@ def compute_scene_metrics(
     pose_m, per_image, per_pair = _pose_metrics(pred_poses, gt_poses, recon)
     metrics.update(pose_m)
 
+    pose_err = recon.get("mean_pose_error_deg")
+    if not isinstance(pose_err, (int, float)):
+        pose_err = metrics.get("pose/reported_mean_error_deg")
+    if not isinstance(pose_err, (int, float)):
+        pose_err = None
+    metrics["reconstruction/success"] = float(
+        scene_reconstruction_success(
+            metrics["registration/num_registered"],
+            metrics["registration/num_images"],
+            pose_err,
+        )
+    )
+    metrics["reconstruction/eval_score"] = scene_eval_score(
+        metrics["registration/registered_fraction"], pose_err
+    )
+
     # Registered index set (for overlap coverage) — from pred poses or an
     # explicit name list in recon_result.
     registered_indices: set[int] | None = set(pred_poses) if pred_poses else None
@@ -856,10 +931,29 @@ def aggregate_scene_metrics(
         summary[f"{prefix}mean_{key.replace('/', '_')}"] = float(np.mean(values))
         summary[f"{prefix}median_{key.replace('/', '_')}"] = float(np.median(values))
 
-    # Headline rates
+    # Headline rates. success_rate is pose-aligned (≥50% registered and
+    # pose < 20°), not "any camera registered".
     summary[f"{prefix}success_rate"] = float(
+        np.mean([m.get("reconstruction/success", 0.0) for m in per_scene_metrics])
+    )
+    summary[f"{prefix}any_registered_rate"] = float(
         np.mean([m.get("registration/success", 0.0) for m in per_scene_metrics])
     )
+    fracs = [float(m.get("registration/registered_fraction") or 0.0) for m in per_scene_metrics]
+    pose_errs = [
+        float(m["pose/reported_mean_error_deg"])
+        for m in per_scene_metrics
+        if isinstance(m.get("pose/reported_mean_error_deg"), (int, float))
+    ]
+    if not pose_errs:
+        pose_errs = [
+            float(m["pose/rel_rot_err_mean_deg"])
+            for m in per_scene_metrics
+            if isinstance(m.get("pose/rel_rot_err_mean_deg"), (int, float))
+        ]
+    mean_frac = float(np.mean(fracs)) if fracs else 0.0
+    mean_pose = float(np.mean(pose_errs)) if pose_errs else None
+    summary[f"{prefix}eval_score"] = scene_eval_score(mean_frac, mean_pose)
     summary[f"{prefix}full_registration_rate"] = float(
         np.mean([m.get("registration/full", 0.0) for m in per_scene_metrics])
     )
@@ -879,6 +973,9 @@ def aggregate_scene_metrics(
             "registered_fraction": m.get("registration/registered_fraction"),
             "num_tool_calls": m.get("efficiency/num_tool_calls"),
             "rel_auc_10": m.get("pose/rel_auc_10"),
+            "pose_err_deg": m.get("pose/reported_mean_error_deg"),
+            "reconstruction_success": m.get("reconstruction/success"),
+            "eval_score": m.get("reconstruction/eval_score"),
             "doppelganger_f1": m.get("doppelganger/f1"),
         }
         for m in per_scene_metrics

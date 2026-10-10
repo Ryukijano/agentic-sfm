@@ -21,19 +21,22 @@ training:
   weight_decay: 0.01
   warmup_steps: 50
   total_epochs: 5
-  batch_size: 2
-  gradient_accumulation_steps: 8  # effective batch size = 16
+  batch_size: 1
+  gradient_accumulation_steps: 8  # effective batch size = 8
   max_grad_norm: 1.0
   save_freq: 1
 
 data:
-  sft_data: "data/scene_sft_train.jsonl"
+  sft_data: "data/scene_sft_graph_train.jsonl"
+  # 401,408 px = <=512 vision tokens/image at patch16+merge2; 8 image slots
+  # -> ~4k vision tokens per example (was ~8k at 1,003,520 px).
+  max_image_pixels: 401408
 
 output:
-  checkpoint_dir: "outputs/scene_sft/checkpoints"
-  results_dir: "outputs/scene_sft"
-  log_dir: "logs/scene_sft"
+  checkpoint_dir: "outputs/scene_sft_graph_retry2/checkpoints"
+  results_dir: "outputs/scene_sft_graph_retry2"
+  log_dir: "logs/scene_sft_graph_retry2"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase2-scene-sft-qwen35-2b"
-  wandb_enabled: false
+  wandb_run_name: "phase2-scene-graph-sft-qwen35-2b-retry2"
+  wandb_enabled: true

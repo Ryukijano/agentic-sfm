@@ -58,8 +58,17 @@ DEFAULT_IMAGE_ROOT = "/scratch/kcwp264/data/megadepth/megadepth_test_1500"
 # Tools the scene grammar allows (must stay a subset of what
 # run_scene_episode / _execute_scene_tool handle).
 ALLOWED_SCENE_TOOLS = frozenset({
-    "retrieve", "match", "crop", "crop_and_match",
-    "doppelganger_check", "sfm_run", "inspect", "done",
+    "build_initial_graph",
+    "inspect_graph",
+    "verify_doppelganger",
+    "prune_edges",
+    "bridge_components",
+    "sfm_run",
+    "done",
+    "retrieve",
+    "match",
+    "doppelganger_check",
+    "inspect",
 })
 
 # Scene-level reward weights — mirrored from configs/phase2_scene.yaml so the
@@ -75,7 +84,7 @@ SCENE_REWARD_CFG: dict[str, Any] = {
     "use_ntep_rewards": False,
 }
 
-_N_THUMBNAILS = 8  # run_scene_episode shows up to 8 scene images
+_N_THUMBNAILS = 8  # SFT trajectories; Phase-2 GRPO prompts now show 4 (vLLM cap)
 
 
 # ---------------------------------------------------------------------------
@@ -356,26 +365,193 @@ def _synth_match_result(
     }
 
 
-def _synth_crop_result(
-    image_id: str,
-    bbox: list[float],
-    size_wh: tuple[int, int],
-    path: str,
+def _synth_initial_graph_result(
+    n: int,
+    cand_pairs: list[tuple[int, int]],
+    verified_pairs: list[tuple[int, int]],
+    edge_ok: np.ndarray,
+    rng: np.random.Generator,
 ) -> dict[str, Any]:
-    """Crop result with the server's pixel-coordinate crop id convention."""
-    w, h = size_wh
-    x1 = max(0, int(bbox[0] * w))
-    y1 = max(0, int(bbox[1] * h))
-    x2 = min(w, int(bbox[2] * w))
-    y2 = min(h, int(bbox[3] * h))
-    crop_id = f"{image_id}_crop_{x1}_{y1}_{x2}_{y2}"
+    sizes, n_multi = _largest_components(n, edge_ok)
     return {
-        "cropped_image_id": crop_id,
-        "crop_id": crop_id,
-        "path": path,
-        "origin_xy": [x1, y1],
-        "size": [x2 - x1, y2 - y1],
-        "crop_size": [x2 - x1, y2 - y1],
+        "num_images": n,
+        "num_candidate_edges": len(cand_pairs),
+        "num_verified_edges": len(verified_pairs),
+        "num_failed_edges": max(0, len(cand_pairs) - len(verified_pairs)),
+        "num_components": max(1, n_multi),
+        "component_sizes": sizes,
+        "status": "ok",
+    }
+
+
+def _synth_inspect_graph_result(
+    n: int,
+    ids: list[str],
+    verified_pairs: set[tuple[int, int]],
+    edge_ok: np.ndarray,
+    suspicious_pairs: list[tuple[int, int]],
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    sizes, n_multi = _largest_components(n, edge_ok)
+    deg = [0] * n
+    for i, j in verified_pairs:
+        deg[i] += 1
+        deg[j] += 1
+
+    isolated = [ids[i] for i in range(n) if deg[i] == 0]
+
+    seen = [False] * n
+    components = []
+    for s in range(n):
+        if seen[s]:
+            continue
+        stack, comp = [s], []
+        seen[s] = True
+        while stack:
+            u = stack.pop()
+            comp.append(ids[u])
+            for v in range(n):
+                if not seen[v] and (edge_ok[u, v] or edge_ok[v, u]):
+                    seen[v] = True
+                    stack.append(v)
+        components.append(comp)
+
+    suspicious_cycles = []
+    for di, dj in suspicious_pairs:
+        k = (dj + 1) % n if (dj + 1) % n != di else (dj + 2) % n
+        suspicious_cycles.append({
+            "cycle": [ids[di], ids[dj], ids[k]],
+            "rotation_error_deg": round(float(rng.uniform(18.0, 32.0)), 2),
+            "max_error_edge": [ids[di], ids[dj]],
+        })
+
+    return {
+        "num_images": n,
+        "num_verified_edges": len(verified_pairs),
+        "num_pruned_edges": 0,
+        "num_components": max(1, n_multi),
+        "component_sizes": sizes,
+        "degrees": {
+            "min": int(min(deg)) if deg else 0,
+            "mean": round(float(np.mean(deg)), 2) if deg else 0.0,
+            "max": int(max(deg)) if deg else 0,
+        },
+        "isolated_images": isolated,
+        "bottlenecks": [],
+        "weak_bridges": [],
+        "suspicious_cycles": suspicious_cycles,
+        "components": components,
+        "status": "ok",
+    }
+
+
+def _synth_verify_doppelganger_result(
+    image_a: str,
+    image_b: str,
+    is_doppelganger: bool,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    if is_doppelganger:
+        sim = float(rng.uniform(0.75, 0.95))
+        ratio = float(rng.uniform(0.01, 0.08))
+        inliers = int(rng.integers(5, 30))
+        rot_err = float(rng.uniform(18.0, 34.0))
+        evidence = f"High cycle rotation residual ({rot_err:.1f} deg > 15.0 deg)"
+    else:
+        sim = float(rng.uniform(0.50, 0.85))
+        ratio = float(rng.uniform(0.20, 0.65))
+        inliers = int(rng.integers(60, 350))
+        rot_err = float(rng.uniform(1.2, 5.5))
+        evidence = f"Cycle rotation residual is consistent ({rot_err:.1f} deg <= 15.0 deg)"
+
+    return {
+        "pair": [image_a, image_b],
+        "visual_similarity": round(sim, 4),
+        "num_inliers": inliers,
+        "inlier_ratio": round(ratio, 4),
+        "cycle_rotation_error_deg": round(rot_err, 2),
+        "is_doppelganger": is_doppelganger,
+        "evidence": evidence,
+        "status": "ok",
+    }
+
+
+def _synth_prune_edges_result(
+    pairs_pruned: list[list[str]],
+    remaining_verified: set[tuple[int, int]],
+    n: int,
+    ids: list[str],
+) -> dict[str, Any]:
+    edge_ok = np.zeros((n, n), dtype=bool)
+    for i, j in remaining_verified:
+        edge_ok[i, j] = edge_ok[j, i] = True
+    sizes, n_multi = _largest_components(n, edge_ok)
+
+    seen = [False] * n
+    components = []
+    for s in range(n):
+        if seen[s]:
+            continue
+        stack, comp = [s], []
+        seen[s] = True
+        while stack:
+            u = stack.pop()
+            comp.append(ids[u])
+            for v in range(n):
+                if not seen[v] and (edge_ok[u, v] or edge_ok[v, u]):
+                    seen[v] = True
+                    stack.append(v)
+        components.append(comp)
+
+    return {
+        "num_pruned": len(pairs_pruned),
+        "remaining_edges": len(remaining_verified),
+        "num_components": max(1, n_multi),
+        "components": components,
+        "status": "ok",
+    }
+
+
+def _synth_bridge_components_result(
+    comp_a_id: int,
+    comp_b_id: int,
+    added_edges: list[list[str]],
+    remaining_verified: set[tuple[int, int]],
+    n: int,
+    ids: list[str],
+) -> dict[str, Any]:
+    edge_ok = np.zeros((n, n), dtype=bool)
+    for i, j in remaining_verified:
+        edge_ok[i, j] = edge_ok[j, i] = True
+    sizes, n_multi = _largest_components(n, edge_ok)
+
+    seen = [False] * n
+    components = []
+    for s in range(n):
+        if seen[s]:
+            continue
+        stack, comp = [s], []
+        seen[s] = True
+        while stack:
+            u = stack.pop()
+            comp.append(ids[u])
+            for v in range(n):
+                if not seen[v] and (edge_ok[u, v] or edge_ok[v, u]):
+                    seen[v] = True
+                    stack.append(v)
+        components.append(comp)
+
+    new_edges_info = [
+        {"pair": p, "inliers": 90, "inlier_ratio": 0.45, "status": "verified"}
+        for p in added_edges
+    ]
+    return {
+        "candidates_tested": max(3, len(added_edges)),
+        "bridges_added": len(added_edges),
+        "new_edges": new_edges_info,
+        "num_components": max(1, n_multi),
+        "components": components,
+        "status": "ok",
     }
 
 
@@ -451,14 +627,13 @@ def _synth_sfm_result(
     rng: np.random.Generator,
     output_dir: str,
     stragglers: int = 0,
+    active_edge_count: int = 0,
 ) -> dict[str, Any]:
     """COLMAP result implied by the GT overlap graph minus flagged pairs.
 
     Registered count = largest covisible component (edge when GT overlap >=
     0.03, the rough LoFTR/COLMAP covisibility floor) minus ``stragglers``.
-    ``num_pairs_matched`` mirrors the server: 0 when the episode ran no
-    doppelganger_check (server falls back to exhaustive matching), else the
-    size of the exhaustive-minus-flagged pair list.
+    ``num_pairs_matched`` mirrors the server: active verified edges matched.
     """
     n = len(ids)
     edge = np.zeros((n, n), dtype=bool)
@@ -473,7 +648,9 @@ def _synth_sfm_result(
     registered = sizes[0] if sizes and sizes[0] >= 2 else 0
     registered = max(0, registered - int(stragglers))
 
-    if num_checks > 0:
+    if active_edge_count > 0:
+        num_pairs_matched = active_edge_count
+    elif num_checks > 0:
         num_pairs_matched = n * (n - 1) // 2 - len(flagged_keys)
     else:
         num_pairs_matched = 0  # server-side exhaustive matching
@@ -509,9 +686,9 @@ def build_oracle_episode(
 ) -> dict[str, Any]:
     """Synthesize one oracle scene episode -> SFT example dict.
 
-    Trajectory: retrieve -> match/crop_and_match on top GT-overlap pairs ->
-    (match +) doppelganger_check on a low-overlap look-alike -> sfm_run ->
-    [extra matches + sfm_run when under-registered] -> inspect -> done.
+    Trajectory follows Scene-Level Graph Orchestration:
+    build_initial_graph -> inspect_graph -> [verify_doppelganger & prune_edges] ->
+    [bridge_components] -> sfm_run -> done.
     """
     scene_id = scene["scene_id"]
     n = scene["num_images"]
@@ -530,7 +707,7 @@ def build_oracle_episode(
         if sub_om[i, j] > 0
     ]
     cand.sort(key=lambda c: c[0], reverse=True)
-    if not cand:  # degenerate scene: fall back to consecutive pairs, ~0 overlap
+    if not cand:
         cand = [(0.02, i, i + 1) for i in range(n - 1)]
 
     # A low-GT-overlap "look-alike" pair is the doppelganger candidate.
@@ -550,236 +727,127 @@ def build_oracle_episode(
             default=None,
         )
         doppel_ij = (worst[1], worst[2]) if worst else None
-    # Whether this episode's check flags a doppelganger (~55%).
+
     flag_doppel = doppel_ij is not None and rng.random() < 0.55
     run_doppel_check = flag_doppel or (doppel_ij is not None and rng.random() < 0.45)
 
     steps: list[tuple[ToolCall, dict[str, Any] | None]] = []
-    used_pairs: set[str] = set()  # pair keys already matched ("do not repeat")
 
     def _emit(tool: str, args: dict[str, Any], result: dict[str, Any] | None) -> None:
-        if tool in ("match", "crop_and_match", "doppelganger_check"):
-            a = args.get("image_a") or args.get("image_id") or "?"
-            b = args.get("image_b") or "?"
-            used_pairs.add(_pair_key(a, b))
         steps.append((ToolCall(tool=tool, args=args), result))
 
-    # ---- retrieve --------------------------------------------------------
-    top_k = int(rng.choice([10, 15, 20, 25]))
-    retr = [
-        {"image_a": ids[i], "image_b": ids[j], "score": round(_retr_score(o, rng), 4)}
-        for o, i, j in cand[:top_k]
-    ]
-    # Retrieval noise: the look-alike pair leaks into the tail of the list.
-    if run_doppel_check and doppel_ij is not None and retr and rng.random() < 0.7:
-        di, dj = doppel_ij
-        key = _pair_key(ids[di], ids[dj])
-        if not any(
-            _pair_key(p["image_a"], p["image_b"]) == key for p in retr
-        ):
-            retr[-1] = {
-                "image_a": ids[di],
-                "image_b": ids[dj],
-                "score": round(float(rng.uniform(0.38, 0.60)), 4),
-            }
-    _emit("retrieve", {"top_k": top_k}, {"pairs": retr, "num_pairs": len(retr)})
+    # ---- 1. build_initial_graph ------------------------------------------
+    k_neighbors = int(rng.choice([1, 2, 3, 4, 5]))
+    cand_pairs: set[tuple[int, int]] = set()
+    for i in range(n):
+        neighbors = sorted(
+            [j for j in range(n) if j != i],
+            key=lambda j: sub_om[min(i, j), max(i, j)],
+            reverse=True,
+        )[:k_neighbors]
+        for j in neighbors:
+            cand_pairs.add((min(i, j), max(i, j)))
 
-    # ---- match / crop_and_match on the best pairs -------------------------
-    # Plain match on the top-overlap pairs; crop_and_match on mid-overlap
-    # pairs deeper in the retrieve list (the "crop when overlap is small"
-    # branch of the workflow).
-    n_match = int(min(rng.integers(4, 10), len(cand)))
-    n_top = int(min(rng.integers(3, 7), n_match))
-
-    def _emit_crop_and_match(o: float, i: int, j: int) -> None:
-        pose = _gt_relative_pose(_gt_pose(scene, i), _gt_pose(scene, j))
-        crop_pos, other = (i, j) if rng.random() < 0.5 else (j, i)
-        bbox = _gt_overlap_bbox(scene, geom, crop_pos, other, image_root, rng)
-        if bbox is None:
-            b = ORACLE_CROP_BOXES[int(rng.integers(0, len(ORACLE_CROP_BOXES)))]
-            bbox = [
-                round(float(np.clip(v + rng.normal(0, 0.02), 0.0, 1.0)), 3)
-                for v in b
-            ]
-        K = None
-        if geom is not None and geom.get("intrinsics") is not None:
-            try:
-                K = np.asarray(
-                    geom["intrinsics"][image_indices[crop_pos]], dtype=np.float64
-                )
-            except Exception:
-                K = None
-        size_wh = _image_size_wh(image_root, scene["image_paths"][crop_pos], K)
-        crop_res = _synth_crop_result(
-            ids[crop_pos], bbox, size_wh,
-            str(Path(image_root) / scene["image_paths"][crop_pos])
-            if image_root
-            else scene["image_paths"][crop_pos],
-        )
-        # Cropping zooms into the shared overlap -> boosted inlier ratio.
-        result = _synth_match_result(
-            max(o, 0.05) * rng.uniform(1.1, 1.5), pose, rng, matcher
-        )
-        result["crop"] = crop_res
-        result["cropped_image_id"] = crop_res["cropped_image_id"]
-        _emit(
-            "crop_and_match",
-            {
-                "image_id": ids[crop_pos],
-                "bbox": bbox,
-                "image_b": ids[other],
-                "matcher": matcher,
-            },
-            result,
-        )
-
-    for o, i, j in cand[:n_top]:
-        pose = _gt_relative_pose(_gt_pose(scene, i), _gt_pose(scene, j))
-        if 0.02 <= o < 0.35 and rng.random() < 0.5:
-            _emit_crop_and_match(o, i, j)
-        else:
-            _emit(
-                "match",
-                {"image_a": ids[i], "image_b": ids[j], "matcher": matcher},
-                _synth_match_result(o, pose, rng, matcher),
-            )
-
-    # Mid-overlap pairs from deeper in the retrieve list -> crop_and_match.
-    mid = [
-        c for c in cand[n_top:]
-        if 0.02 <= c[0] < 0.4 and _pair_key(ids[c[1]], ids[c[2]]) not in used_pairs
-    ]
-    n_crop = int(min(rng.integers(1, 3), len(mid), max(0, n_match - n_top)))
-    for o, i, j in mid[:n_crop]:
-        _emit_crop_and_match(o, i, j)
-    # Fill any remaining match budget with plain matches (unused pairs only).
-    emitted = sum(
-        1 for tc, _ in steps if tc.tool in ("match", "crop_and_match")
-    )
-    for o, i, j in cand:
-        if emitted >= n_match:
-            break
-        if _pair_key(ids[i], ids[j]) in used_pairs:
-            continue
-        pose = _gt_relative_pose(_gt_pose(scene, i), _gt_pose(scene, j))
-        _emit(
-            "match",
-            {"image_a": ids[i], "image_b": ids[j], "matcher": matcher},
-            _synth_match_result(o, pose, rng, matcher),
-        )
-        emitted += 1
-
-    # Occasional standalone crop -> match (teaches the two-step grammar).
-    if n_match and rng.random() < 0.12:
-        unused = [
-            c for c in cand
-            if _pair_key(ids[c[1]], ids[c[2]]) not in used_pairs
-        ]
-        pool = unused or cand
-        o, i, j = pool[int(rng.integers(0, len(pool)))]
-        crop_pos, other = (i, j) if rng.random() < 0.5 else (j, i)
-        b = ORACLE_CROP_BOXES[int(rng.integers(0, len(ORACLE_CROP_BOXES)))]
-        bbox = [
-            round(float(np.clip(v + rng.normal(0, 0.02), 0.0, 1.0)), 3)
-            for v in b
-        ]
-        K = None
-        if geom is not None and geom.get("intrinsics") is not None:
-            try:
-                K = np.asarray(geom["intrinsics"][image_indices[crop_pos]], dtype=np.float64)
-            except Exception:
-                K = None
-        size_wh = _image_size_wh(image_root, scene["image_paths"][crop_pos], K)
-        crop_res = _synth_crop_result(
-            ids[crop_pos], bbox, size_wh,
-            str(Path(image_root) / scene["image_paths"][crop_pos])
-            if image_root
-            else scene["image_paths"][crop_pos],
-        )
-        _emit("crop", {"image_id": ids[crop_pos], "bbox": bbox}, crop_res)
-        pose = _gt_relative_pose(_gt_pose(scene, crop_pos), _gt_pose(scene, other))
-        _emit(
-            "match",
-            {
-                "image_a": crop_res["cropped_image_id"],
-                "image_b": ids[other],
-                "matcher": matcher,
-            },
-            _synth_match_result(max(o, 0.05), pose, rng, matcher),
-        )
-
-    # ---- match the look-alike, then doppelganger_check it -----------------
-    flagged_keys: set[str] = set()
     if run_doppel_check and doppel_ij is not None:
+        cand_pairs.add((min(doppel_ij), max(doppel_ij)))
+
+    verified_pairs: set[tuple[int, int]] = set()
+    edge_ok = np.zeros((n, n), dtype=bool)
+    for i, j in cand_pairs:
+        if sub_om[i, j] >= 0.03:
+            verified_pairs.add((i, j))
+            edge_ok[i, j] = edge_ok[j, i] = True
+        elif run_doppel_check and (i, j) == (min(doppel_ij), max(doppel_ij)):
+            # False positive verified edge (look-alike loop closure)
+            verified_pairs.add((i, j))
+            edge_ok[i, j] = edge_ok[j, i] = True
+
+    cand_list = list(cand_pairs)
+    init_res = _synth_initial_graph_result(n, cand_list, list(verified_pairs), edge_ok, rng)
+    _emit("build_initial_graph", {"k_neighbors": k_neighbors, "matcher": matcher}, init_res)
+
+    # ---- 2. inspect_graph ------------------------------------------------
+    suspicious = [doppel_ij] if (run_doppel_check and doppel_ij is not None and (min(doppel_ij), max(doppel_ij)) in verified_pairs) else []
+    insp_res = _synth_inspect_graph_result(n, ids, verified_pairs, edge_ok, suspicious, rng)
+    _emit("inspect_graph", {}, insp_res)
+
+    # ---- 3. verify_doppelganger & prune_edges ----------------------------
+    flagged_keys: set[str] = set()
+    if run_doppel_check and doppel_ij is not None and (min(doppel_ij), max(doppel_ij)) in verified_pairs:
         di, dj = doppel_ij
-        key = _pair_key(ids[di], ids[dj])
-        if key not in used_pairs:
-            _emit(
-                "match",
-                {"image_a": ids[di], "image_b": ids[dj], "matcher": matcher},
-                _synth_match_result(0.0, None, rng, matcher),
-            )
-        result = _synth_doppelganger_result(flag_doppel, rng)
-        _emit(
-            "doppelganger_check",
-            {"image_a": ids[di], "image_b": ids[dj]},
-            result,
-        )
+        v_res = _synth_verify_doppelganger_result(ids[di], ids[dj], flag_doppel, rng)
+        _emit("verify_doppelganger", {"image_a": ids[di], "image_b": ids[dj]}, v_res)
+
         if flag_doppel:
-            flagged_keys.add(key)
+            pair_key = (min(di, dj), max(di, dj))
+            verified_pairs.discard(pair_key)
+            edge_ok[di, dj] = edge_ok[dj, di] = False
+            flagged_keys.add(_pair_key(ids[di], ids[dj]))
+            p_res = _synth_prune_edges_result([[ids[di], ids[dj]]], verified_pairs, n, ids)
+            _emit("prune_edges", {"pairs": [[ids[di], ids[dj]]]}, p_res)
 
-    # Occasional second check on a genuinely good pair -> clean verdict.
-    if cand and rng.random() < 0.15:
-        o, i, j = cand[int(rng.integers(0, min(3, len(cand))))]
-        _emit(
-            "doppelganger_check",
-            {"image_a": ids[i], "image_b": ids[j]},
-            _synth_doppelganger_result(False, rng),
-        )
+    if verified_pairs and rng.random() < 0.15:
+        gi, gj = list(verified_pairs)[0]
+        v_good = _synth_verify_doppelganger_result(ids[gi], ids[gj], False, rng)
+        _emit("verify_doppelganger", {"image_a": ids[gi], "image_b": ids[gj]}, v_good)
 
-    # ---- sfm_run -----------------------------------------------------------
-    num_checks = sum(1 for tc, _ in steps if tc.tool == "doppelganger_check")
+    # ---- 4. bridge_components (if disconnected) --------------------------
+    sizes, n_multi = _largest_components(n, edge_ok)
+    if n_multi > 1 or (sizes and sizes[0] < n and len(sizes) > 1):
+        comp0_nodes: list[int] = []
+        seen = [False] * n
+        stack = [0]
+        seen[0] = True
+        while stack:
+            u = stack.pop()
+            comp0_nodes.append(u)
+            for v in range(n):
+                if not seen[v] and edge_ok[u, v]:
+                    seen[v] = True
+                    stack.append(v)
+        other_nodes = [v for v in range(n) if v not in comp0_nodes]
+        if other_nodes:
+            best_bridge = max(
+                ((sub_om[min(u, v), max(u, v)], min(u, v), max(u, v)) for u in comp0_nodes for v in other_nodes),
+                key=lambda x: x[0],
+                default=None,
+            )
+            if best_bridge and best_bridge[0] > 0.01:
+                bu, bv = best_bridge[1], best_bridge[2]
+                verified_pairs.add((bu, bv))
+                edge_ok[bu, bv] = edge_ok[bv, bu] = True
+                b_res = _synth_bridge_components_result(0, 1, [[ids[bu], ids[bv]]], verified_pairs, n, ids)
+                _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": matcher}, b_res)
+
+    # ---- 5. sfm_run ------------------------------------------------------
     out_dir = f"{output_base}/{scene_id}_ep{ep_idx:04d}/sparse/0"
-    stragglers = int(rng.integers(0, 3)) if n >= 6 and rng.random() < 0.4 else 0
+    stragglers = int(rng.integers(0, 2)) if n >= 8 and rng.random() < 0.3 else 0
+    num_checks = sum(1 for tc, _ in steps if tc.tool == "verify_doppelganger")
     recon = _synth_sfm_result(
         scene, sub_om, flagged_keys, ids, num_checks, rng, out_dir,
-        stragglers=stragglers,
+        stragglers=stragglers, active_edge_count=len(verified_pairs),
     )
     _emit("sfm_run", {}, recon)
 
-    # Recovery: under-registered (or no convergence) -> match a few more
-    # pairs and re-run COLMAP, per the prompt's retry instruction.
-    if recon["num_registered"] < 0.8 * n and rng.random() < 0.65:
-        extra = [
-            c for c in cand
-            if _pair_key(ids[c[1]], ids[c[2]]) not in used_pairs
-        ][:4]
-        for o, i, j in extra:
-            pose = _gt_relative_pose(_gt_pose(scene, i), _gt_pose(scene, j))
-            _emit(
-                "match",
-                {"image_a": ids[i], "image_b": ids[j], "matcher": matcher},
-                _synth_match_result(o, pose, rng, matcher),
-            )
-        if extra:
+    # Recovery: under-registered -> bridge or add matches and re-run sfm_run
+    if recon["num_registered"] < 0.8 * n and rng.random() < 0.5:
+        added = False
+        for o, i, j in cand:
+            if (i, j) not in verified_pairs and _pair_key(ids[i], ids[j]) not in flagged_keys:
+                verified_pairs.add((i, j))
+                edge_ok[i, j] = edge_ok[j, i] = True
+                added = True
+                break
+        if added:
+            b_res = _synth_bridge_components_result(0, 1, [[ids[i], ids[j]]], verified_pairs, n, ids)
+            _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 2, "matcher": matcher}, b_res)
             recon = _synth_sfm_result(
                 scene, sub_om, flagged_keys, ids, num_checks, rng, out_dir,
-                stragglers=0,
+                stragglers=0, active_edge_count=len(verified_pairs),
             )
             _emit("sfm_run", {}, recon)
 
-    # ---- inspect + done -----------------------------------------------------
-    _emit(
-        "inspect",
-        {},
-        {
-            "num_images": recon["num_registered"],
-            "num_registered": recon["num_registered"],
-            "num_points3d": recon["num_points3d"],
-            "num_cameras": 1,
-            "mean_reproj_error": recon["mean_reproj_error"],
-        },
-    )
+    # ---- 6. done ---------------------------------------------------------
     _emit("done", {}, None)
 
     # ---- messages (exactly the run_scene_episode layout) --------------------
@@ -795,7 +863,7 @@ def build_oracle_episode(
                 f"Scene {scene_id} has {n} images. "
                 f"Showing {n_show} thumbnails. "
                 f"Registered as img_0000 through img_{n - 1:04d}. "
-                f"Use retrieve to find good pairs, then match them, then run sfm_run."
+                f"Call build_initial_graph to initialize the view graph, inspect/optimize it, and run sfm_run."
             ),
         }
     )
@@ -960,7 +1028,7 @@ def main() -> None:
                 continue
             tool = call.get("tool", "?")
             tool_hist[tool] = tool_hist.get(tool, 0) + 1
-            if tool == "doppelganger_check":
+            if tool == "verify_doppelganger":
                 seen_flag = True
         n_flagged += int(seen_flag)
     summary = {
@@ -968,12 +1036,15 @@ def main() -> None:
         "num_episodes": len(examples),
         "scenes": sorted({ex["scene_id"] for ex in examples}),
         "tool_histogram": tool_hist,
-        "episodes_with_doppelganger_check": n_flagged,
+        "episodes_with_doppelganger_verification": n_flagged,
         "mean_images": float(np.mean([ex["num_images"] for ex in examples])) if examples else 0.0,
         "mean_reward": float(np.mean([ex["reward"] for ex in examples])) if examples else 0.0,
         "seed": args.seed,
     }
-    summary_path = out_path.parent / "scene_sft_summary.json"
+    summary_path = out_path.parent / (
+        "scene_sft_summary.json" if out_path.name == "scene_sft_train.jsonl"
+        else f"{out_path.stem}_summary.json"
+    )
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     logger.info("Saved %d scene SFT examples to %s", len(examples), out_path)

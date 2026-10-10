@@ -58,6 +58,19 @@ def _count_image_slots(messages: list[dict]) -> int:
     return n
 
 
+def _set_max_image_pixels(processor, max_pixels: int) -> None:
+    """Cap per-image token budget.
+
+    Works on plain dicts and on transformers' ``SizeDict`` dataclass (which
+    is NOT an ``isinstance(size, dict)`` — a prior check silently skipped it,
+    leaving the 16.7M-pixel default and ~1,850-token images).
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    size = getattr(image_processor, "size", None)
+    if size is not None and "longest_edge" in size:
+        size["longest_edge"] = min(int(size["longest_edge"]), int(max_pixels))
+
+
 def _load_example_images(ex: dict) -> list:
     """Scene or pair images plus any crop frames stored on the SFT example.
 
@@ -67,7 +80,7 @@ def _load_example_images(ex: dict) -> list:
     """
     if ex.get("image_paths"):
         images = []
-        for path in ex["image_paths"]:
+        for path in ex["image_paths"][:_count_image_slots(ex.get("messages") or []) or None]:
             try:
                 images.append(Image.open(path).convert("RGB"))
             except Exception:
@@ -148,6 +161,8 @@ class SFTTrainer:
             torch_dtype=torch.bfloat16,
             device_map=self.device,
         )
+        max_image_pixels = self.config.get("data", {}).get("max_image_pixels", 1003520)
+        _set_max_image_pixels(self._processor, max_image_pixels)
 
         lora_cfg = LoraConfig(
             r=self.lora_config["rank"],
@@ -158,6 +173,15 @@ class SFTTrainer:
         )
         self._model = get_peft_model(self._model, lora_cfg)
         self._model.print_trainable_parameters()
+
+        # Scene examples run ~10k-token multimodal sequences; without
+        # checkpointing activations exceed the L40S's 44 GiB even at bs=1.
+        self._model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self._model.enable_input_require_grads()
+        if getattr(self._model.config, "use_cache", None) is not None:
+            self._model.config.use_cache = False
 
         trainable = [p for p in self._model.parameters() if p.requires_grad]
         self._optimizer = torch.optim.AdamW(
@@ -236,20 +260,17 @@ class SFTTrainer:
                 mask_tensor = torch.tensor(mask, device=self.device, dtype=torch.bool)
 
                 outputs = self._model(**inputs)
-                logits = outputs.logits[:, :-1, :]
-                target_ids = inputs["input_ids"][:, 1:]
-                token_logps = F.log_softmax(logits, dim=-1)
-                per_token_logps = token_logps.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-
-                # Shift mask: logps[i] predicts token i+1
-                assistant_mask = mask_tensor[1:].to(per_token_logps.device)
-
-                if assistant_mask.sum() == 0:
+                # Select assistant positions *before* softmax — a full
+                # [L, vocab] log_softmax copy costs multiple GB at L~10k.
+                logits = outputs.logits[0, :-1]                    # [L-1, V]
+                targets = inputs["input_ids"][0, 1:]               # [L-1]
+                assistant_mask = mask_tensor[1:].to(logits.device)
+                sel_logits = logits[assistant_mask]                # [n_sel, V]
+                if sel_logits.shape[0] == 0:
                     continue
-
-                # Cross-entropy on assistant tokens: logps already gathered at targets.
-                masked_logps = per_token_logps[0][assistant_mask]
-                loss = -masked_logps.mean()
+                loss = F.cross_entropy(
+                    sel_logits.float(), targets[assistant_mask]
+                )
 
                 loss = loss / self.grad_accum
                 loss.backward()
@@ -261,6 +282,8 @@ class SFTTrainer:
                     f"SFT step failed for "
                     f"{ex.get('pair_id') or ex.get('scene_id', '?')}: {e}"
                 )
+                self._optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
                 continue
 
         if valid_count > 0 and is_last_accum:
@@ -310,6 +333,7 @@ class SFTTrainer:
             rng.shuffle(indices)
 
             epoch_losses = []
+            epoch_valid = 0
             micro_step = 0
 
             for batch_start in range(0, len(examples), self.batch_size):
@@ -321,6 +345,7 @@ class SFTTrainer:
 
                 stats = self.train_step(batch, accum_step=micro_step, is_last_accum=is_last_accum)
                 epoch_losses.append(stats["loss"])
+                epoch_valid += stats["valid_count"]
 
                 if is_last_accum:
                     global_step += 1
@@ -334,8 +359,12 @@ class SFTTrainer:
                                 "sft/global_step": global_step,
                             })
 
+            if epoch_valid < 0.95 * len(examples):
+                raise RuntimeError(
+                    f"Only {epoch_valid}/{len(examples)} SFT examples succeeded in epoch {epoch + 1}"
+                )
             mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-            logger.info(f"Epoch {epoch+1} mean loss: {mean_loss:.4f}")
+            logger.info(f"Epoch {epoch+1} mean loss: {mean_loss:.4f}; valid={epoch_valid}/{len(examples)}")
 
             if (epoch + 1) % self.save_freq == 0:
                 self.save_lora_checkpoint(epoch + 1)

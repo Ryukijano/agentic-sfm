@@ -62,6 +62,13 @@ if squeue -j 7894645 -h -o '%T' 2>/dev/null | grep -Eq 'RUNNING|PENDING'; then
   echo "Wait for it to finish, then resubmit."
   exit 1
 fi
+# Refuse to share outputs/phase1_hard with another live hard-pair job.
+if squeue --me -h -n asfm-grpo-hard,asfm-grpo-hard2 -o '%A %T' 2>/dev/null \
+    | awk -v me="${SLURM_JOB_ID}" '$1 != me && $2 ~ /RUNNING|PENDING/' | grep -q .; then
+  echo "ERROR: another hard-pair GRPO job is already queued or running."
+  squeue --me -n asfm-grpo-hard,asfm-grpo-hard2
+  exit 1
+fi
 
 VLLM_PORT=$((39000 + SLURM_JOB_ID % 20000))
 TOOL_SERVER_PORT=$((19000 + SLURM_JOB_ID % 20000))

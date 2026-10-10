@@ -199,13 +199,13 @@ def evaluate_scenes(
 def _print_summary_table(results: dict[str, dict[str, Any]]) -> None:
     keys = [
         ("success_rate", "{:.2%}"),
+        ("eval_score", "{:.3f}"),
         ("mean_registration_registered_fraction", "{:.3f}"),
-        ("mean_registration_num_points3d", "{:.0f}"),
-        ("mean_registration_mean_reproj_error_px", "{:.3f}"),
+        ("mean_reconstruction_eval_score", "{:.3f}"),
+        ("mean_pose_reported_mean_error_deg", "{:.2f}"),
         ("mean_pose_rel_auc_10", "{:.3f}"),
-        ("mean_pose_rel_rot_err_mean_deg", "{:.2f}"),
-        ("mean_doppelganger_f1", "{:.3f}"),
         ("mean_efficiency_num_tool_calls", "{:.1f}"),
+        ("any_registered_rate", "{:.2%}"),
         ("reward_mean", "{:.3f}"),
     ]
     header = f"{'mode':10s} " + " ".join(f"{k[:18]:>18s}" for k, _ in keys)
@@ -214,7 +214,7 @@ def _print_summary_table(results: dict[str, dict[str, Any]]) -> None:
     for mode, agg in results.items():
         row = f"{mode:10s} "
         for key, fmt in keys:
-            v = agg.get(f"scene_eval_{key}")
+            v = agg.get(f"scene_eval/{key}")
             row += f"{fmt.format(v):>18s} " if v is not None else f"{'—':>18s} "
         logger.info(row)
 
@@ -234,6 +234,17 @@ def main():
     parser.add_argument("--lora-checkpoint", default=None,
                         help="LoRA adapter path to load into vLLM for agent mode")
     parser.add_argument("--output-dir", default="outputs/scene_eval")
+    parser.add_argument(
+        "--max-scannet-scenes",
+        type=int,
+        default=0,
+        help="Append this many ScanNet holdout scenes (0 = MegaDepth only).",
+    )
+    parser.add_argument(
+        "--scannet-root",
+        default=None,
+        help="Override data.scannet_root for the holdout pool.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Log metrics to WandB")
     args = parser.parse_args()
 
@@ -250,15 +261,36 @@ def main():
     # Build scene dataset (reuses the Phase 2 training loader)
     from scripts.run_scene_grpo import SceneDataset
 
+    max_images = args.max_images_per_scene or data_cfg.get("max_images_per_scene", 20)
     scene_dataset = SceneDataset.from_megadepth(
         scene_info_dir=data_cfg.get("scene_info_dir", "data/megadepth/scene_info"),
         image_root=data_cfg.get("image_root", ""),
         scene_ids=args.scene_ids,
-        max_images_per_scene=args.max_images_per_scene
-        or data_cfg.get("max_images_per_scene", 20),
+        max_images_per_scene=max_images,
         min_images_per_scene=data_cfg.get("min_images_per_scene", 5),
     )
-    scenes = scene_dataset.scenes[: args.max_scenes] if args.max_scenes else scene_dataset.scenes
+    scenes = list(scene_dataset.scenes)
+    if args.max_scannet_scenes > 0:
+        scannet_root = args.scannet_root or data_cfg.get("scannet_root") or (
+            "/scratch/kcwp264/data/megadepth/scannet_test_1500"
+        )
+        # r5 training left ScanNet off; this holdout is unseen by best_eval.
+        holdout_ids = [
+            "scene0707_00", "scene0708_00", "scene0709_00", "scene0710_00",
+            "scene0711_00", "scene0712_00", "scene0713_00", "scene0714_00",
+        ][: args.max_scannet_scenes]
+        sn = SceneDataset.from_scannet(
+            scannet_root,
+            scene_ids=holdout_ids,
+            max_images_per_scene=max_images,
+            min_images_per_scene=data_cfg.get("min_images_per_scene", 5),
+        )
+        scenes.extend(sn.scenes)
+        logger.info(
+            "ScanNet holdout: %s", [s["scene_id"] for s in sn.scenes]
+        )
+    if args.max_scenes is not None:
+        scenes = scenes[: args.max_scenes]
     logger.info(f"Evaluating {len(scenes)} scenes: {[s['scene_id'] for s in scenes]}")
     if not scenes:
         logger.error("No scenes found — check data.scene_info_dir / image_root in config")
@@ -292,7 +324,7 @@ def main():
     for mode in args.mode:
         agent = None
         if mode == "agent":
-            from scripts.run_grpo import VLLMRolloutAgent
+            from scripts.run_grpo import VLLMRolloutAgent, load_vllm_lora
 
             agent = VLLMRolloutAgent(
                 vllm_url=args.vllm_url,
@@ -311,23 +343,11 @@ def main():
             # are read via getattr(agent, "reward_config") in scene_episode.
             agent.reward_config = reward_cfg
 
-            # Optionally load a LoRA checkpoint into the vLLM server.
             ckpt = args.lora_checkpoint or config["model"].get("checkpoint")
-            if ckpt:
-                try:
-                    import httpx
-
-                    httpx.post(
-                        f"{args.vllm_url.rstrip('/')}/v1/load_lora_adapter",
-                        json={"lora_name": "eval", "lora_path": str(Path(ckpt).resolve())},
-                        headers={"Authorization": "Bearer EMPTY"},
-                        timeout=60,
-                    )
-                    agent._lora_loaded = True
-                    agent.vllm_model = "eval"
-                    logger.info(f"Loaded LoRA adapter into vLLM: {ckpt}")
-                except Exception as e:
-                    logger.warning(f"Could not load LoRA adapter {ckpt}: {e}")
+            if not ckpt:
+                logger.error("agent mode requires --lora-checkpoint (do not eval base Qwen)")
+                sys.exit(1)
+            load_vllm_lora(args.vllm_url, ckpt, agent, adapter_name="eval", version=1)
         elif mode == "oracle":
             agent = _ShimAgent(matcher=data_cfg.get("matcher", DEFAULT_MATCHER),
                              reward_config=reward_cfg)

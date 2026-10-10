@@ -111,6 +111,68 @@ class ToolClient:
         r.raise_for_status()
         return r.json()
 
+    def build_initial_graph(
+        self,
+        image_ids: list[str],
+        k_neighbors: int = 5,
+        matcher: str = DEFAULT_MATCHER,
+        session: str = "",
+    ) -> dict[str, Any]:
+        r = self.client.post(
+            "/build_initial_graph",
+            json={
+                "image_ids": image_ids,
+                "k_neighbors": k_neighbors,
+                "matcher": matcher,
+                "session": session,
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def inspect_graph(self, session: str = "") -> dict[str, Any]:
+        r = self.client.post("/inspect_graph", json={"session": session})
+        r.raise_for_status()
+        return r.json()
+
+    def verify_doppelganger(
+        self, image_a: str, image_b: str, session: str = ""
+    ) -> dict[str, Any]:
+        r = self.client.post(
+            "/verify_doppelganger",
+            json={"image_a": image_a, "image_b": image_b, "session": session},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def prune_edges(self, pairs: list[list[str]], session: str = "") -> dict[str, Any]:
+        r = self.client.post(
+            "/prune_edges", json={"pairs": pairs, "session": session}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def bridge_components(
+        self,
+        comp_a_id: int = 0,
+        comp_b_id: int = 1,
+        budget: int = 3,
+        matcher: str = DEFAULT_MATCHER,
+        session: str = "",
+    ) -> dict[str, Any]:
+        r = self.client.post(
+            "/bridge_components",
+            json={
+                "comp_a_id": comp_a_id,
+                "comp_b_id": comp_b_id,
+                "budget": budget,
+                "matcher": matcher,
+                "session": session,
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
     def close(self):
         if self._client:
             self._client.close()

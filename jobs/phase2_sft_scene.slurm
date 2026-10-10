@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=85G
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/scratch/kcwp264/logs/agentic-sfm/scene_sft_%j.out
 #SBATCH --error=/scratch/kcwp264/logs/agentic-sfm/scene_sft_%j.err
 
@@ -19,7 +19,7 @@ echo "Start: $(date)"
 
 PROJECT_ROOT="/scratch/kcwp264/agentic-sfm"
 CONFIG="${PROJECT_ROOT}/configs/phase2_sft_scene.yaml"
-OUTPUT_DIR="/scratch/kcwp264/agentic-sfm/outputs/scene_sft"
+OUTPUT_DIR="/scratch/kcwp264/agentic-sfm/outputs/scene_sft_graph_retry2"
 LOG_DIR="/scratch/kcwp264/logs/agentic-sfm"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
@@ -44,13 +44,13 @@ assert_qwen35_runtime()
 print("Policy runtime check passed")
 PY
 
-if [ ! -s data/scene_sft_train.jsonl ]; then
-    echo "ERROR: data/scene_sft_train.jsonl is missing or empty."
-    echo "Run: python scripts/build_scene_sft.py --num-episodes 200"
+if [ ! -s data/scene_sft_graph_train.jsonl ]; then
+    echo "ERROR: data/scene_sft_graph_train.jsonl is missing or empty."
+    echo "Run: python scripts/build_scene_sft.py --num-episodes 200 --output data/scene_sft_graph_train.jsonl"
     exit 1
 fi
 
-echo "Scene SFT examples: $(wc -l < data/scene_sft_train.jsonl)"
+echo "Scene SFT examples: $(wc -l < data/scene_sft_graph_train.jsonl)"
 CUDA_VISIBLE_DEVICES=0 python scripts/run_sft.py \
     --config "${CONFIG}" \
     --output-dir "${OUTPUT_DIR}" \

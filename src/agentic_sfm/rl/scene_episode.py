@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -71,16 +73,77 @@ def _is_connection_error(exc: BaseException) -> bool:
     )
 
 
+def stage_episode_images(
+    image_paths: list[str],
+    image_root: str = "",
+    session_id: str = "",
+) -> str:
+    """Stage exactly the N episode images into an isolated directory via symlinks.
+
+    Guarantees COLMAP sees ONLY the images in this episode, preventing
+    discovery of non-sampled images in the dataset directory.
+    """
+    import shutil
+    import tempfile
+
+    candidates = [
+        Path("/dev/shm"),
+        Path(os.environ.get("TMP_SHARED", "")) if os.environ.get("TMP_SHARED") else None,
+        Path(tempfile.gettempdir()),
+    ]
+    base_dir = None
+    for cand in candidates:
+        if cand is not None and cand.exists() and os.access(cand, os.W_OK):
+            base_dir = cand
+            break
+    if base_dir is None:
+        base_dir = Path(tempfile.gettempdir())
+
+    stage_id = session_id or uuid.uuid4().hex[:8]
+    stage_dir = base_dir / f"asfm_stage_{stage_id}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, path in enumerate(image_paths):
+        full_path = Path(image_root) / path if image_root else Path(path)
+        full_path = full_path.resolve()
+        ext = full_path.suffix or ".jpg"
+        sym_name = f"img_{i:04d}{ext}"
+        target = stage_dir / sym_name
+        if not target.exists():
+            try:
+                target.symlink_to(full_path)
+            except Exception:
+                shutil.copy2(full_path, target)
+    return str(stage_dir)
+
+
+def cleanup_stage_dir(stage_dir: str) -> None:
+    """Clean up the isolated staging directory and symlinks."""
+    if not stage_dir or not os.path.exists(stage_dir):
+        return
+    import shutil
+    try:
+        shutil.rmtree(stage_dir)
+    except Exception as e:
+        logger.debug(f"Failed to clean up staging dir {stage_dir}: {e}")
+
+
 def _register_scene_images(
     tool_client: ToolClient,
     image_paths: list[str],
     image_root: str = "",
+    staged_dir: str = "",
 ) -> dict[str, str]:
     """Register scene images; abort immediately if the tool server is down."""
     registered_ids: dict[str, str] = {}
     for i, path in enumerate(image_paths):
         img_id = f"img_{i:04d}"
-        full = str(Path(image_root) / path) if image_root else path
+        if staged_dir and os.path.isdir(staged_dir):
+            ext = Path(path).suffix or ".jpg"
+            staged_file = os.path.join(staged_dir, f"img_{i:04d}{ext}")
+            full = staged_file if os.path.exists(staged_file) else (str(Path(image_root) / path) if image_root else path)
+        else:
+            full = str(Path(image_root) / path) if image_root else path
         try:
             tool_client.register_image(img_id, full)
             registered_ids[path] = img_id
@@ -154,6 +217,148 @@ def _sfm_pair_list(
                 continue
             pair_list.append([a, b])
     return pair_list, len(flagged), n_filtered
+
+
+# Matches agent-facing image ids: "img_0012" (crop suffixes are stripped by
+# _base_image_id first); bare positional indices are accepted too.
+_EPISODE_IMG_ID_RE = re.compile(r"^img_(\d{1,6})$")
+
+
+def _episode_image_index(image_id: Any, num_images: int) -> int | None:
+    """Resolve an agent-facing image id to its episode-local index.
+
+    Agent-facing ids are ``img_0000..img_{N-1:04d}`` — the position in
+    ``image_paths`` (exactly how ``_register_scene_images`` names them), which
+    is also the row/column of the episode's ``sub_om`` covisibility submatrix.
+    """
+    s = _base_image_id(str(image_id)).strip()
+    m = _EPISODE_IMG_ID_RE.match(s)
+    if m:
+        i = int(m.group(1))
+    elif s.isdigit():
+        i = int(s)
+    else:
+        return None
+    return i if 0 <= i < num_images else None
+
+
+def _in_play_pairs(
+    ep: SceneRolloutEpisode,
+    tool_client: Any = None,
+) -> list[tuple[str, str]]:
+    """Collect the episode-local image-id pairs that were actually in play.
+
+    Union of (a) the active edge list from the most recent
+    ``inspect_graph``/``build_initial_graph`` result carrying an ``edges``
+    field (one extra read-only ``inspect_graph`` call at episode end when the
+    episode used graph tools but no result carried edges), (b) pairs sent to
+    ``verify_doppelganger``/``doppelganger_check`` (tool-call args plus the
+    recorded ``ep.doppelganger_checks`` keys), (c) ``prune_edges`` pair args,
+    and (d) the explicit ``sfm_run`` pair list plus retrieve-style ``pairs``
+    results.  Ids stay in the agent-facing ``img_XXXX`` namespace.
+    """
+    pairs: set[tuple[str, str]] = set()
+
+    def _add(a: Any, b: Any) -> None:
+        a_s, b_s = _base_image_id(str(a)), _base_image_id(str(b))
+        if a_s and b_s and a_s not in ("?", "") and b_s not in ("?", "") and a_s != b_s:
+            pairs.add((a_s, b_s) if a_s <= b_s else (b_s, a_s))
+
+    def _add_pairs_list(raw: Any) -> None:
+        if not isinstance(raw, list):
+            return
+        for p in raw:
+            if isinstance(p, dict):
+                _add(p.get("image_a"), p.get("image_b"))
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                _add(p[0], p[1])
+
+    # (a) most recent graph result carrying an active edge list
+    edges: list[Any] | None = None
+    for res in reversed(ep.results):
+        if isinstance(res, dict) and isinstance(res.get("edges"), list):
+            edges = res["edges"]
+            break
+    if edges is None and tool_client is not None:
+        used_graph_tools = any(
+            tc.tool in ("build_initial_graph", "inspect_graph", "prune_edges",
+                        "bridge_components")
+            for tc in ep.tool_calls
+        )
+        if used_graph_tools and hasattr(tool_client, "inspect_graph"):
+            # Read-only final read of the session's view graph so the episode
+            # knows which edges the reconstruction actually used.
+            try:
+                res = tool_client.inspect_graph(session=ep.session_id)
+                if isinstance(res, dict) and isinstance(res.get("edges"), list):
+                    edges = res["edges"]
+            except Exception as e:
+                logger.debug(f"Episode-end inspect_graph failed: {e}")
+    _add_pairs_list(edges)
+
+    # (b) doppelganger checks: recorded pair keys + tool-call args
+    for key in ep.doppelganger_checks:
+        parts = str(key).split("__")
+        if len(parts) == 2:
+            _add(parts[0], parts[1])
+    for tc in ep.tool_calls:
+        if tc.tool in ("verify_doppelganger", "doppelganger_check"):
+            _add(
+                tc.args.get("image_a"),
+                tc.args.get("image_b") or tc.args.get("image_id"),
+            )
+        elif tc.tool == "prune_edges":
+            # (c) prune_edges pair args
+            _add_pairs_list(tc.args.get("pairs"))
+
+    # (d) explicit sfm pair list + retrieve-style pair results
+    _add_pairs_list(getattr(ep, "sfm_pair_list", None))
+    for res in ep.results:
+        if isinstance(res, dict):
+            _add_pairs_list(res.get("pair_list"))
+            if isinstance(res.get("pairs"), list):
+                _add_pairs_list(res["pairs"])
+
+    return sorted(pairs)
+
+
+def _gt_impostor_pairs(
+    ep: SceneRolloutEpisode,
+    overlap_matrix: np.ndarray | None,
+    image_indices: list[int] | None,
+    tool_client: Any = None,
+) -> list[list[str]] | None:
+    """Ground-truth doppelganger labels from the covisibility matrix.
+
+    MegaDepth overlap semantics: > 0 means measured covisibility, 0.0 means
+    measured none, and -1.0 means never measured.  Both ``<= 0`` values mean
+    "not actually overlapping", so an in-play pair on such a value is a true
+    doppelganger.  Returns ``[[img_a, img_b], ...]`` in the agent-facing id
+    namespace, or ``None`` when GT overlap data is unavailable (pure mock
+    episodes — the reward then uses its gated fallback).
+    """
+    if overlap_matrix is None or image_indices is None:
+        return None
+    om = np.asarray(overlap_matrix)
+    if om.ndim != 2:
+        return None
+    n = len(ep.image_paths)
+    if n < 2 or len(image_indices) != n:
+        return None
+    try:
+        sub_om = om[np.ix_(image_indices, image_indices)]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+    impostors: list[list[str]] = []
+    for a, b in _in_play_pairs(ep, tool_client=tool_client):
+        i = _episode_image_index(a, n)
+        j = _episode_image_index(b, n)
+        if i is None or j is None or i == j:
+            continue
+        if float(sub_om[i, j]) <= 0.0:
+            impostors.append([a, b])
+    return impostors
 
 
 def _inject_pose_error(
@@ -239,40 +444,44 @@ def _inject_pose_error(
 
 # System prompt for scene-level episodes
 SCENE_SYSTEM_PROMPT = """\
-You are an SfM agent. Reconstruct the scene from its images (img_0000, \
-img_0001, ...). Output exactly one JSON tool call per turn:
+You are a Photogrammetry Director agent. Reconstruct the 3D scene from its images (img_0000, img_0001, ...) by actively constructing, verifying, and optimizing the view graph. Output exactly one JSON tool call per turn:
 {"tool": "name", "args": {...}}
 
 Tools:
-- retrieve {"top_k": 20} -> candidate pairs [{"image_a","image_b","score"}]
-- match {"image_a","image_b","matcher":"loftr"} -> num_inliers, inlier_ratio, \
-pose
-- crop {"image_id","bbox":[x1,y1,x2,y2]} -> cropped_image_id; bbox coords 0-1
-- crop_and_match {"image_id","bbox":[...],"image_b","matcher"} -> crop + match \
-in one step; use when overlap is small
-- doppelganger_check {"image_a","image_b"} -> is_doppelganger, confidence, \
-inlier_ratio; detects look-alike pairs of a different place
-- sfm_run {} -> COLMAP reconstruction: num_registered, num_points3d, \
-mean_reproj_error
-- inspect {} -> stats of the last reconstruction
+- build_initial_graph {"k_neighbors": 5, "matcher": "loftr"} -> initializes view graph via visual retrieval and batch matching; returns graph summary (num_components, isolated_images, bottlenecks, suspicious_cycles)
+- inspect_graph {} -> analyzes current view graph topology, connected components, articulation bridges, and rotation cycle residuals
+- verify_doppelganger {"image_a": "img_0000", "image_b": "img_0001"} -> checks if a pair is a visual doppelganger / symmetry ambiguity using cycle rotation consistency and appearance similarity
+- prune_edges {"pairs": [["img_0000", "img_0001"]]} -> removes incorrect or ambiguous edges from the view graph before reconstruction
+- bridge_components {"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": "loftr"} -> searches for cross-component candidate pairs and attempts to connect disconnected subgraphs
+- sfm_run {} -> runs incremental SfM on the verified active view graph; returns num_registered, num_points3d, mean_reproj_error
+- inspect {} -> detailed statistics of the reconstruction
 - done {} -> end episode
 
-Workflow: retrieve once; match the best 5-10 pairs (crop_and_match for small \
-overlap); doppelganger_check suspicious pairs — similar look but low \
-inlier_ratio — BEFORE sfm_run (flagged pairs are filtered out); then sfm_run \
-and inspect; if few images registered, match more and rerun; done when most \
-are registered.
+Workflow:
+1. Always start by calling build_initial_graph to create the initial view graph.
+2. Call inspect_graph or inspect suspicious_cycles in the initial summary.
+3. If suspicious cycles or symmetry ambiguities exist, call verify_doppelganger on those pairs.
+4. Call prune_edges to eliminate verified doppelganger edges.
+5. If the graph has multiple disconnected components (num_components > 1), call bridge_components to connect them.
+6. Call sfm_run to reconstruct the scene from the verified graph.
+7. Call done when reconstruction succeeds.
 
-Reward: higher for more registered images, accurate poses, and filtered \
-doppelgangers. sfm_run with too few or bad matches scores low. Do not repeat \
-calls.
+Reward: higher for registered images (coverage) and accurate camera poses. Failed or empty graphs incur a severe penalty. Do not repeat calls.
 
 Examples:
-{"tool": "retrieve", "args": {"top_k": 15}}
-{"tool": "match", "args": {"image_a": "img_0000", "image_b": "img_0001", "matcher": "loftr"}}
-{"tool": "doppelganger_check", "args": {"image_a": "img_0002", "image_b": "img_0007"}}
+{"tool": "build_initial_graph", "args": {"k_neighbors": 5, "matcher": "loftr"}}
+{"tool": "inspect_graph", "args": {}}
+{"tool": "verify_doppelganger", "args": {"image_a": "img_0000", "image_b": "img_0001"}}
+{"tool": "prune_edges", "args": {"pairs": [["img_0000", "img_0001"]]}}
+{"tool": "bridge_components", "args": {"comp_a_id": 0, "comp_b_id": 1, "budget": 3}}
 {"tool": "sfm_run", "args": {}}
 {"tool": "done", "args": {}}"""
+
+
+# Must match vLLM --limit-mm-per-prompt image:N and stay under --max-model-len.
+SCENE_MAX_PROMPT_IMAGES = 4
+SCENE_CONTEXT_BUDGET = 7000  # tokens (chars/4 estimate + image cost)
+_IMG_TOKEN_COST = 512         # ~vision tokens at 401408 px (SFT pixel cap)
 
 
 @dataclass
@@ -294,9 +503,14 @@ class SceneRolloutEpisode:
     pair_matches: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Doppelganger checks: canonical pair key ("idA__idB", sorted, crop
-    # suffixes stripped) -> raw /doppelganger_check response.  Pairs whose
-    # confidence exceeds the flag threshold are excluded from sfm_run.
+    # suffixes stripped) -> raw /doppelganger_check or /verify_doppelganger
+    # response.  Pairs whose confidence exceeds the flag threshold are
+    # excluded from sfm_run.
     doppelganger_checks: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # Explicit pair list handed to the last sfm_run (None = server-side
+    # exhaustive/graph-driven matching).  Used for GT doppelganger labelling.
+    sfm_pair_list: list[list[str]] | None = None
 
     # Final reconstruction result
     recon_result: dict[str, Any] = field(default_factory=dict)
@@ -318,6 +532,9 @@ class SceneRolloutEpisode:
     # Unique per-episode id — scopes the server's match store so sibling
     # rollouts / earlier epochs can't subsidize this episode's sfm_run.
     session_id: str = ""
+    # Isolated staging directory where symlinks to exact episode images live
+    staged_image_dir: str = ""
+
 
 
 def _scene_reward_kwargs(agent: Any) -> dict[str, Any]:
@@ -337,6 +554,14 @@ def _scene_reward_kwargs(agent: Any) -> dict[str, Any]:
         "first_call_validity_weight": cfg.get("first_call_validity_weight", 0.5),
         "first_call_invalid_penalty": cfg.get("first_call_invalid_penalty", 1.0),
         "gate_geometry_on_validity": cfg.get("gate_geometry_on_validity", True),
+        # Graph sparsity cost (only applies when coverage >= 0.7; normalized
+        # by the exhaustive N(N-1)/2 pair count) and the opt-in gate for the
+        # self-certified doppelganger fallback (disabled by default — real
+        # scoring is against GT-derived impostor labels).
+        "graph_cost_weight": cfg.get("graph_cost_weight", 0.0),
+        "allow_self_certified_doppelganger": cfg.get(
+            "allow_self_certified_doppelganger", False
+        ),
     }
 
 
@@ -367,11 +592,17 @@ def run_scene_episode(
     )
     ep.session_id = f"{scene_id}-{uuid.uuid4().hex[:8]}"
 
-    # Register all images with the tool server
-    registered_ids = _register_scene_images(tool_client, image_paths, image_root)
+    # Stage exact N episode images into isolated directory
+    ep.staged_image_dir = stage_episode_images(image_paths, image_root=image_root, session_id=ep.session_id)
 
-    # Build initial message with scene images (first N as thumbnails)
-    n_show = min(len(image_paths), 8)  # show up to 8 images
+    # Register all images with the tool server
+    registered_ids = _register_scene_images(
+        tool_client, image_paths, image_root=image_root, staged_dir=ep.staged_image_dir
+    )
+
+    # Build initial message with scene images (first N as thumbnails).
+    # Must stay <= vLLM --limit-mm-per-prompt image:4 (Phase 2 r5).
+    n_show = min(len(image_paths), SCENE_MAX_PROMPT_IMAGES)
     ep.images = []
     content: list[dict[str, Any]] = []
     for i in range(n_show):
@@ -389,7 +620,7 @@ def run_scene_episode(
             f"Scene {scene_id} has {len(image_paths)} images. "
             f"Showing {n_show} thumbnails. "
             f"Registered as img_0000 through img_{len(image_paths)-1:04d}. "
-            f"Use retrieve to find good pairs, then match them, then run sfm_run."
+            f"Call build_initial_graph to initialize the view graph, inspect/optimize it, and run sfm_run."
         ),
     })
 
@@ -490,13 +721,26 @@ def run_scene_episode(
         obs_text = format_observation(result)
         ep.messages.append({"role": "user", "content": f"Observation: {obs_text}"})
 
+    # Build GT impostor labels from the covisibility matrix.  gt_recon is
+    # shared across the whole GRPO group — never mutate it; attach the
+    # episode-specific labels to a shallow copy instead.
+    gt = gt_recon
+    if overlap_matrix is not None and image_indices is not None:
+        impostors = _gt_impostor_pairs(
+            ep, overlap_matrix, image_indices, tool_client=tool_client
+        )
+        if impostors is not None:
+            gt = dict(gt_recon or {})
+            gt["impostors"] = impostors
+            ep.gt_recon = gt
+
     # Inject GT pose error into recon_result before reward computation
-    _inject_pose_error(ep, gt_recon)
+    _inject_pose_error(ep, gt)
 
     # Compute scene-level reward
     ep.reward_components = compute_scene_reward(
         ep.recon_result or {},
-        gt_recon=gt_recon,
+        gt_recon=gt,
         num_tool_calls=num_tool_calls,
         num_valid_calls=num_valid_calls,
         tool_calls=ep.tool_calls,
@@ -509,15 +753,8 @@ def run_scene_episode(
         f"[{scene_id}] Episode done: {num_tool_calls} calls, "
         f"reward={ep.reward:.3f}, registered={ep.recon_result.get('num_registered', 0)}"
     )
+    cleanup_stage_dir(ep.staged_image_dir)
     return ep
-
-
-# Conservative context budget for scene rollouts. The model supports ~262k
-# positions but vLLM is launched with a smaller --max-model-len; we keep the
-# rolling conversation well under it so long episodes never hit the 400
-# "input exceeds max context length" errors seen in early Phase-2 runs.
-SCENE_CONTEXT_BUDGET = 24000  # tokens (chars/4 estimate + image cost)
-_IMG_TOKEN_COST = 300         # rough token cost per image/thumbnail
 
 
 def _estimate_context_tokens(messages: list[dict[str, Any]], num_images: int) -> int:
@@ -586,10 +823,13 @@ def run_scene_oracle_episode(
     # Register images
     ep.session_id = f"{scene_id}-oracle-{uuid.uuid4().hex[:8]}"
 
-    registered_ids = _register_scene_images(tool_client, image_paths, image_root)
+    ep.staged_image_dir = stage_episode_images(image_paths, image_root, session_id=ep.session_id)
+    registered_ids = _register_scene_images(
+        tool_client, image_paths, image_root, staged_dir=ep.staged_image_dir
+    )
 
     # Encode images for the prompt
-    n_show = min(len(image_paths), 8)
+    n_show = min(len(image_paths), SCENE_MAX_PROMPT_IMAGES)
     ep.images = []
     for i in range(n_show):
         try:
@@ -657,7 +897,9 @@ def run_scene_oracle_episode(
     oracle_calls.append(ToolCall(tool="sfm_run", args={}))
     oracle_responses.append(json.dumps({"tool": "sfm_run", "args": {}}))
     try:
-        if image_paths:
+        if ep.staged_image_dir and os.path.isdir(ep.staged_image_dir):
+            image_dir = ep.staged_image_dir
+        elif image_paths:
             p0 = Path(image_paths[0])
             if not p0.is_absolute() and image_root:
                 p0 = Path(image_root) / p0
@@ -702,14 +944,27 @@ def run_scene_oracle_episode(
         {"role": "assistant", "content": oracle_responses[-1]},  # done
     ]
 
+    # Build GT impostor labels from the covisibility matrix (same GT-based
+    # doppelganger scoring as the agent rollout path).  gt_recon is shared
+    # across the GRPO group — attach labels to a shallow copy only.
+    gt = gt_recon
+    if overlap_matrix is not None and image_indices is not None:
+        impostors = _gt_impostor_pairs(
+            ep, overlap_matrix, image_indices, tool_client=tool_client
+        )
+        if impostors is not None:
+            gt = dict(gt_recon or {})
+            gt["impostors"] = impostors
+            ep.gt_recon = gt
+
     # Inject GT pose error before reward computation
-    _inject_pose_error(ep, gt_recon)
+    _inject_pose_error(ep, gt)
     recon_result = ep.recon_result  # may now contain mean_pose_error_deg
 
     # Compute reward
     n_valid = len(oracle_calls) - 1  # exclude done
     ep.reward_components = compute_scene_reward(
-        recon_result, gt_recon=gt_recon,
+        recon_result, gt_recon=gt,
         num_tool_calls=len(oracle_calls), num_valid_calls=n_valid,
         tool_calls=oracle_calls,
         tool_results=oracle_results,
@@ -728,6 +983,7 @@ def run_scene_oracle_episode(
         ep.reward = failed_group_max_reward + 0.1
         ep.reward_components["oracle_floor_boost"] = ep.reward - ep.reward_components["total_reward"]
 
+    cleanup_stage_dir(ep.staged_image_dir)
     return ep
 
 
@@ -742,6 +998,47 @@ def _execute_scene_tool(
     """Execute a scene-level tool call."""
     args = tc.args
 
+    if tc.tool == "build_initial_graph":
+        k_neighbors = int(args.get("k_neighbors", 5))
+        matcher = str(args.get("matcher", DEFAULT_MATCHER))
+        return tool_client.build_initial_graph(
+            image_ids=list(registered_ids.values()),
+            k_neighbors=k_neighbors,
+            matcher=matcher,
+            session=ep.session_id,
+        )
+
+    if tc.tool == "inspect_graph":
+        return tool_client.inspect_graph(session=ep.session_id)
+
+    if tc.tool == "verify_doppelganger":
+        a = str(args.get("image_a", ""))
+        b = str(args.get("image_b", ""))
+        res = tool_client.verify_doppelganger(image_a=a, image_b=b, session=ep.session_id)
+        if isinstance(res, dict) and not res.get("error"):
+            # Record every checked pair (flagged or not) so it stays "in
+            # play" for GT doppelganger labelling; _sfm_pair_list still only
+            # filters pairs the response actually flagged.
+            ep.doppelganger_checks[_pair_key(a, b)] = res
+        return res
+
+    if tc.tool == "prune_edges":
+        pairs = args.get("pairs", [])
+        return tool_client.prune_edges(pairs=pairs, session=ep.session_id)
+
+    if tc.tool == "bridge_components":
+        comp_a = int(args.get("comp_a_id", args.get("comp_a", 0)))
+        comp_b = int(args.get("comp_b_id", args.get("comp_b", 1)))
+        budget = int(args.get("budget", 3))
+        matcher = str(args.get("matcher", DEFAULT_MATCHER))
+        return tool_client.bridge_components(
+            comp_a_id=comp_a,
+            comp_b_id=comp_b,
+            budget=budget,
+            matcher=matcher,
+            session=ep.session_id,
+        )
+
     if tc.tool == "retrieve":
         # Use learned retrieval (DINOv2 embeddings) for agent rollouts.
         # The S-GRPO oracle uses GT overlap_matrix instead — that's the
@@ -755,8 +1052,10 @@ def _execute_scene_tool(
         return {"pairs": pairs, "num_pairs": len(pairs)}
 
     if tc.tool == "sfm_run":
-        # Resolve image_dir via image_root when image_paths are relative.
-        if ep.image_paths:
+        # Prioritize isolated staging directory (exact N images)
+        if ep.staged_image_dir and os.path.isdir(ep.staged_image_dir):
+            image_dir = ep.staged_image_dir
+        elif ep.image_paths:
             p0 = Path(ep.image_paths[0])
             if not p0.is_absolute() and ep.image_root:
                 p0 = Path(ep.image_root) / p0
@@ -766,6 +1065,7 @@ def _execute_scene_tool(
         else:
             image_dir = ""
         pair_list, n_present, n_filtered = _sfm_pair_list(ep, registered_ids)
+        ep.sfm_pair_list = pair_list
         result = tool_client.sfm_run(
             image_dir=image_dir, pair_list=pair_list, session=ep.session_id
         )

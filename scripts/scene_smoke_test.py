@@ -68,6 +68,7 @@ REQUIRED_REWARD_KEYS = (
     "accumulative_tool_reward",
     "ntep_intent_reward",
     "ntep_redundancy_penalty",
+    "first_call_validity_reward",
     "total_reward",
 )
 
@@ -174,6 +175,87 @@ class MockToolClient:
             "mean_reproj_error": 1.1,
         }
 
+    def build_initial_graph(
+        self, image_ids: list[str] | None = None, k_neighbors: int = 5, matcher: str = DEFAULT_MATCHER, session: str = ""
+    ) -> dict[str, Any]:
+        if image_ids is None:
+            image_ids = list(self.registered.keys())
+        self.call_log.append(f"build_initial_graph:{len(image_ids)}:{k_neighbors}")
+        return {
+            "num_images": len(image_ids),
+            "num_verified_edges": len(image_ids) * 2,
+            "num_failed_edges": 1,
+            "num_components": 1,
+            "component_sizes": [len(image_ids)],
+            "degrees": {"min": 2, "mean": 4.0, "max": 6},
+            "isolated_images": [],
+            "bottlenecks": [],
+            "weak_bridges": [],
+            "suspicious_cycles": [
+                {
+                    "cycle": ["img_0000", "img_0001", "img_0002"],
+                    "rotation_error_deg": 18.5,
+                    "edges": [["img_0000", "img_0001"], ["img_0001", "img_0002"], ["img_0002", "img_0000"]],
+                }
+            ],
+            "status": "ok",
+        }
+
+    def inspect_graph(self, session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"inspect_graph:{session}")
+        return {
+            "num_images": len(self.registered),
+            "num_verified_edges": len(self.registered) * 2,
+            "num_failed_edges": 1,
+            "num_components": 1,
+            "component_sizes": [len(self.registered)],
+            "degrees": {"min": 2, "mean": 4.0, "max": 6},
+            "isolated_images": [],
+            "bottlenecks": [],
+            "weak_bridges": [],
+            "suspicious_cycles": [],
+            "components": [list(self.registered.keys())],
+            "status": "ok",
+        }
+
+    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"verify_doppelganger:{image_a}:{image_b}")
+        conf = float(self.doppelganger_confidence)
+        is_dop = conf >= 0.5
+        return {
+            "pair": [image_a, image_b],
+            "visual_similarity": 0.85,
+            "num_inliers": 25,
+            "inlier_ratio": 0.2,
+            "cycle_rotation_error_deg": 22.4 if is_dop else 3.2,
+            "is_doppelganger": is_dop,
+            "evidence": "Cycle rotation residual is high" if is_dop else "Consistent geometry",
+            "status": "ok",
+        }
+
+    def prune_edges(self, pairs: list[list[str]], session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"prune_edges:{len(pairs)}")
+        return {
+            "num_pruned": len(pairs),
+            "remaining_edges": max(0, len(self.registered) * 2 - len(pairs)),
+            "num_components": 1,
+            "components": [list(self.registered.keys())],
+            "status": "ok",
+        }
+
+    def bridge_components(
+        self, comp_a_id: int = 0, comp_b_id: int = 1, budget: int = 3, matcher: str = DEFAULT_MATCHER, session: str = ""
+    ) -> dict[str, Any]:
+        self.call_log.append(f"bridge_components:{comp_a_id}:{comp_b_id}")
+        return {
+            "candidates_tested": budget,
+            "bridges_added": 1,
+            "new_edges": [{"pair": ["img_0000", "img_0005"], "inliers": 80, "inlier_ratio": 0.5, "status": "verified"}],
+            "num_components": 1,
+            "components": [list(self.registered.keys())],
+            "status": "ok",
+        }
+
     def close(self) -> None:
         pass
 
@@ -213,6 +295,30 @@ class InstrumentedToolClient(ToolClient):
         self.call_log.append(f"doppelganger_check:{image_a}:{image_b}")
         return super().doppelganger_check(image_a, image_b)
 
+    def build_initial_graph(
+        self, image_ids: list[str], k_neighbors: int = 5, matcher: str = DEFAULT_MATCHER, session: str = ""
+    ) -> dict[str, Any]:
+        self.call_log.append(f"build_initial_graph:{len(image_ids)}:{k_neighbors}")
+        return super().build_initial_graph(image_ids, k_neighbors, matcher, session=session)
+
+    def inspect_graph(self, session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"inspect_graph:{session}")
+        return super().inspect_graph(session=session)
+
+    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"verify_doppelganger:{image_a}:{image_b}")
+        return super().verify_doppelganger(image_a, image_b, session=session)
+
+    def prune_edges(self, pairs: list[list[str]], session: str = "") -> dict[str, Any]:
+        self.call_log.append(f"prune_edges:{len(pairs)}")
+        return super().prune_edges(pairs, session=session)
+
+    def bridge_components(
+        self, comp_a_id: int = 0, comp_b_id: int = 1, budget: int = 3, matcher: str = DEFAULT_MATCHER, session: str = ""
+    ) -> dict[str, Any]:
+        self.call_log.append(f"bridge_components:{comp_a_id}:{comp_b_id}")
+        return super().bridge_components(comp_a_id, comp_b_id, budget, matcher, session=session)
+
     def sfm_run(self, image_dir: str, pair_list: list | None = None,
                 output_dir: str = "", session: str = "") -> dict[str, Any]:
         self.sfm_pair_lists.append(pair_list)
@@ -227,8 +333,45 @@ class InstrumentedToolClient(ToolClient):
 
 
 # ---------------------------------------------------------------------------
-# Scripted agent
+# Scripted agents
 # ---------------------------------------------------------------------------
+
+
+class ScriptedGraphAgent:
+    """Deterministic agent following the Scene-Level Graph Orchestration workflow."""
+
+    def __init__(self, matcher: str = DEFAULT_MATCHER, reward_config: dict[str, Any] | None = None,
+                 k_neighbors: int = 5):
+        self.matcher = matcher
+        self.reward_config = reward_config or {}
+        self.k_neighbors = k_neighbors
+        self._turn = 0
+
+    def _encode_image(self, path: str) -> str:
+        return "smoke-test-image"
+
+    def _generate_turn(self, messages: list[dict[str, Any]], images: list | None = None) -> str:
+        if len(messages) <= 2:
+            self._turn = 0
+
+        turn = self._turn
+        self._turn += 1
+
+        if turn == 0:
+            return json.dumps({"tool": "build_initial_graph", "args": {"k_neighbors": self.k_neighbors, "matcher": self.matcher}})
+        elif turn == 1:
+            return json.dumps({"tool": "inspect_graph", "args": {}})
+        elif turn == 2:
+            return json.dumps({"tool": "verify_doppelganger", "args": {"image_a": "img_0000", "image_b": "img_0001"}})
+        elif turn == 3:
+            return json.dumps({"tool": "prune_edges", "args": {"pairs": [["img_0000", "img_0001"]]}})
+        elif turn == 4:
+            return json.dumps({"tool": "sfm_run", "args": {}})
+        else:
+            return json.dumps({"tool": "done", "args": {}})
+
+    def expected_tool_sequence(self) -> list[str]:
+        return ["build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "sfm_run", "done"]
 
 
 class ScriptedSceneAgent:
@@ -516,51 +659,81 @@ def verify_episode(
     for tc, res in paired:
         by_tool.setdefault(tc.tool, []).append(res)
 
-    # 2. Retrieval returns pairs ------------------------------------------
-    retr = by_tool.get("retrieve", [])
-    pairs = retr[0].get("pairs", []) if retr else []
-    pairs_ok = all(
-        isinstance(p, dict) and "image_a" in p and "image_b" in p for p in pairs
-    )
-    checks.append(Check(
-        "retrieval_pairs",
-        bool(retr) and len(pairs) > 0 and pairs_ok,
-        f"{len(pairs)} pairs returned",
-    ))
+    # 2. Workflow-specific checks -----------------------------------------
+    is_graph_workflow = "build_initial_graph" in by_tool
 
-    # 3. Match results have num_inliers > 0 --------------------------------
-    matches = by_tool.get("match", []) + by_tool.get("crop_and_match", [])
-    match_ok = bool(matches) and all(
-        not r.get("error") and float(r.get("num_inliers") or 0) > 0
-        for r in matches
-    )
-    checks.append(Check(
-        "match_inliers",
-        match_ok,
-        f"{len(matches)} match calls, "
-        f"inliers={[r.get('num_inliers') for r in matches]}",
-    ))
+    if is_graph_workflow:
+        b_res = by_tool.get("build_initial_graph", [{}])[0]
+        checks.append(Check(
+            "graph_initialization",
+            b_res.get("status") == "ok" and b_res.get("num_verified_edges", 0) > 0,
+            f"verified_edges={b_res.get('num_verified_edges')}, components={b_res.get('num_components')}",
+        ))
+        insp_res = by_tool.get("inspect_graph", [{}])[0]
+        checks.append(Check(
+            "graph_inspection",
+            insp_res.get("status") == "ok" and "component_sizes" in insp_res,
+            f"components={insp_res.get('num_components')}, sizes={insp_res.get('component_sizes')}",
+        ))
+        dops = by_tool.get("verify_doppelganger", [])
+        checks.append(Check(
+            "doppelganger_verification",
+            bool(dops) and all(r.get("status") == "ok" and "is_doppelganger" in r for r in dops),
+            f"{len(dops)} verified, doppelganger={[r.get('is_doppelganger') for r in dops]}",
+        ))
+        prunes = by_tool.get("prune_edges", [])
+        if prunes:
+            checks.append(Check(
+                "edge_pruning",
+                all(r.get("status") == "ok" for r in prunes),
+                f"{len(prunes)} prune calls",
+            ))
+    else:
+        # 2a. Retrieval returns pairs
+        retr = by_tool.get("retrieve", [])
+        pairs = retr[0].get("pairs", []) if retr else []
+        pairs_ok = all(
+            isinstance(p, dict) and "image_a" in p and "image_b" in p for p in pairs
+        )
+        checks.append(Check(
+            "retrieval_pairs",
+            bool(retr) and len(pairs) > 0 and pairs_ok,
+            f"{len(pairs)} pairs returned",
+        ))
 
-    # 4. Doppelganger check returns a confidence ---------------------------
-    dops = by_tool.get("doppelganger_check", [])
+        # 2b. Match results have num_inliers > 0
+        matches = by_tool.get("match", []) + by_tool.get("crop_and_match", [])
+        match_ok = bool(matches) and all(
+            not r.get("error") and float(r.get("num_inliers") or 0) > 0
+            for r in matches
+        )
+        checks.append(Check(
+            "match_inliers",
+            match_ok,
+            f"{len(matches)} match calls, "
+            f"inliers={[r.get('num_inliers') for r in matches]}",
+        ))
 
-    def _has_conf(r: dict[str, Any]) -> bool:
-        c = r.get("confidence", r.get("score"))
-        return isinstance(c, (int, float)) and not isinstance(c, bool)
+        # 2c. Doppelganger check returns a confidence
+        dops = by_tool.get("doppelganger_check", [])
 
-    checks.append(Check(
-        "doppelganger_confidence",
-        bool(dops) and all(_has_conf(r) for r in dops),
-        f"{len(dops)} checks, confidences="
-        f"{[r.get('confidence', r.get('score')) for r in dops]}",
-    ))
-    checks.append(Check(
-        "doppelganger_tracked",
-        len(ep.doppelganger_checks) == len(dops),
-        f"{len(ep.doppelganger_checks)} pair keys tracked in episode",
-    ))
+        def _has_conf(r: dict[str, Any]) -> bool:
+            c = r.get("confidence", r.get("score"))
+            return isinstance(c, (int, float)) and not isinstance(c, bool)
 
-    # 5. sfm_run produces a reconstruction ---------------------------------
+        checks.append(Check(
+            "doppelganger_confidence",
+            bool(dops) and all(_has_conf(r) for r in dops),
+            f"{len(dops)} checks, confidences="
+            f"{[r.get('confidence', r.get('score')) for r in dops]}",
+        ))
+        checks.append(Check(
+            "doppelganger_tracked",
+            len(ep.doppelganger_checks) == len(dops),
+            f"{len(ep.doppelganger_checks)} pair keys tracked in episode",
+        ))
+
+    # 3. sfm_run produces a reconstruction ---------------------------------
     recon = ep.recon_result or {}
     n_reg = recon.get("num_registered")
     checks.append(Check(
@@ -570,13 +743,14 @@ def verify_episode(
         f"num_registered={n_reg}, num_points3d={recon.get('num_points3d')}",
     ))
 
-    # inspect should run against the reconstruction the episode produced.
-    inspects = by_tool.get("inspect", [])
-    checks.append(Check(
-        "inspect_result",
-        bool(inspects) and all(not r.get("error") for r in inspects),
-        f"{len(inspects)} inspect calls",
-    ))
+    # Legacy inspect check if inspect was called
+    if "inspect" in by_tool:
+        inspects = by_tool.get("inspect", [])
+        checks.append(Check(
+            "inspect_result",
+            bool(inspects) and all(not r.get("error") for r in inspects),
+            f"{len(inspects)} inspect calls",
+        ))
 
     # 6. Reward components computed correctly ------------------------------
     rc = ep.reward_components or {}
@@ -735,6 +909,8 @@ def main() -> int:
     parser.add_argument("--flag-doppelganger", action="store_true",
                         help="Mock mode only: report the checked pair as a "
                              "doppelganger so it is filtered from sfm_run")
+    parser.add_argument("--agent", choices=["graph", "heuristic"], default="graph",
+                        help="Agent strategy: graph (default: Graph Orchestration) or heuristic (Phase 2)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -773,8 +949,11 @@ def main() -> int:
         install_mock_retrieval()
         logger.info("Retrieval embeddings patched to deterministic hashes")
 
-    # 3. Run the scene episode with the scripted agent.
-    agent = ScriptedSceneAgent(num_matches=args.num_matches, matcher=args.matcher)
+    # 3. Run the scene episode with the chosen scripted agent.
+    if args.agent == "graph":
+        agent = ScriptedGraphAgent(matcher=args.matcher)
+    else:
+        agent = ScriptedSceneAgent(num_matches=args.num_matches, matcher=args.matcher)
     ep = run_scene_episode(
         agent=agent,
         scene_id=scene["scene_id"],

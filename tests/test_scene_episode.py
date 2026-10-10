@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from agentic_sfm.agent.policy import ToolCall, parse_tool_call
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
+    SCENE_MAX_PROMPT_IMAGES,
     SCENE_SYSTEM_PROMPT,
     ToolServerDown,
     _execute_scene_tool,
@@ -120,6 +121,20 @@ class TestSceneEpisode:
         assert len(ep.tool_calls) == 4  # retrieve, match, sfm_run, done
         assert ep.reward > 0
         assert ep.recon_result.get("num_registered", 0) > 0
+
+    def test_prompt_thumbnail_cap_matches_vllm(self):
+        agent = MockAgent()
+        client = MockToolClient()
+        paths = [f"{i}.jpg" for i in range(SCENE_MAX_PROMPT_IMAGES + 3)]
+        ep = run_scene_episode(
+            agent=agent,
+            scene_id="test",
+            image_paths=paths,
+            tool_client=client,
+            max_tool_calls=2,
+        )
+        assert len(ep.images) == SCENE_MAX_PROMPT_IMAGES
+        assert SCENE_MAX_PROMPT_IMAGES == 4
 
     def test_oracle_episode(self):
         agent = MockAgent()
@@ -241,6 +256,7 @@ class TestSceneRewardIntegration:
             num_valid_calls=5,
             use_accumulative_tool_reward=True,
             use_ntep_rewards=True,
+            allow_self_certified_doppelganger=True,
             tool_calls=[ToolCall(tool="match", args={}), ToolCall(tool="done", args={})],
             tool_results=[{"num_inliers": 100}, {}],
         )
@@ -248,6 +264,8 @@ class TestSceneRewardIntegration:
         assert "accumulative_tool_reward" in rc
         assert "ntep_intent_reward" in rc
         assert "ntep_redundancy_penalty" in rc
+        # self-certified fallback is opt-in only and never counts as GT scoring
+        assert rc["doppelganger_scored"] is False
 
     def test_scene_reward_all_components(self):
         rc = compute_scene_reward(
@@ -259,10 +277,14 @@ class TestSceneRewardIntegration:
         assert "split_penalty" in rc
         assert "pose_reward" in rc
         assert "doppelganger_reward" in rc
+        assert "doppelganger_scored" in rc
         assert "tool_cost" in rc
         assert "accumulative_tool_reward" in rc
         assert "first_call_validity_reward" in rc
         assert "total_reward" in rc
+        # No GT impostor labels in gt_recon -> no self-certified bonus paid.
+        assert rc["doppelganger_reward"] == 0.0
+        assert rc["doppelganger_scored"] is False
 
 
 class TestRepeatCallBreaker:

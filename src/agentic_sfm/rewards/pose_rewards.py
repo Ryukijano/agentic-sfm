@@ -395,6 +395,7 @@ def compute_scene_reward(
     pose_weight: float = 1.0,
     split_penalty: float = 0.5,
     doppelganger_weight: float = 0.3,
+    graph_cost_weight: float = 0.0,
     accumulative_tool_coef: float = 0.1,
     use_accumulative_tool_reward: bool = True,
     num_valid_calls: int = 0,
@@ -406,6 +407,7 @@ def compute_scene_reward(
     first_call_validity_weight: float = 0.5,
     first_call_invalid_penalty: float = 1.0,
     gate_geometry_on_validity: bool = True,
+    allow_self_certified_doppelganger: bool = False,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a scene-level SfM episode.
@@ -413,6 +415,11 @@ def compute_scene_reward(
     Uses the same reward framework as compute_pair_reward: accumulative tool
     reward (not per-call penalty), optional NTEP process rewards, plus
     scene-specific components (registration, split, doppelganger filtering).
+
+    Doppelganger bonus is paid ONLY when GT impostor labels are available
+    (``gt_recon["impostors"]`` / ``gt_recon["gt_impostor_pairs"]``); the
+    self-reported ``num_doppelgangers_*`` fallback requires the explicit
+    ``allow_self_certified_doppelganger=True`` opt-in (mock/synthetic tests).
     """
     components: dict[str, Any] = {}
 
@@ -426,33 +433,79 @@ def compute_scene_reward(
 
     num_registered = recon_result.get("num_registered", 0)
 
+    gt_images = 1
     if gt_recon:
         gt_images = gt_recon.get("num_images", 1)
-        reg_ratio = num_registered / max(gt_images, 1)
-        components["registration_reward"] = registration_weight * reg_ratio
+        cov = num_registered / max(gt_images, 1)
+        components["registration_reward"] = registration_weight * cov
     else:
-        components["registration_reward"] = registration_weight * min(num_registered / 100, 1.0)
+        gt_images = recon_result.get("total_images", 100)
+        cov = min(num_registered / max(gt_images, 1), 1.0)
+        components["registration_reward"] = registration_weight * cov
 
-    if num_registered == 0:
+    if num_registered < 3:
         components["split_penalty"] = -split_penalty
     else:
         components["split_penalty"] = 0.0
 
     pose_err = recon_result.get("mean_pose_error_deg")
     if pose_err is not None and pose_weight:
-        components["pose_reward"] = pose_weight * max(0.0, 1.0 - float(pose_err) / 20.0)
+        # Coverage-coupled pose reward: prevents scoring high pose reward on an easy 2-image subset
+        pose_acc = max(0.0, 1.0 - float(pose_err) / 20.0)
+        components["pose_reward"] = pose_weight * cov * pose_acc
     else:
         components["pose_reward"] = 0.0
 
-    # Doppelganger filtering: reward for correctly identifying and filtering
-    # doppelganger pairs (images that look similar but are different scenes).
-    n_doppel_filtered = recon_result.get("num_doppelgangers_filtered", 0)
-    n_doppel_total = recon_result.get("num_doppelgangers_present", 0)
-    if n_doppel_total > 0:
-        doppel_rate = n_doppel_filtered / n_doppel_total
-        components["doppelganger_reward"] = doppelganger_weight * doppel_rate
+    # Conditional graph sparsity cost: penalized ONLY when reconstruction succeeds (coverage >= 0.70).
+    # The kwarg is the config-driven source of truth; the recon_result lookup
+    # stays only as backward-compat for older tests (the server never writes it).
+    gw = graph_cost_weight if graph_cost_weight > 0 else float(recon_result.get("graph_cost_weight", 0.0) or 0.0)
+    num_matched = recon_result.get("num_pairs_matched", 0)
+    num_exhaustive = gt_images * (gt_images - 1) // 2
+    if cov >= 0.70 and num_exhaustive > 0 and gw > 0.0:
+        sparsity = num_matched / num_exhaustive
+        components["graph_cost"] = -gw * min(sparsity, 1.0)
     else:
+        components["graph_cost"] = 0.0
+
+    # Doppelganger filtering: scored strictly against ground truth when available
+    gt_impostors = (gt_recon.get("impostors") or gt_recon.get("gt_impostor_pairs")) if gt_recon else None
+    if gt_impostors is not None and len(gt_impostors) > 0:
+        pruned_pairs = set()
+        if tool_calls and tool_results:
+            for tc, res in zip(tool_calls, tool_results):
+                if getattr(tc, "tool", None) == "prune_edges":
+                    for p in (getattr(tc, "args", None) or {}).get("pairs", []):
+                        if len(p) >= 2:
+                            pruned_pairs.add(tuple(sorted((str(p[0]), str(p[1])))))
+        gt_set = {tuple(sorted((str(p[0]), str(p[1])))) for p in gt_impostors if len(p) >= 2}
+        tp = len(pruned_pairs & gt_set)
+        fp = len(pruned_pairs - gt_set)
+        fn = len(gt_set - pruned_pairs)
+        precision = tp / max(tp + fp, 1) if (tp + fp) > 0 else 0.0
+        recall = tp / max(tp + fn, 1) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8) if (precision + recall) > 0 else 0.0
+        components["doppelganger_reward"] = doppelganger_weight * f1
+        components["doppelganger_scored"] = True
+    elif allow_self_certified_doppelganger:
+        # Legacy fallback for synthetic/mock tests where no GT impostor list
+        # was set. Both num_doppelgangers_* fields are derived from the
+        # agent's OWN doppelganger flags, so this rate is self-certified and
+        # must never pay a bonus in real training.
+        n_doppel_filtered = recon_result.get("num_doppelgangers_filtered", 0)
+        n_doppel_total = recon_result.get("num_doppelgangers_present", 0)
+        if n_doppel_total > 0:
+            doppel_rate = n_doppel_filtered / n_doppel_total
+            components["doppelganger_reward"] = doppelganger_weight * doppel_rate
+        else:
+            components["doppelganger_reward"] = 0.0
+        components["doppelganger_scored"] = False
+    else:
+        # No GT impostor labels and no opt-in: the agent's self-reported
+        # filtering rate is not verifiable, so no doppelganger bonus is paid
+        # (reward-hacking guard — flagging arbitrary pairs must not pay).
         components["doppelganger_reward"] = 0.0
+        components["doppelganger_scored"] = False
 
     # Accumulative tool reward (replaces per-call penalty)
     if use_accumulative_tool_reward:
@@ -480,6 +533,7 @@ def compute_scene_reward(
         components["accumulative_tool_reward"] = 0.0
         components["doppelganger_reward"] = 0.0
         components["tool_cost"] = 0.0
+        components["graph_cost"] = 0.0
         components["validity_gated"] = True
     else:
         components["validity_gated"] = False
@@ -494,6 +548,7 @@ def compute_scene_reward(
         + components["ntep_intent_reward"]
         + components["ntep_redundancy_penalty"]
         + components["first_call_validity_reward"]
+        + components["graph_cost"]
     )
     return components
 

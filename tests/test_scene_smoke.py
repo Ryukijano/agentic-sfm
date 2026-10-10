@@ -123,7 +123,7 @@ class TestSceneEpisodeSmoke:
         assert rc["pose_reward"] == pytest.approx(0.75)          # 1 - 5/20
         assert rc["accumulative_tool_reward"] == pytest.approx(0.9)  # 9 valid
         assert rc["split_penalty"] == 0.0
-        assert rc["total_reward"] == pytest.approx(2.15)
+        assert rc["total_reward"] == pytest.approx(2.65)
         assert ep.reward == rc["total_reward"]
 
 
@@ -142,7 +142,16 @@ class TestDoppelgangerPath:
         assert flagged == []
         assert ep.recon_result["num_doppelgangers_present"] == 1
         assert ep.recon_result["num_doppelgangers_filtered"] == 1
-        assert ep.reward_components["doppelganger_reward"] == pytest.approx(0.3)
+        # GT impostor labels: the synthetic scene's overlap matrix is the
+        # identity, so every in-play off-diagonal pair (incl. the checked
+        # one) has overlap <= 0 and is a GT doppelganger.
+        assert ep.gt_recon is not None and ep.gt_recon.get("impostors")
+        impostor_keys = {"__".join(sorted(p)) for p in ep.gt_recon["impostors"]}
+        assert checked_key in impostor_keys
+        # GT-based scoring: only prune_edges count as detections, and this
+        # agent only ran doppelganger_check, so the F1 (and reward) is 0 —
+        # the old self-certified +0.3 bonus is gone.
+        assert ep.reward_components["doppelganger_reward"] == pytest.approx(0.0)
 
     def test_unflagged_pair_kept_in_sfm(self, scene):
         client = MockToolClient(doppelganger_confidence=0.12)
@@ -198,3 +207,46 @@ class TestCoherentSubset:
         s = self._scene()
         out = select_coherent_subset(s, 10)
         assert out["num_images"] == 6
+
+
+class TestGraphOrchestrationAgent:
+    def test_graph_agent_end_to_end(self, scene):
+        from scripts.scene_smoke_test import ScriptedGraphAgent
+        s, img_root = scene
+        client = MockToolClient()
+        agent = ScriptedGraphAgent()
+        ep = run_scene_episode(
+            agent=agent,
+            scene_id=s["scene_id"],
+            image_paths=s["image_paths"],
+            tool_client=client,
+            gt_recon=s.get("gt_recon"),
+            overlap_matrix=s.get("overlap_matrix"),
+            image_indices=s.get("image_indices"),
+            image_root=img_root,
+        )
+        assert [tc.tool for tc in ep.tool_calls] == [
+            "build_initial_graph",
+            "inspect_graph",
+            "verify_doppelganger",
+            "prune_edges",
+            "sfm_run",
+            "done",
+        ]
+        assert ep.done
+        assert ep.recon_result["num_registered"] == N_SAMPLED
+        assert ep.reward > 0
+        assert "first_call_validity_reward" in ep.reward_components
+        assert ep.reward_components["first_call_validity_reward"] == 0.5
+        # GT doppelganger scoring is end-to-end here: the pruned pair
+        # (img_0000, img_0001) has zero measured overlap in the synthetic
+        # scene (identity overlap matrix), so it is a GT impostor and the
+        # prune is a true positive.  The sfm pair list is exhaustive (nothing
+        # flagged), so the GT set holds all C(10,2)=45 in-play pairs:
+        # precision 1, recall 1/45 -> f1 = 2/46.
+        assert ep.gt_recon is not None and ep.gt_recon.get("impostors")
+        impostor_keys = {"__".join(sorted(p)) for p in ep.gt_recon["impostors"]}
+        assert "img_0000__img_0001" in impostor_keys
+        assert len(impostor_keys) == N_SAMPLED * (N_SAMPLED - 1) // 2
+        assert ep.reward_components["doppelganger_reward"] == pytest.approx(
+            0.3 * 2 / 46)

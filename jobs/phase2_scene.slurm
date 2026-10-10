@@ -16,7 +16,7 @@
 # =============================================================================
 #SBATCH --job-name=asfm-phase2
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:3
+#SBATCH --gres=gpu:l40s:3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
@@ -36,7 +36,9 @@ echo "Start: $(date)"
 
 PROJECT_ROOT="/scratch/kcwp264/agentic-sfm"
 CONFIG="${PROJECT_ROOT}/configs/phase2_scene.yaml"
-OUTPUT_DIR="/scratch/kcwp264/agentic-sfm/outputs/phase2"
+# Unique per-job dir — do not overwrite outputs/phase2/checkpoints from 7975335.
+OUTPUT_DIR="/scratch/kcwp264/agentic-sfm/outputs/phase2/run_${SLURM_JOB_ID}"
+SCENE_SFT="${PROJECT_ROOT}/outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
 LOG_DIR="/scratch/kcwp264/logs/agentic-sfm"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
@@ -61,18 +63,21 @@ mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_DIR}" "${FLASHINFER_JIT_D
 
 cd "${PROJECT_ROOT}"
 
+if [[ ! -f "${SCENE_SFT}/adapter_model.safetensors" ]]; then
+    echo "ERROR: scene SFT adapter missing at ${SCENE_SFT}"
+    exit 1
+fi
+echo "Scene SFT warmstart: ${SCENE_SFT}"
+
+# COLMAP workdirs on job-local NVMe (deleted at job end). Never ./outputs/sfm_run_*.
+export SFM_OUTPUT_ROOT="${TMP_SHARED:-${TMPDIR:-/tmp}}/asfm_sfm_${SLURM_JOB_ID}"
+mkdir -p "${SFM_OUTPUT_ROOT}"
+echo "SFM_OUTPUT_ROOT=${SFM_OUTPUT_ROOT}"
+
 VLLM_PORT=$((39000 + SLURM_JOB_ID % 20000))
 TOOL_PORT=$((19000 + SLURM_JOB_ID % 20000))
 export VLLM_PORT TOOL_PORT
 echo "vLLM port: ${VLLM_PORT}  tool port: ${TOOL_PORT}"
-
-# Check Phase 1 checkpoint exists
-PHASE1_CKPT="${PROJECT_ROOT}/outputs/phase1/checkpoints/best"
-if [[ ! -d "${PHASE1_CKPT}" ]]; then
-    echo "WARNING: Phase 1 checkpoint not found at ${PHASE1_CKPT}"
-    echo "Starting from SFT adapter instead."
-    PHASE1_CKPT="${PROJECT_ROOT}/outputs/sft/checkpoints/epoch_5"
-fi
 
 python - <<'PY'
 from agentic_sfm.constants import assert_qwen35_runtime
@@ -114,9 +119,9 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
     --max-lora-rank 32 \
     --port "${VLLM_PORT}" \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 32768 \
-    --limit-mm-per-prompt '{"image":8,"video":0}' \
-    --mm-processor-kwargs '{"max_pixels":1003520,"min_pixels":3136}' \
+    --max-model-len 8192 \
+    --limit-mm-per-prompt '{"image":4,"video":0}' \
+    --mm-processor-kwargs '{"max_pixels":401408,"min_pixels":3136}' \
     --mm-processor-cache-gb 0 \
     --trust-remote-code \
     --dtype bfloat16 \

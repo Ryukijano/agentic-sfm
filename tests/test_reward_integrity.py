@@ -224,6 +224,27 @@ class TestSfMRun:
         o2 = TS._RECON_STORE[r2["recon_id"]]["output_dir"]
         assert o1 != o2
 
+    def test_default_dir_uses_sfm_output_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "colmap"
+        monkeypatch.setenv("SFM_OUTPUT_ROOT", str(root))
+        d = str(tmp_path / "missing_imgs")
+        r = TS.tool_sfm_run(d, output_dir="")
+        out = Path(TS._RECON_STORE[r["recon_id"]]["output_dir"])
+        assert out.parent == root
+        assert out.name.startswith("sfm_run_")
+        assert "./outputs" not in str(out)
+
+    def test_mkdir_quota_returns_error_dict(self, tmp_path, monkeypatch):
+        def boom(self, *args, **kwargs):
+            raise OSError(28, "Disk quota exceeded")
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        r = TS.tool_sfm_run(str(tmp_path), output_dir=str(tmp_path / "o"))
+        assert r["num_registered"] == 0
+        assert r["num_points3d"] == 0
+        assert r.get("status") == "io_error"
+        assert "error" in r
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher: no silent defaults, rejection propagates

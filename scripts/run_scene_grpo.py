@@ -33,6 +33,13 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO))  # for `import scripts.run_grpo`
 
+from agentic_sfm.eval.scene_eval import (
+    SCENE_SUCCESS_MAX_POSE_ERROR_DEG,
+    SCENE_SUCCESS_MIN_REGISTERED_FRAC,
+    registered_fraction,
+    scene_eval_score,
+    scene_reconstruction_success,
+)
 from agentic_sfm.constants import DEFAULT_MATCHER, assert_qwen35_runtime
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
@@ -568,6 +575,9 @@ class SceneGRPOTrainer(GRPOTrainer):
         )
         self.scene_dataset = scene_dataset
         self.val_scenes = list(val_scenes or [])
+        # Reconstruction-gated best_eval (registered_frac * pose term).
+        # Train mean reward must not promote checkpoints.
+        self._best_eval_score = float("-inf")
         # Epoch index currently being trained — written to trainer_state.json.
         self.current_epoch = 0
         # Episodes from the most recent collect_scene_rollouts call (pre
@@ -848,16 +858,47 @@ class SceneGRPOTrainer(GRPOTrainer):
 
         rewards = [ep.reward for ep in episodes]
         tool_calls = [len(ep.tool_calls) for ep in episodes]
-        registered = [
-            float((ep.recon_result or {}).get("num_registered", 0) or 0)
-            for ep in episodes
-        ]
+        train_cfg = self.config.get("training", {})
+        min_frac = float(
+            train_cfg.get("eval_min_registered_frac", SCENE_SUCCESS_MIN_REGISTERED_FRAC)
+        )
+        max_pose = float(
+            train_cfg.get("eval_max_pose_error_deg", SCENE_SUCCESS_MAX_POSE_ERROR_DEG)
+        )
+        successes = []
+        fracs = []
+        pose_errs: list[float] = []
+        registered = []
+        for ep in episodes:
+            recon = ep.recon_result or {}
+            n_reg = float(recon.get("num_registered") or 0)
+            n_img = float(ep.num_images or len(ep.image_paths) or 1)
+            pose = recon.get("mean_pose_error_deg")
+            if not isinstance(pose, (int, float)):
+                pose = None
+            registered.append(n_reg)
+            fracs.append(registered_fraction(n_reg, n_img))
+            if isinstance(pose, (int, float)):
+                pose_errs.append(float(pose))
+            successes.append(
+                scene_reconstruction_success(
+                    n_reg, n_img, pose,
+                    min_registered_frac=min_frac,
+                    max_pose_error_deg=max_pose,
+                )
+            )
+        mean_frac = float(np.mean(fracs)) if fracs else 0.0
+        mean_pose = float(np.mean(pose_errs)) if pose_errs else None
         stats = {
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "num_scenes": len(episodes),
             "mean_tool_calls": float(np.mean(tool_calls)) if tool_calls else 0.0,
-            "success_rate": float(np.mean([1.0 if r > 0 else 0.0 for r in registered])),
+            "success_rate": float(np.mean(successes)) if successes else 0.0,
             "mean_registered": float(np.mean(registered)) if registered else 0.0,
+            "mean_registered_frac": mean_frac,
+            "eval_score": scene_eval_score(
+                mean_frac, mean_pose, max_pose_error_deg=max_pose
+            ),
         }
         stats.update(self._scene_metrics(episodes))
         if self._wandb:
@@ -1194,8 +1235,22 @@ def main():
                 f"  Eval: reward={eval_stats['mean_reward']:.3f}, "
                 f"success_rate={eval_stats.get('success_rate', 0.0):.3f}, "
                 f"registered={eval_stats.get('mean_registered', 0.0):.1f}, "
-                f"pose_err={eval_stats.get('scene/mean_pose_error_deg', 0.0):.2f}°"
+                f"reg_frac={eval_stats.get('mean_registered_frac', 0.0):.3f}, "
+                f"pose_err={eval_stats.get('scene/mean_pose_error_deg', 0.0):.2f}°, "
+                f"eval_score={eval_stats.get('eval_score', 0.0):.3f}"
             )
+            score = float(eval_stats.get("eval_score") or 0.0)
+            if score > trainer._best_eval_score:
+                trainer._best_eval_score = score
+                trainer.save_lora_checkpoint("best_eval", rollout_agent)
+                trainer.save_lora_checkpoint("best", rollout_agent)
+                logger.info(
+                    f"  New best eval_score {score:.3f} "
+                    f"(success={eval_stats.get('success_rate', 0.0):.3f}, "
+                    f"reg_frac={eval_stats.get('mean_registered_frac', 0.0):.3f}, "
+                    f"pose_err={eval_stats.get('scene/mean_pose_error_deg', 0.0):.2f}°) "
+                    f"-> checkpoints/best_eval"
+                )
 
         # Always dump `latest` so vLLM rollouts track the LoRA policy;
         # numbered checkpoints at save_freq.
@@ -1204,13 +1259,9 @@ def main():
             trainer.save_lora_checkpoint(epoch + 1, rollout_agent)
             logger.info(f"  Saved checkpoint at epoch {epoch + 1}")
 
-        # `latest` follows the current (possibly regressed) policy; `best`
-        # is the quality-gated resume point.
-        if epoch_stats:
-            if mean_reward > trainer._best_epoch_reward:
-                trainer._best_epoch_reward = mean_reward
-                trainer.save_lora_checkpoint("best")
-                logger.info(f"  New best epoch mean reward {mean_reward:.3f} -> checkpoints/best")
+        # `latest` follows the current (possibly regressed) policy.
+        # `best` / `best_eval` are reconstruction-gated (eval_score), never
+        # train mean reward.
 
     trainer.save_lora_checkpoint(total_epochs, rollout_agent)
     if trainer._wandb:

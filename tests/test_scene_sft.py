@@ -124,9 +124,9 @@ def _check_example_schema(ex: dict) -> None:
             assert isinstance(msg["content"], str)
             assert msg["content"].startswith("Observation:")
 
-    assert calls[0] == "retrieve"
+    assert calls[0] == "build_initial_graph"
     assert calls[-1] == "done"
-    assert "sfm_run" in calls and "inspect" in calls
+    assert "sfm_run" in calls and "inspect_graph" in calls
     # roles strictly alternate assistant -> user(obs) except after `done`
     roles = [m["role"] for m in msgs[2:]]
     for a, b in zip(roles, roles[1:]):
@@ -146,7 +146,7 @@ class TestOracleEpisode:
         s, img_root, _ = scene
         rng = np.random.default_rng(7)
         tool_seqs = set()
-        has_doppel = has_crop = 0
+        has_doppel = has_prune = 0
         for ep in range(8):
             ex = build_oracle_episode(s, img_root, ep_idx=ep, rng=rng)
             _check_example_schema(ex)
@@ -156,11 +156,13 @@ class TestOracleEpisode:
                 if m["role"] == "assistant"
             )
             tool_seqs.add(tools)
-            has_doppel += "doppelganger_check" in tools
-            has_crop += ("crop_and_match" in tools) or ("crop" in tools)
+            has_doppel += "verify_doppelganger" in tools
+            has_prune += "prune_edges" in tools
+            for t in tools:
+                assert t not in ("crop", "crop_and_match")
         assert len(tool_seqs) > 1            # trajectories actually vary
         assert has_doppel >= 1               # doppelganger branch exercised
-        assert has_crop >= 1                 # crop grammar exercised
+        assert has_prune >= 1                # edge pruning exercised
 
     def test_flagged_doppelganger_excluded_from_recon(self, scene):
         """When a check flags, sfm_run reports it present + filtered."""
@@ -221,6 +223,18 @@ class TestBuildExamples:
 
 
 class TestSFTLoaderCompat:
+    def test_sft_caps_image_pixels(self):
+        from types import SimpleNamespace
+        from scripts.run_sft import _set_max_image_pixels
+
+        processor = SimpleNamespace(
+            image_processor=SimpleNamespace(size={"longest_edge": 16777216})
+        )
+        _set_max_image_pixels(processor, 1003520)
+        assert processor.image_processor.size["longest_edge"] == 1003520
+        _set_max_image_pixels(processor, 2000000)
+        assert processor.image_processor.size["longest_edge"] == 1003520
+
     def test_load_example_images_scene(self, scene):
         """run_sft._load_example_images consumes scene examples."""
         from scripts.run_sft import _count_image_slots, _load_example_images

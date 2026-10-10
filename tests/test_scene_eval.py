@@ -18,6 +18,8 @@ from agentic_sfm.eval.scene_eval import (
     aggregate_scene_metrics,
     compute_efficiency_frontier,
     compute_scene_metrics,
+    scene_eval_score,
+    scene_reconstruction_success,
 )
 from agentic_sfm.rl.scene_episode import SceneRolloutEpisode
 
@@ -85,6 +87,14 @@ def _make_episode(**kwargs):
     )
     defaults.update(kwargs)
     return SceneRolloutEpisode(**defaults)
+
+
+def test_staged_colmap_image_names_resolve_to_gt_indices():
+    from agentic_sfm.eval.scene_eval import _index_lookup, _resolve_image_index
+
+    ep = _make_episode(image_paths=["original/a.jpg", "different/a.jpg", "original/c.png"])
+    lookup = _index_lookup(ep)
+    assert [_resolve_image_index(name, lookup) for name in ("img_0000.jpg", "img_0001.jpg", "img_0002.png")] == [0, 1, 2]
 
 
 class TestPoseHelpers:
@@ -183,6 +193,7 @@ class TestSceneMetrics:
         m = compute_scene_metrics(ep, {"gt_recon": {"num_images": 4, "poses": _gt_poses(4)}})
         assert m["registration/num_registered"] == 0
         assert m["registration/success"] == 0.0
+        assert m["reconstruction/success"] == 0.0
         assert m["pose/available"] == 0.0
         assert "pose/abs_rot_err_mean_deg" not in m
 
@@ -269,9 +280,12 @@ class TestSceneMetrics:
 class TestAggregation:
     def test_aggregate(self):
         eps = []
-        for n_reg, n_calls in [(4, 3), (2, 6), (0, 10)]:
+        for n_reg, n_calls, pose in [(4, 3, 2.0), (2, 6, 5.0), (0, 10, None)]:
+            recon = {"num_registered": n_reg, "num_points3d": 100 * n_reg}
+            if pose is not None:
+                recon["mean_pose_error_deg"] = pose
             ep = _make_episode(
-                recon_result={"num_registered": n_reg, "num_points3d": 100 * n_reg},
+                recon_result=recon,
                 tool_calls=[ToolCall(tool="match", args={})] * max(n_calls - 1, 0)
                 + [ToolCall(tool="done", args={})],
                 results=[{"num_inliers": 10}] * max(n_calls - 1, 0),
@@ -283,7 +297,10 @@ class TestAggregation:
         assert agg["scene_eval/mean_registration_registered_fraction"] == pytest.approx(
             (1.0 + 0.5 + 0.0) / 3
         )
+        # 4/4 @ 2° and 2/4 @ 5° pass the pose gate; 0 registered fails.
         assert agg["scene_eval/success_rate"] == pytest.approx(2 / 3)
+        assert agg["scene_eval/any_registered_rate"] == pytest.approx(2 / 3)
+        assert agg["scene_eval/eval_score"] > 0.0
         frontier = agg["scene_eval/efficiency_frontier"]
         assert frontier[0] == {"num_tool_calls": 3, "registered_fraction": 1.0}
         assert agg["scene_eval/per_scene"][0]["scene_id"] == "0015"
@@ -304,3 +321,47 @@ class TestAggregation:
     def test_pair_key(self):
         assert _pair_key("b", "a") == "a__b"
         assert _pair_key("img_0001_crop_0_0_10_10", "img_0002") == "img_0001__img_0002"
+
+
+class TestSceneReconstructionSuccess:
+    def test_one_camera_is_not_success(self):
+        assert scene_reconstruction_success(1, 10, 2.0) is False
+
+    def test_half_registered_good_pose_is_success(self):
+        assert scene_reconstruction_success(5, 10, 5.0) is True
+
+    def test_good_coverage_bad_pose_is_not_success(self):
+        assert scene_reconstruction_success(8, 10, 40.0) is False
+
+    def test_missing_pose_is_not_success(self):
+        assert scene_reconstruction_success(8, 10, None) is False
+
+    def test_eval_score_zero_without_pose(self):
+        assert scene_eval_score(1.0, None) == 0.0
+
+    def test_aggregate_high_coverage_bad_pose_is_not_success(self):
+        ep = _make_episode(
+            recon_result={
+                "num_registered": 8,
+                "num_points3d": 800,
+                "mean_pose_error_deg": 77.0,
+            },
+            num_images=10,
+            image_paths=[f"images/{i}.jpg" for i in range(10)],
+        )
+        m = compute_scene_metrics(ep, {"num_images": 10})
+        assert m["registration/success"] == 1.0
+        assert m["reconstruction/success"] == 0.0
+        assert m["reconstruction/eval_score"] == 0.0
+        agg = aggregate_scene_metrics([m])
+        assert agg["scene_eval/success_rate"] == 0.0
+        assert agg["scene_eval/any_registered_rate"] == 1.0
+        assert agg["scene_eval/eval_score"] == 0.0
+
+    def test_eval_score_penalizes_pose_error(self):
+        perfect = scene_eval_score(1.0, 0.0)
+        mid = scene_eval_score(1.0, 10.0)
+        assert perfect == pytest.approx(1.0)
+        assert mid == pytest.approx(0.5)
+        assert scene_eval_score(1.0, 40.0) == 0.0
+        assert scene_eval_score(0.5, 0.0) == pytest.approx(0.5)

@@ -629,13 +629,27 @@ def _import_agent_matches(
     return len(valid_pairs)
 
 
+def default_sfm_output_dir() -> str:
+    """COLMAP workdir: $SFM_OUTPUT_ROOT (or $TMPDIR), never ./outputs on scratch."""
+    root = os.environ.get("SFM_OUTPUT_ROOT") or os.environ.get("TMPDIR") or tempfile.gettempdir()
+    return str(Path(root) / f"sfm_run_{uuid.uuid4().hex[:8]}")
+
+
 @app.post("/sfm_run")
 def sfm_run(req: SfMRequest):
     # Unique per-call dir unless the caller pinned one — a shared fixed dir
     # lets one sfm_run wipe another episode's reconstruction.
-    out = req.output_dir or f"./outputs/sfm_run_{uuid.uuid4().hex[:8]}"
+    out = req.output_dir or default_sfm_output_dir()
     output_dir = Path(out)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {
+            "error": f"could not create sfm output dir {out}: {e}",
+            "status": "io_error",
+            "num_registered": 0,
+            "num_points3d": 0,
+        }
 
     if not os.path.isdir(req.image_dir):
         return {

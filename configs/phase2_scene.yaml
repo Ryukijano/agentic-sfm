@@ -4,11 +4,12 @@
 model:
   name: "Qwen/Qwen3.5-2B"
   max_new_tokens: 512
-  # Scene SFT is the JSON contract for retrieve/sfm_run. After Phase-1 hard
-  # lands, optionally point sft_adapter at outputs/phase1_hard/checkpoints/best_eval.
-  checkpoint: "outputs/scene_sft/checkpoints/epoch_5"
-  sft_adapter: "outputs/scene_sft/checkpoints/epoch_5"
-  kl_adapter: "outputs/scene_sft/checkpoints/epoch_5"
+  # Scene SFT (graph-grammar retry 2) is the JSON contract for
+  # build_initial_graph/verify_doppelganger/prune_edges/sfm_run.  New
+  # verified SFT adapter after the graph-tool retry run.
+  checkpoint: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  sft_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  kl_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
   lora:
     rank: 32
     alpha: 64
@@ -18,7 +19,7 @@ model:
 rl:
   algorithm: "grpo"
   framework: "custom"
-  group_size: 6           # N trajectories per scene
+  group_size: 4           # N trajectories per scene (was 6; activation OOM)
   max_tool_calls: 20      # more tools per episode than Phase 1
   max_turns: 30           # more turns for multi-step pipeline
   temperature: 1.0
@@ -34,7 +35,9 @@ rl:
   reward_warmup_steps: 20
 
 tools:
-  enabled: ["crop", "match", "doppelganger_check", "retrieve", "sfm_run", "inspect"]
+  # Scene grammar for Phase-2 graph orchestration (informational — the system
+  # prompt in rl/scene_episode.py is the source of truth for the agent).
+  enabled: ["build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "bridge_components", "sfm_run", "inspect", "done"]
   matchers: ["loftr"]      # start with LoFTR, add mast3r later
   sfm_backend: "colmap"
 
@@ -43,9 +46,15 @@ reward:
   registration_weight: 0.5   # fraction of images registered
   pose_weight: 1.0           # mean pose error (1 - err/20)
   split_penalty: 0.5         # penalty when 0 images registered
-  doppelganger_weight: 0.0   # DISABLED: self-certified bonus (+0.3 for flagging
-                           # any pair, no GT labels) was reward-hackable; recon
-                           # quality already rewards correct exclusions
+  doppelganger_weight: 0.3   # F1 of pruned edges vs GT-derived impostors
+                             # (pairs in play with overlap <= 0 in the MegaDepth
+                             # covisibility matrix); the self-certified fallback
+                             # (agent's own flags, no GT labels) is disabled via
+                             # allow_self_certified_doppelganger
+  allow_self_certified_doppelganger: false
+  # Graph sparsity cost: only applies when coverage >= 0.7; normalized by the
+  # exhaustive N(N-1)/2 pair count.
+  graph_cost_weight: 0.2
   # Accumulative tool reward (replaces per-call penalty)
   tool_cost: 0.0             # legacy (disabled)
   accumulative_tool_coef: 0.1
@@ -64,10 +73,12 @@ reward:
 
 curriculum:
   enabled: true
+  # Never raise max_images above 20 — 50-image sequences blew GPU-1 activations
+  # (job 7975335). Stage 3 still opens all MegaDepth scenes, at 20 images.
   stages:
     - {epochs: 10, max_images: 10, scenes: ["0015"]}           # small scene warmup
     - {epochs: 20, max_images: 20, scenes: ["0015", "0022"]}   # add second scene
-    - {epochs: 20, max_images: 50, scenes: null}               # all scenes
+    - {epochs: 20, max_images: 20, scenes: null}               # all MegaDepth, 20 imgs
 
 training:
   lr: 5.0e-6
@@ -78,9 +89,15 @@ training:
   max_grad_norm: 1.0
   save_freq: 5
   eval_freq: 5
+  # Pose-aligned scene success (not "any camera registered").
+  eval_min_registered_frac: 0.5
+  eval_max_pose_error_deg: 20.0
   log_freq: 10
   # Phase-1 collapse fixes — SceneGRPOTrainer inherits these from GRPOTrainer.
   kl_coef: 0.03
+  # Frozen SFT leash on a *separate* CPU copy. Do not wrap the GPU base —
+  # .to("cpu") on a shared PeftModel would yank training weights off GPU 1.
+  kl_device: "cpu"
   off_support_threshold: -9.0
   on_policy_reload: true
   lora_staging_dir: "/dev/shm"
@@ -92,7 +109,7 @@ rollout:
   vllm_port: 8000
   tool_server_port: 8765
   num_rollout_workers: 4
-  batch_size: 2             # scenes per batch (fewer than pairs — more expensive)
+  batch_size: 1             # one scene per step (was 2; group×batch activations)
   min_p: 0.05
   top_k: 50
 
@@ -100,10 +117,9 @@ data:
   # Scene data from MegaDepth scene_info
   scene_info_dir: "/scratch/kcwp264/data/megadepth/scene_info_full/scene_info"
   image_root: "/scratch/kcwp264/data/megadepth/megadepth_test_1500"
-  # Indoor RGB-D scenes: extracted scannet_test_1500 scenes (sceneNNNN_MM
-  # dirs).  When set, ScanNet scenes are concatenated with MegaDepth for
-  # Phase 2 scene training.  Set to null to disable.
-  scannet_root: "/scratch/kcwp264/data/megadepth/scannet_test_1500/scannet_test_1500"
+  # ScanNet indoor RGB-D is off for this OOM-safe run. Re-enable the path
+  # only after a 20-image MegaDepth job finishes without GPU-1 OOM.
+  scannet_root: null
   scannet_scene_ids: null    # e.g. ["scene0772_00"]; null = all extracted
   max_images_per_scene: 20   # images per scene episode (curriculum increases this)
   min_images_per_scene: 5
@@ -117,4 +133,4 @@ output:
   log_dir: "logs/phase2"
   wandb_project: "agentic-sfm"
   wandb_entity: null
-  wandb_run_name: "phase2-scene-grpo-qwen35-2b-r3"  # r3: KL + on-policy + first-call gate
+  wandb_run_name: "phase2-scene-grpo-qwen35-2b-r5"  # r5: OOM caps + CPU KL + pose-gated eval

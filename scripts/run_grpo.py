@@ -53,7 +53,7 @@ from agentic_sfm.agent.policy import (
 )
 from agentic_sfm.constants import DEFAULT_MATCHER, DEFAULT_POLICY_MODEL
 from agentic_sfm.data.hard_pairs import HardPairDataset
-from agentic_sfm.eval.evaluate import select_eval_pairs, summarize_pair_eval
+from agentic_sfm.eval.evaluate import pair_episode_row, select_eval_pairs, summarize_pair_eval
 from agentic_sfm.geometry import keep_best_match
 from agentic_sfm.rewards.pose_rewards import compute_pair_reward
 from agentic_sfm.tools.client import ToolClient
@@ -68,6 +68,54 @@ logger = logging.getLogger(__name__)
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def load_vllm_lora(
+    vllm_url: str,
+    ckpt_path: str | Path,
+    rollout_agent: "VLLMRolloutAgent | None" = None,
+    *,
+    adapter_name: str | None = None,
+    version: int = 1,
+) -> str:
+    """Hot-load a LoRA into a running vLLM server. Returns the adapter name.
+
+    Raises ``RuntimeError`` if the load POST fails so callers cannot silently
+    evaluate the base Qwen checkpoint.
+    """
+    import urllib.request
+
+    adapter = adapter_name or f"agentic-sfm-policy-v{version}"
+    base = vllm_url.rstrip("/")
+    path = str(Path(ckpt_path).resolve())
+    if not (Path(path) / "adapter_model.safetensors").is_file():
+        raise FileNotFoundError(f"LoRA adapter missing adapter_model.safetensors: {path}")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer EMPTY",
+    }
+
+    def _post(route: str, payload: dict, timeout: int = 120) -> None:
+        req = urllib.request.Request(
+            f"{base}{route}",
+            data=json.dumps(payload).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+
+    _post("/v1/load_lora_adapter", {"lora_name": adapter, "lora_path": path})
+    if rollout_agent is not None:
+        rollout_agent.vllm_model = adapter
+        rollout_agent._lora_loaded = True
+    logger.info(f"vLLM serving LoRA adapter {adapter} from {path}")
+    for route in ("/v1/reset_prefix_cache", "/v1/reset_encoder_cache"):
+        try:
+            _post(route, {}, timeout=60)
+        except Exception as e:
+            logger.debug(f"vLLM {route} failed (non-fatal): {e}")
+    return adapter
 
 
 def _n_images_in_messages(messages: list[dict[str, Any]]) -> int:
@@ -120,6 +168,9 @@ class VLLMRolloutAgent:
                  ntep_intent_coef: float = 0.05,
                  ntep_redundancy_penalty: float = 0.05,
                  use_ntep_rewards: bool = False,
+                 first_call_validity_weight: float = 0.5,
+                 first_call_invalid_penalty: float = 1.0,
+                 gate_geometry_on_validity: bool = True,
                  sft_adapter: str | None = None,
                  reward_config: dict[str, Any] | None = None):
         self.vllm_url = vllm_url.rstrip("/")
@@ -146,6 +197,10 @@ class VLLMRolloutAgent:
         self.ntep_intent_coef = ntep_intent_coef
         self.ntep_redundancy_penalty = ntep_redundancy_penalty
         self.use_ntep_rewards = use_ntep_rewards
+        # First-call validity gate (commit 0f61843)
+        self.first_call_validity_weight = first_call_validity_weight
+        self.first_call_invalid_penalty = first_call_invalid_penalty
+        self.gate_geometry_on_validity = gate_geometry_on_validity
         self._global_step = 0
         self.vllm_model = model_name
         self._lora_loaded = False
@@ -659,6 +714,12 @@ class GRPOTrainer:
         # kl_adapter separately when resuming RL from a trained LoRA while
         # still anchoring JSON style to SFT.
         self.kl_adapter = config["model"].get("kl_adapter") or self.sft_adapter
+        # Optional device for a *separate* frozen copy ("cpu" for Phase 2).
+        # None keeps the historical wrap of get_base_model() on the train GPU.
+        raw_kl_dev = config.get("training", {}).get("kl_device")
+        self.kl_device = (
+            str(raw_kl_dev).strip() if raw_kl_dev not in (None, "") else None
+        )
         # Use cuda:0 if CUDA_VISIBLE_DEVICES is set (only 1 GPU visible)
         # Otherwise use the configured training GPU (default cuda:1)
         if os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -742,16 +803,61 @@ class GRPOTrainer:
         # degenerate/repetitive modes RL without any anchor discovers.
         if self.kl_coef > 0 and self.kl_adapter and os.path.isdir(self.kl_adapter):
             try:
-                from peft import PeftModel
-                ref = PeftModel.from_pretrained(self._model.get_base_model(), self.kl_adapter, is_trainable=False)
-                ref.eval()
-                for p in ref.parameters():
-                    p.requires_grad = False
-                self._ref_model = ref
-                logger.info(f"Reference (KL anchor) model loaded from {self.kl_adapter}")
+                self._ref_model = self._load_kl_reference()
+                logger.info(
+                    f"Reference (KL anchor) loaded from {self.kl_adapter} "
+                    f"on {self._module_device(self._ref_model, 'cpu')}"
+                )
             except Exception as e:
                 logger.warning(f"Reference model load failed — KL disabled: {e}")
                 self._ref_model = None
+
+    def _load_kl_reference(self) -> torch.nn.Module:
+        """Frozen SFT LoRA used only for the k3 KL term (no gradients).
+
+        ``kl_device: cpu`` loads a **separate** base+adapter on host RAM so
+        GPU 1 only holds the trainable LoRA. Never ``.to("cpu")`` a PeftModel
+        that wraps ``self._model.get_base_model()`` — that shared base would
+        leave the train GPU.
+        """
+        from peft import PeftModel
+
+        from agentic_sfm.agent.policy import load_policy_processor_and_model
+
+        if self.kl_device:
+            logger.info(
+                "Loading frozen KL adapter as a separate copy on %s",
+                self.kl_device,
+            )
+            device_map = self.kl_device
+            _, base = load_policy_processor_and_model(
+                self.model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device_map,
+            )
+            ref = PeftModel.from_pretrained(
+                base, self.kl_adapter, is_trainable=False
+            )
+            ref.to(self.kl_device)
+        else:
+            ref = PeftModel.from_pretrained(
+                self._model.get_base_model(),
+                self.kl_adapter,
+                is_trainable=False,
+            )
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad = False
+        return ref
+
+    @staticmethod
+    def _module_device(
+        model: torch.nn.Module, fallback: str | torch.device = "cpu"
+    ) -> torch.device:
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            return torch.device(fallback)
 
     def get_curriculum_difficulties(self, epoch: int) -> list[str]:
         if not self.curriculum_stages:
@@ -1003,11 +1109,12 @@ class GRPOTrainer:
         if model is None:
             self._load_training_model()
             model = self._model
+        device = self._module_device(model, self.training_device)
         results = []
 
         for ep in episodes:
             if not ep.messages:
-                results.append((torch.tensor(0.0, device=self.training_device), torch.tensor([], device=self.training_device, dtype=torch.bool)))
+                results.append((torch.tensor(0.0, device=device), torch.tensor([], device=device, dtype=torch.bool)))
                 continue
 
             try:
@@ -1020,10 +1127,10 @@ class GRPOTrainer:
                 )
                 inputs = self._processor(
                     text=[text], images=images, return_tensors="pt", padding=True
-                ).to(self.training_device)
+                ).to(device)
 
                 mask = self._compute_assistant_mask(messages, images, self._processor)
-                mask_tensor = torch.tensor(mask, device=self.training_device, dtype=torch.bool)
+                mask_tensor = torch.tensor(mask, device=device, dtype=torch.bool)
 
                 ctx_manager = torch.enable_grad() if requires_grad else torch.no_grad()
                 with ctx_manager:
@@ -1046,7 +1153,7 @@ class GRPOTrainer:
                 results.append((per_token_logps.squeeze(0), assistant_mask))
             except Exception as e:
                 logger.warning(f"Logprob computation failed for {self._group_key(ep)}: {e}")
-                results.append((torch.tensor(0.0, device=self.training_device), torch.tensor([], device=self.training_device, dtype=torch.bool)))
+                results.append((torch.tensor(0.0, device=device), torch.tensor([], device=device, dtype=torch.bool)))
 
         return results
 
@@ -1205,7 +1312,11 @@ class GRPOTrainer:
                     ref_logps, ref_mask = ref_results[i]
                     if ref_logps.ndim > 0 and ref_mask.numel() > 0:
                         nr = min(ref_logps.shape[0], ref_mask.shape[0])
-                        ref_full = ref_logps[:nr][ref_mask[:nr]].to(torch.float32).detach()
+                        ref_full = (
+                            ref_logps[:nr][ref_mask[:nr]]
+                            .to(device=new_tok.device, dtype=torch.float32)
+                            .detach()
+                        )
                         if keep is not None:
                             ref_full = ref_full[: keep.shape[0]][keep]
                         k = min(new_tok.shape[0], ref_full.shape[0])
@@ -1310,21 +1421,7 @@ class GRPOTrainer:
                 K_a=pair.K_a, K_b=pair.K_b,
             )
             episodes.append(ep)
-            rc = ep.reward_components or {}
-            n_inliers = int((ep.final_match or {}).get("num_inliers") or 0)
-            rows.append({
-                "pair_id": pair.pair_id,
-                "difficulty": pair.difficulty,
-                "reward": float(ep.reward),
-                "geometric_reward": float(rc.get("pose_reward") or 0.0) + float(rc.get("inlier_reward") or 0.0),
-                "num_inliers": n_inliers,
-                "inlier_ratio": float((ep.final_match or {}).get("inlier_ratio") or 0.0),
-                "pose_auc": float(rc.get("pose_reward") or 0.0) / pose_w,
-                "num_tool_calls": len(ep.tool_calls),
-                "rotation_error": float(rc["rotation_error_deg"]) if "rotation_error_deg" in rc else -1.0,
-                "translation_error": float(rc["translation_error_deg"]) if "translation_error_deg" in rc else -1.0,
-                "success": n_inliers > 0,
-            })
+            rows.append(pair_episode_row(pair, ep, pose_weight=pose_w))
         stats = summarize_pair_eval(rows, method="grpo_val")
         stats["num_pairs"] = stats.get("total", len(rows))
         stats["success_rate"] = float(stats.get("success_rate", 0.0))
@@ -1357,48 +1454,23 @@ class GRPOTrainer:
         caches afterwards — a same-name reload can reuse stale KV blocks
         (vLLM #42125, #44939) and silently serve the previous policy.
         """
-        import urllib.error
-        import urllib.request
-
         if version is None:
             # Every reload needs a fresh name — reusing a name that is already
             # loaded (e.g. the epoch-end "latest" reload right after a per-step
             # push with the same version) makes vLLM 400.
             self._adapter_version += 1
             version = self._adapter_version
-        adapter = f"agentic-sfm-policy-v{version}"
-        base = rollout_agent.vllm_url.rstrip("/")
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer EMPTY",
-        }
-        path = str(ckpt_path.resolve())
-
-        def _post(route: str, payload: dict, timeout: int = 120) -> None:
-            req = urllib.request.Request(
-                f"{base}{route}",
-                data=json.dumps(payload).encode(),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                resp.read()
-
         try:
-            _post("/v1/load_lora_adapter", {"lora_name": adapter, "lora_path": path})
-            rollout_agent.vllm_model = adapter
-            rollout_agent._lora_loaded = True
-            logger.info(f"vLLM serving LoRA adapter {adapter} from {path}")
+            load_vllm_lora(
+                rollout_agent.vllm_url,
+                ckpt_path,
+                rollout_agent,
+                version=version,
+            )
         except Exception as e:
-            logger.warning(f"vLLM load LoRA failed (rollouts stay on {rollout_agent.vllm_model}): {e}")
-            return
-
-        # A reloaded adapter must not reuse KV blocks from the previous policy.
-        for route in ("/v1/reset_prefix_cache", "/v1/reset_encoder_cache"):
-            try:
-                _post(route, {}, timeout=60)
-            except Exception as e:
-                logger.debug(f"vLLM {route} failed (non-fatal): {e}")
+            logger.warning(
+                f"vLLM load LoRA failed (rollouts stay on {rollout_agent.vllm_model}): {e}"
+            )
 
     def train(self):
         """Main GRPO training loop with gradient accumulation."""
@@ -1425,6 +1497,9 @@ class GRPOTrainer:
             ntep_intent_coef=self.ntep_intent_coef,
             ntep_redundancy_penalty=self.ntep_redundancy_penalty,
             use_ntep_rewards=self.use_ntep_rewards,
+            first_call_validity_weight=self.first_call_validity_weight,
+            first_call_invalid_penalty=self.first_call_invalid_penalty,
+            gate_geometry_on_validity=self.gate_geometry_on_validity,
         )
         if self.sft_adapter and os.path.isdir(self.sft_adapter):
             self._reload_vllm_lora(Path(self.sft_adapter), rollout_agent)

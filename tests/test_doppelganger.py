@@ -412,6 +412,196 @@ class TestSceneEpisodeIntegration:
         assert key == "img_0001__img_0002"
 
 
+class TestGTImpostorScoring:
+    """Episode-end GT doppelganger labelling from the overlap matrix.
+
+    A small 3-image scene with a banded overlap matrix (pattern from
+    tests/test_scene_sft.py::_write_scene): pair (0,1) overlaps positively,
+    (0,2) and (1,2) have zero measured covisibility — true doppelgangers.
+    """
+
+    OM = np.array([
+        [1.0, 0.9, 0.0],
+        [0.9, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+
+    class _GraphClient:
+        """Mock tool client for the scene graph grammar (no GPU/server)."""
+
+        def __init__(self, flagged_confidence=0.9):
+            self.registered: dict[str, str] = {}
+            self.flagged_confidence = flagged_confidence
+            self.sfm_pair_lists: list = []
+            self.pruned: list = []
+            # Active edges the (mock) server-side view graph holds.
+            self.active = [("img_0000", "img_0001"), ("img_0001", "img_0002")]
+
+        def register_image(self, img_id, path):
+            self.registered[img_id] = path
+            return {"status": "ok"}
+
+        def inspect_graph(self, session=""):
+            return {
+                "num_images": len(self.registered),
+                "num_verified_edges": len(self.active),
+                "edges": [list(e) for e in self.active],
+                "num_edges_listed": len(self.active),
+                "status": "ok",
+            }
+
+        def verify_doppelganger(self, image_a, image_b, session=""):
+            conf = float(self.flagged_confidence)
+            return {
+                "pair": [image_a, image_b],
+                "is_doppelganger": conf >= 0.5,
+                "confidence": conf,
+                "visual_similarity": 0.85,
+                "num_inliers": 20,
+                "inlier_ratio": 0.1,
+                "evidence": "mock",
+                "status": "ok",
+            }
+
+        def prune_edges(self, pairs, session=""):
+            self.pruned.extend([tuple(p) for p in pairs])
+            for p in pairs:
+                key = tuple(sorted(p))
+                self.active = [e for e in self.active if tuple(sorted(e)) != key]
+            return {"num_pruned": len(pairs), "remaining_edges": len(self.active),
+                    "status": "ok"}
+
+        def sfm_run(self, image_dir, pair_list=None, output_dir="", session="",
+                    **kw):
+            self.sfm_pair_lists.append(pair_list)
+            return {
+                "num_registered": len(self.registered),
+                "num_points3d": 50,
+                "mean_pose_error_deg": 5.0,
+                "num_pairs_matched": len(pair_list) if pair_list else 0,
+                "status": "ok",
+            }
+
+    class _Agent:
+        matcher = "loftr"
+        reward_config: dict = {}
+
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self._i = 0
+
+        def _encode_image(self, path):
+            return "b64"
+
+        def _generate_turn(self, messages, images=None):
+            if self._i < len(self.responses):
+                r = self.responses[self._i]
+                self._i += 1
+                return r
+            return json.dumps({"tool": "done", "args": {}})
+
+    def _scene(self, tmp_path):
+        from PIL import Image
+
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"img_{i:04d}.jpg"
+            Image.new("RGB", (32, 32), (10 * i, 20, 30)).save(p, "JPEG")
+            paths.append(str(p))
+        gt = {"num_images": 3, "poses": {str(i): np.eye(4).tolist()
+                                          for i in range(3)}}
+        return paths, gt
+
+    def _run(self, tmp_path, tool_script, flagged_confidence=0.9):
+        from agentic_sfm.rl.scene_episode import run_scene_episode
+
+        paths, gt = self._scene(tmp_path)
+        client = self._GraphClient(flagged_confidence=flagged_confidence)
+        agent = self._Agent([json.dumps(t) for t in tool_script])
+        ep = run_scene_episode(
+            agent=agent, scene_id="gt-test", image_paths=paths,
+            tool_client=client, gt_recon=gt,
+            overlap_matrix=self.OM, image_indices=[0, 1, 2],
+            max_tool_calls=10,
+        )
+        return ep, client, gt
+
+    def test_flagged_zero_overlap_pair_is_gt_impostor(self, tmp_path):
+        """Flagged + pruned pair with zero overlap: GT impostor, F1 reward.
+
+        In-play pairs: graph edges (0,1)/(1,2), the verified/pruned pair (0,2),
+        and the sfm pair list ((0,1),(1,2) — flagged pair filtered).  GT
+        impostors are the in-play pairs with overlap <= 0: (0,2) and (1,2).
+        The agent pruned exactly (0,2): tp=1, fp=0, fn=1 -> f1 = 2/3 ->
+        doppelganger_reward = 0.3 * 2/3 (the self-certified fallback would
+        pay 0.3, so this asserts the GT path end-to-end).
+        """
+        ep, client, gt = self._run(tmp_path, [
+            {"tool": "verify_doppelganger",
+             "args": {"image_a": "img_0000", "image_b": "img_0002"}},
+            {"tool": "prune_edges",
+             "args": {"pairs": [["img_0000", "img_0002"]]}},
+            {"tool": "sfm_run", "args": {}},
+            {"tool": "done", "args": {}},
+        ])
+        assert ep.done
+        # the flagged pair is a GT impostor
+        impostors = {tuple(sorted(p)) for p in ep.gt_recon["impostors"]}
+        assert ("img_0000", "img_0002") in impostors
+        assert ("img_0001", "img_0002") in impostors
+        assert ("img_0000", "img_0001") not in impostors  # positive overlap
+        # shared gt_recon (whole GRPO group) must not be mutated
+        assert "impostors" not in gt
+        # reward uses the GT path: f1-based, not the flat self-certified rate
+        assert ep.reward_components["doppelganger_reward"] == pytest.approx(0.2)
+        # the flagged pair was excluded from the sfm pair list
+        assert client.sfm_pair_lists[0] is not None
+        assert ("img_0000", "img_0002") not in {
+            tuple(p) for p in client.sfm_pair_lists[0]}
+
+    def test_flagged_positive_overlap_pair_is_not_impostor(self, tmp_path):
+        """Flagging a pair that truly overlaps is a false positive, not GT.
+
+        (0,1) has overlap 0.9 — pruning it counts against precision, and it
+        must never appear in the GT impostor list.
+        """
+        ep, client, gt = self._run(tmp_path, [
+            {"tool": "verify_doppelganger",
+             "args": {"image_a": "img_0000", "image_b": "img_0001"}},
+            {"tool": "prune_edges",
+             "args": {"pairs": [["img_0000", "img_0001"]]}},
+            {"tool": "sfm_run", "args": {}},
+            {"tool": "done", "args": {}},
+        ])
+        impostors = {tuple(sorted(p)) for p in ep.gt_recon["impostors"]}
+        assert ("img_0000", "img_0001") not in impostors
+        # GT impostors are still the two zero-overlap pairs (both were fed
+        # to sfm via the exhaustive-minus-flagged pair list)
+        assert impostors == {("img_0000", "img_0002"), ("img_0001", "img_0002")}
+        # pruned pair is a pure false positive: tp=0 -> f1 = 0
+        assert ep.reward_components["doppelganger_reward"] == pytest.approx(0.0)
+
+    def test_no_overlap_matrix_leaves_impostors_unset(self, tmp_path):
+        """Pure mock episode (no GT overlap data): no impostor labels."""
+        from agentic_sfm.rl.scene_episode import run_scene_episode
+
+        paths, gt = self._scene(tmp_path)
+        client = self._GraphClient()
+        agent = self._Agent([
+            json.dumps({"tool": "verify_doppelganger",
+                        "args": {"image_a": "img_0000", "image_b": "img_0002"}}),
+            json.dumps({"tool": "done", "args": {}}),
+        ])
+        ep = run_scene_episode(
+            agent=agent, scene_id="mock", image_paths=paths,
+            tool_client=client, gt_recon=gt, max_tool_calls=10,
+        )
+        assert ep.gt_recon is gt or ep.gt_recon == gt
+        assert not (ep.gt_recon or {}).get("impostors")
+        # self-certified fallback is disabled by default
+        assert ep.reward_components["doppelganger_reward"] == 0.0
+
+
 class TestRealDino:
     """Optional GPU integration test — real DINOv2 forward pass."""
 

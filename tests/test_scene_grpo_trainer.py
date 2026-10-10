@@ -402,6 +402,20 @@ class TestSceneMetrics:
         ):
             assert key in m
 
+    def test_reward_has_no_self_certified_doppelganger_bonus(self):
+        # Contract pin for the trainer's rollout path: without GT impostor
+        # labels the self-reported filtering rate must not pay a bonus
+        # (doppelganger_scored=False marks that no GT scoring happened).
+        from agentic_sfm.rewards.pose_rewards import compute_scene_reward
+
+        rc = compute_scene_reward(
+            {"num_registered": 8, "mean_pose_error_deg": 5.0,
+             "num_doppelgangers_present": 2, "num_doppelgangers_filtered": 2},
+            gt_recon={"num_images": 10},
+        )
+        assert rc["doppelganger_reward"] == 0.0
+        assert rc["doppelganger_scored"] is False
+
     def test_empty_episode_list(self, tmp_path):
         assert _make_trainer(tmp_path)._scene_metrics([]) == {}
 
@@ -505,10 +519,29 @@ class TestEvaluate:
         assert stats["success_rate"] == pytest.approx(1.0)
         assert stats["mean_registered"] == pytest.approx(3.0)
         assert stats["scene/mean_pose_error_deg"] == pytest.approx(2.0)
+        assert stats["eval_score"] == pytest.approx(1.0 * (1.0 - 2.0 / 20.0))
         # eval uses the unscheduled reward config
         agent = ScriptedSceneAgent()
         trainer.evaluate(agent)
         assert agent.reward_config["pose_weight"] == pytest.approx(0.9)
+
+    def test_evaluate_one_camera_is_not_success(self, tmp_path, monkeypatch):
+        def _one_cam(agent, scene_id, **kw):
+            ep = _episode(
+                scene_id, 1.5,
+                recon_result={"num_registered": 1, "mean_pose_error_deg": 2.0},
+            )
+            ep.num_images = 10
+            ep.image_paths = [f"{i}.jpg" for i in range(10)]
+            return ep
+
+        monkeypatch.setattr("scripts.run_scene_grpo.run_scene_episode", _one_cam)
+        val = [{"scene_id": "v0", "image_paths": ["a.jpg"] * 10, "num_images": 10}]
+        trainer = _make_trainer(tmp_path)
+        trainer.val_scenes = val
+        stats = trainer.evaluate(ScriptedSceneAgent())
+        assert stats["success_rate"] == pytest.approx(0.0)
+        assert stats["eval_score"] == pytest.approx(0.1 * (1.0 - 2.0 / 20.0))
 
     def test_evaluate_with_no_scenes(self, tmp_path):
         trainer = _make_trainer(tmp_path)

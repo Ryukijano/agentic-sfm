@@ -39,6 +39,9 @@ from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from agentic_sfm.graph.view_graph import EdgeData, ViewGraph
+from agentic_sfm.rl.retrieval import compute_image_embedding
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -79,6 +82,36 @@ class RetrieveRequest(BaseModel):
     k: int = 5
 
 
+class BuildGraphRequest(BaseModel):
+    image_ids: list[str] = Field(..., description="Registered image ids for the scene")
+    k_neighbors: int = 5
+    matcher: str = "loftr"
+    session: str = ""
+
+
+class InspectGraphRequest(BaseModel):
+    session: str = ""
+
+
+class VerifyDoppelgangerRequest(BaseModel):
+    image_a: str
+    image_b: str
+    session: str = ""
+
+
+class PruneEdgesRequest(BaseModel):
+    pairs: list[list[str]]
+    session: str = ""
+
+
+class BridgeComponentsRequest(BaseModel):
+    comp_a_id: int = 0
+    comp_b_id: int = 1
+    budget: int = 3
+    matcher: str = "loftr"
+    session: str = ""
+
+
 class SfMRequest(BaseModel):
     image_dir: str
     pair_list: list[tuple[str, str]] | None = None
@@ -88,9 +121,7 @@ class SfMRequest(BaseModel):
     session: str = ""
     # When true, import the agent's own matcher correspondences (cached by
     # earlier /match calls) into COLMAP instead of SIFT matching, so the
-    # reconstruction is driven by the agent's match quality. Defaults true so
-    # the agent's /match work automatically feeds the reconstruction; SIFT is
-    # used only as a fallback when no cached matches exist for the pairs.
+    # reconstruction is driven by the agent's match quality.
     use_agent_matches: bool = True
 
 
@@ -103,6 +134,7 @@ class InspectRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _IMAGE_STORE: dict[str, str | np.ndarray] = {}
+_image_registry = _IMAGE_STORE
 _RECON_STORE: dict[str, dict[str, Any]] = {}
 _CROP_META: dict[str, dict[str, Any]] = {}
 
@@ -114,6 +146,13 @@ _CROP_META: dict[str, dict[str, Any]] = {}
 _match_store: "OrderedDict[str, OrderedDict[tuple[str, str], dict[str, Any]]]" = OrderedDict()
 _MATCH_STORE_MAX_SESSIONS = 64
 _DEFAULT_SESSION = "_default"
+
+# Session-scoped ViewGraph stores for Phase 2 scene-level graph orchestration.
+_SESSION_GRAPHS: dict[str, ViewGraph] = {}
+# Cap on the active edge list returned by tool_inspect_graph.
+_INSPECT_GRAPH_MAX_EDGES = 500
+# Cached image embeddings (keyed by resolved image path)
+_EMBEDDING_CACHE: dict[str, np.ndarray] = {}
 
 
 # COLMAP runs in this child process so a native SIGBUS (FAISS matcher) can't
@@ -713,6 +752,342 @@ def tool_retrieve(query_image: str, k: int = 5) -> dict[str, Any]:
     return {"candidates": candidates[:k]}
 
 
+def tool_build_initial_graph(
+    image_ids: list[str],
+    k_neighbors: int = 5,
+    matcher: str = "loftr",
+    session: str = "",
+) -> dict[str, Any]:
+    """Initialize the view graph using learned visual retrieval and batch matching."""
+    sess = session or _DEFAULT_SESSION
+    if not image_ids:
+        return {"error": "image_ids cannot be empty", "status": "error"}
+
+    # Compute or retrieve DINOv2 embeddings
+    valid_ids: list[str] = []
+    embs: list[np.ndarray] = []
+    for img_id in image_ids:
+        path = _store_path(img_id)
+        if path is None:
+            continue
+        valid_ids.append(img_id)
+        if path in _EMBEDDING_CACHE:
+            embs.append(_EMBEDDING_CACHE[path])
+        else:
+            try:
+                emb = compute_image_embedding(path)
+            except Exception as e:
+                logger.warning(f"Embedding failed for {path}: {e}")
+                emb = np.zeros(384, dtype=np.float32)
+            _EMBEDDING_CACHE[path] = emb
+            embs.append(emb)
+
+    if len(valid_ids) < 2:
+        return {
+            "error": f"Fewer than 2 valid images resolved (found {len(valid_ids)})",
+            "status": "error",
+        }
+
+    # Cosine similarity matrix
+    embs_arr = np.stack(embs)
+    norms = np.linalg.norm(embs_arr, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    embs_norm = embs_arr / norms
+    sim = embs_norm @ embs_norm.T
+
+    # Select top-k nearest neighbors per image (canonical undirected pairs)
+    k = max(1, min(k_neighbors, len(valid_ids) - 1))
+    candidate_pairs: set[tuple[str, str]] = set()
+    for i in range(len(valid_ids)):
+        scores = sim[i].copy()
+        scores[i] = -1e9  # exclude self
+        top_idx = np.argsort(scores)[::-1][:k]
+        for j in top_idx:
+            u, v = valid_ids[i], valid_ids[j]
+            key = (u, v) if u < v else (v, u)
+            candidate_pairs.add(key)
+
+    # Initialize graph
+    graph = ViewGraph(valid_ids)
+
+    # Batch match candidate pairs
+    for u, v in sorted(candidate_pairs):
+        match_res = tool_match(u, v, matcher=matcher, session=sess)
+        num_inliers = int(match_res.get("num_inliers") or 0)
+        num_matches = int(match_res.get("num_matches") or 0)
+        inlier_ratio = float(match_res.get("inlier_ratio") or 0.0)
+        pose = match_res.get("pose")
+        R_rel = np.array(pose["R"], dtype=np.float64) if (pose and "R" in pose) else None
+        t_rel = np.array(pose["t"], dtype=np.float64) if (pose and "t" in pose) else None
+        status = "verified" if num_inliers >= 15 else "failed"
+
+        edge = EdgeData(
+            image_a=u,
+            image_b=v,
+            num_matches=num_matches,
+            num_inliers=num_inliers,
+            inlier_ratio=inlier_ratio,
+            R_rel=R_rel,
+            t_rel=t_rel,
+            matcher=matcher,
+            status=status,
+        )
+        graph.add_edge(u, v, edge)
+
+    _SESSION_GRAPHS[sess] = graph
+
+    summary = graph.get_summary()
+    summary["num_candidates_selected"] = len(candidate_pairs)
+    summary["status"] = "ok"
+    return summary
+
+
+def tool_inspect_graph(session: str = "") -> dict[str, Any]:
+    """Inspect the current session's view graph topology and diagnostics."""
+    sess = session or _DEFAULT_SESSION
+    graph = _SESSION_GRAPHS.get(sess)
+    if graph is None:
+        return {
+            "error": f"No active view graph found for session '{sess}'. Call build_initial_graph first.",
+            "status": "error",
+        }
+    summary = graph.get_summary()
+    summary["components"] = graph.get_connected_components()
+    # Active edge list so the episode runner knows which pairs were actually
+    # in play (used to derive GT doppelganger labels at episode end).  Capped
+    # so huge graphs don't blow the agent's context budget.
+    active = list(graph.active_edges().keys())
+    summary["edges"] = [[u, v] for (u, v) in active[:_INSPECT_GRAPH_MAX_EDGES]]
+    summary["num_edges_listed"] = len(summary["edges"])
+    summary["status"] = "ok"
+    return summary
+
+
+def tool_verify_doppelganger(
+    image_a: str,
+    image_b: str,
+    session: str = "",
+) -> dict[str, Any]:
+    """Verify if an image pair is a visual doppelganger using multi-modal evidence."""
+    sess = session or _DEFAULT_SESSION
+    graph = _SESSION_GRAPHS.get(sess)
+
+    path_a = _store_path(image_a)
+    path_b = _store_path(image_b)
+
+    # 1. Visual similarity via embeddings
+    vis_sim = 0.0
+    if path_a and path_b:
+        emb_a = _EMBEDDING_CACHE.get(path_a)
+        if emb_a is None:
+            emb_a = compute_image_embedding(path_a)
+            _EMBEDDING_CACHE[path_a] = emb_a
+        emb_b = _EMBEDDING_CACHE.get(path_b)
+        if emb_b is None:
+            emb_b = compute_image_embedding(path_b)
+            _EMBEDDING_CACHE[path_b] = emb_b
+
+        denom = max(float(np.linalg.norm(emb_a) * np.linalg.norm(emb_b)), 1e-8)
+        vis_sim = float(np.dot(emb_a, emb_b) / denom)
+
+    # 2. Local matching evidence
+    u, v = (image_a, image_b) if image_a < image_b else (image_b, image_a)
+    edge = graph.edges.get((u, v)) if graph else None
+
+    if edge is not None and edge.status == "verified":
+        inliers = edge.num_inliers
+        ratio = edge.inlier_ratio
+        R_uv = edge.R_rel
+    else:
+        match_res = tool_match(image_a, image_b, matcher="loftr", session=sess)
+        inliers = int(match_res.get("num_inliers") or 0)
+        ratio = float(match_res.get("inlier_ratio") or 0.0)
+        pose = match_res.get("pose")
+        R_uv = np.array(pose["R"], dtype=np.float64) if (pose and "R" in pose) else None
+
+    # 3. Cycle rotation residual check across common neighbors
+    cycle_errors: list[float] = []
+    if graph is not None and R_uv is not None:
+        active = graph.active_edges()
+        adj: dict[str, dict[str, np.ndarray]] = {n: {} for n in graph.nodes}
+        for (i, j), e in active.items():
+            if e.R_rel is not None and e.num_inliers >= 15:
+                R = np.asarray(e.R_rel, dtype=np.float64).reshape(3, 3)
+                adj[i][j] = R
+                adj[j][i] = R.T
+
+        if u in adj and v in adj:
+            common = set(adj[u].keys()) & set(adj[v].keys())
+            for w in common:
+                # Loop: u -> v -> w -> u: R_wu @ R_vw @ R_uv
+                R_loop = adj[w][u] @ adj[v][w] @ R_uv
+                tr = np.clip((np.trace(R_loop) - 1.0) / 2.0, -1.0, 1.0)
+                angle_deg = float(np.degrees(np.arccos(tr)))
+                cycle_errors.append(angle_deg)
+
+    max_cycle_err = max(cycle_errors) if cycle_errors else None
+
+    # Multi-modal verdict
+    is_dop = False
+    evidence_parts: list[str] = []
+    if max_cycle_err is not None and max_cycle_err > 15.0 and vis_sim > 0.70:
+        is_dop = True
+        evidence_parts.append(
+            f"High cycle rotation residual ({max_cycle_err:.1f}° > 15°) with high appearance similarity ({vis_sim:.2f}) indicates symmetry fold/doppelganger."
+        )
+    elif vis_sim > 0.80 and inliers < 15:
+        is_dop = True
+        evidence_parts.append(
+            f"High appearance similarity ({vis_sim:.2f}) but low inlier count ({inliers} < 15) indicates repetitive visual texture without valid epipolar geometry."
+        )
+    elif vis_sim > 0.80 and ratio < 0.15:
+        is_dop = True
+        evidence_parts.append(
+            f"High appearance similarity ({vis_sim:.2f}) but poor inlier ratio ({ratio:.2f}) suggests spurious matches on repetitive structures."
+        )
+    else:
+        evidence_parts.append(
+            f"Consistent geometry (inliers={inliers}, ratio={ratio:.2f}, sim={vis_sim:.2f}"
+            + (f", cycle_err={max_cycle_err:.1f}°" if max_cycle_err is not None else "")
+            + ")."
+        )
+
+    evidence = " ".join(evidence_parts)
+
+    return {
+        "pair": [image_a, image_b],
+        "visual_similarity": round(vis_sim, 3),
+        "num_inliers": inliers,
+        "inlier_ratio": round(ratio, 3),
+        "cycle_rotation_error_deg": round(max_cycle_err, 2) if max_cycle_err is not None else None,
+        "is_doppelganger": is_dop,
+        "evidence": evidence,
+        "status": "ok",
+    }
+
+
+def tool_prune_edges(pairs: list[list[str]], session: str = "") -> dict[str, Any]:
+    """Prune specified edges from the session's active view graph."""
+    sess = session or _DEFAULT_SESSION
+    graph = _SESSION_GRAPHS.get(sess)
+    if graph is None:
+        return {"error": f"No active graph for session '{sess}'", "status": "error"}
+
+    pruned_count = 0
+    bucket = _match_store.get(sess, {})
+    for p in pairs:
+        if len(p) >= 2:
+            u, v = str(p[0]), str(p[1])
+            if graph.prune_edge(u, v):
+                pruned_count += 1
+            pa = _store_path(u)
+            pb = _store_path(v)
+            if pa and pb:
+                bucket.pop(tuple(sorted((os.path.abspath(pa), os.path.abspath(pb)))), None)
+
+    summary = graph.get_summary()
+    comps = graph.get_connected_components()
+    return {
+        "num_pruned": pruned_count,
+        "remaining_edges": len(graph.active_edges()),
+        "num_components": len(comps),
+        "components": comps,
+        "summary": summary,
+        "status": "ok",
+    }
+
+
+def tool_bridge_components(
+    comp_a_id: int = 0,
+    comp_b_id: int = 1,
+    budget: int = 3,
+    matcher: str = "loftr",
+    session: str = "",
+) -> dict[str, Any]:
+    """Search for cross-component candidate pairs to connect disconnected components."""
+    sess = session or _DEFAULT_SESSION
+    graph = _SESSION_GRAPHS.get(sess)
+    if graph is None:
+        return {"error": f"No active graph for session '{sess}'", "status": "error"}
+
+    comps = graph.get_connected_components()
+    if comp_a_id < 0 or comp_a_id >= len(comps) or comp_b_id < 0 or comp_b_id >= len(comps):
+        return {
+            "error": f"Invalid component IDs {comp_a_id}, {comp_b_id}. Total components: {len(comps)}",
+            "status": "error",
+        }
+    if comp_a_id == comp_b_id:
+        return {"error": "comp_a_id and comp_b_id must be distinct", "status": "error"}
+
+    nodes_a = comps[comp_a_id]
+    nodes_b = comps[comp_b_id]
+
+    b = max(1, min(budget, 5))
+
+    candidates: list[tuple[str, str, float]] = []
+    for u in nodes_a:
+        path_u = _store_path(u)
+        emb_u = _EMBEDDING_CACHE.get(path_u) if path_u else None
+        for v in nodes_b:
+            key = graph.canonical_key(u, v)
+            if key in graph.edges and graph.edges[key].status == "verified":
+                continue
+            path_v = _store_path(v)
+            emb_v = _EMBEDDING_CACHE.get(path_v) if path_v else None
+            score = 0.0
+            if emb_u is not None and emb_v is not None:
+                denom = max(float(np.linalg.norm(emb_u) * np.linalg.norm(emb_v)), 1e-8)
+                score = float(np.dot(emb_u, emb_v) / denom)
+            candidates.append((u, v, score))
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    tested_candidates = candidates[:b]
+
+    bridges_added = 0
+    new_edges: list[dict[str, Any]] = []
+    for u, v, score in tested_candidates:
+        match_res = tool_match(u, v, matcher=matcher, session=sess)
+        num_inliers = int(match_res.get("num_inliers") or 0)
+        num_matches = int(match_res.get("num_matches") or 0)
+        inlier_ratio = float(match_res.get("inlier_ratio") or 0.0)
+        pose = match_res.get("pose")
+        R_rel = np.array(pose["R"], dtype=np.float64) if (pose and "R" in pose) else None
+        t_rel = np.array(pose["t"], dtype=np.float64) if (pose and "t" in pose) else None
+        status = "verified" if num_inliers >= 15 else "failed"
+
+        edge = EdgeData(
+            image_a=u,
+            image_b=v,
+            num_matches=num_matches,
+            num_inliers=num_inliers,
+            inlier_ratio=inlier_ratio,
+            R_rel=R_rel,
+            t_rel=t_rel,
+            matcher=matcher,
+            status=status,
+        )
+        graph.add_edge(u, v, edge)
+        if status == "verified":
+            bridges_added += 1
+            new_edges.append({
+                "pair": [u, v],
+                "inliers": num_inliers,
+                "inlier_ratio": round(inlier_ratio, 3),
+                "status": "verified",
+            })
+
+    new_comps = graph.get_connected_components()
+    return {
+        "candidates_tested": len(tested_candidates),
+        "bridges_added": bridges_added,
+        "new_edges": new_edges,
+        "num_components": len(new_comps),
+        "components": new_comps,
+        "summary": graph.get_summary(),
+        "status": "ok",
+    }
+
+
 def _resolve_image_name(id_or_path: str, image_dir: str) -> str:
     """Map a registered image id or path to its COLMAP image name.
 
@@ -801,6 +1176,17 @@ def _import_agent_matches(
     import pycolmap
 
     store = _match_store.get(session or _DEFAULT_SESSION, {})
+    graph = _SESSION_GRAPHS.get(session or _DEFAULT_SESSION)
+
+    # Active path pairs from the session's ViewGraph (if present)
+    active_path_set: set[tuple[str, str]] | None = None
+    if graph is not None:
+        active_path_set = set()
+        for (u, v), edge in graph.active_edges().items():
+            pa = _store_path(u)
+            pb = _store_path(v)
+            if pa and pb:
+                active_path_set.add(tuple(sorted((os.path.abspath(pa), os.path.abspath(pb)))))
 
     # Resolve the requested pairs (or all cached pairs when pair_list is None)
     # to their cached match records.
@@ -813,16 +1199,18 @@ def _import_agent_matches(
             b = _store_path(str(pair[1]))
             if a is None or b is None:
                 continue  # in-memory crops have no file path to key on
-            rec = store.get(
-                tuple(sorted((os.path.abspath(a), os.path.abspath(b))))
-            )
+            key = tuple(sorted((os.path.abspath(a), os.path.abspath(b))))
+            if active_path_set is not None and key not in active_path_set:
+                continue
+            rec = store.get(key)
             if rec is not None:
                 records.append(rec)
     else:
-        records = [
-            r for r in store.values()
-            if os.path.exists(r["path_a"]) and os.path.exists(r["path_b"])
-        ]
+        for key, r in store.items():
+            if active_path_set is not None and key not in active_path_set:
+                continue
+            if os.path.exists(r["path_a"]) and os.path.exists(r["path_b"]):
+                records.append(r)
     if not records:
         return 0
 
@@ -993,6 +1381,12 @@ def _run_colmap_subprocess(
         }
 
 
+def default_sfm_output_dir() -> str:
+    """COLMAP workdir: $SFM_OUTPUT_ROOT (or $TMPDIR), never ./outputs on scratch."""
+    root = os.environ.get("SFM_OUTPUT_ROOT") or os.environ.get("TMPDIR") or tempfile.gettempdir()
+    return str(Path(root) / f"sfm_run_{uuid.uuid4().hex[:8]}")
+
+
 def tool_sfm_run(
     image_dir: str,
     pair_list: list[tuple[str, str]] | None = None,
@@ -1005,10 +1399,19 @@ def tool_sfm_run(
     # lets one sfm_run wipe another episode's reconstruction (database.db is
     # deleted and sparse/ is rewritten in place).
     if not output_dir:
-        output_dir = f"./outputs/sfm_run_{uuid.uuid4().hex[:8]}"
+        output_dir = default_sfm_output_dir()
     outdir = Path(output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
     recon_id = f"recon_{uuid.uuid4().hex[:8]}"
+    try:
+        outdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {
+            "error": f"could not create sfm output dir {output_dir}: {e}",
+            "status": "io_error",
+            "recon_id": recon_id,
+            "num_registered": 0,
+            "num_points3d": 0,
+        }
     _RECON_STORE[recon_id] = {"image_dir": image_dir, "output_dir": output_dir}
 
     if not os.path.isdir(image_dir):
@@ -1048,7 +1451,27 @@ def tool_sfm_run(
         # triangulates them directly. This couples reconstruction quality to
         # the agent's matcher choices instead of an independent SIFT pass.
         used_agent_matches = False
+        n_imported = 0
         if use_agent_matches:
+            sess = session or _DEFAULT_SESSION
+            graph = _SESSION_GRAPHS.get(sess)
+            has_graph = graph is not None
+            has_store = bool(_match_store.get(sess))
+
+            if has_graph and len(graph.active_edges()) == 0:
+                logger.warning(
+                    "Active view graph has 0 verified edges; aborting (strict no-fallback contract)"
+                )
+                return {
+                    "error": "No verified edges in agent graph. Reconstruction aborted.",
+                    "status": "failed_empty_graph",
+                    "recon_id": recon_id,
+                    "num_registered": 0,
+                    "num_points3d": 0,
+                    "mean_reproj_error": 0.0,
+                    "num_pairs_matched": 0,
+                }
+
             n_imported = _import_agent_matches(db_path, image_dir, pair_list, session=session)
             if n_imported > 0:
                 used_agent_matches = True
@@ -1056,14 +1479,28 @@ def tool_sfm_run(
                     "Imported %d agent-verified match pairs into COLMAP",
                     n_imported,
                 )
+            elif has_graph or has_store or session:
+                logger.warning(
+                    "use_agent_matches set but 0 verified matches imported; "
+                    "aborting reconstruction (strict no-fallback contract)"
+                )
+                return {
+                    "error": "No verified edges imported for COLMAP. Reconstruction aborted.",
+                    "status": "failed_empty_graph",
+                    "recon_id": recon_id,
+                    "num_registered": 0,
+                    "num_points3d": 0,
+                    "mean_reproj_error": 0.0,
+                    "num_pairs_matched": 0,
+                }
             else:
                 logger.warning(
-                    "use_agent_matches set but no cached matches for the pairs; "
+                    "use_agent_matches set but no session graph/matches; "
                     "falling back to SIFT"
                 )
 
         named_pairs: list[list[str]] | None = None
-        num_pairs_requested = 0
+        num_pairs_requested = n_imported if used_agent_matches else 0
         if pair_list is not None:
             named_pairs = []
             for pair in pair_list:
@@ -1073,7 +1510,8 @@ def tool_sfm_run(
                 name_b = _resolve_image_name(str(pair[1]), image_dir)
                 if name_a and name_b:
                     named_pairs.append([name_a, name_b])
-            num_pairs_requested = len(named_pairs)
+            if not used_agent_matches:
+                num_pairs_requested = len(named_pairs)
             if not used_agent_matches and num_pairs_requested == 0:
                 return {
                     "error": "pair_list entries did not resolve to known images; "
@@ -1167,7 +1605,13 @@ app = FastAPI(title="Agentic SfM Tool Server", version="0.1.0")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "tools": ["crop", "match", "doppelganger_check", "retrieve", "sfm_run", "inspect"]}
+    return {
+        "status": "ok",
+        "tools": [
+            "crop", "match", "doppelganger_check", "retrieve", "sfm_run", "inspect",
+            "build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "bridge_components",
+        ],
+    }
 
 
 @app.post("/crop")
@@ -1189,6 +1633,37 @@ def doppelganger_check(req: DoppelgangerRequest):
 @app.post("/retrieve")
 def retrieve(req: RetrieveRequest):
     return tool_retrieve(req.query_image, req.k)
+
+
+@app.post("/build_initial_graph")
+def build_initial_graph_endpoint(req: BuildGraphRequest):
+    return tool_build_initial_graph(
+        req.image_ids, req.k_neighbors, req.matcher, session=req.session
+    )
+
+
+@app.post("/inspect_graph")
+def inspect_graph_endpoint(req: InspectGraphRequest):
+    return tool_inspect_graph(session=req.session)
+
+
+@app.post("/verify_doppelganger")
+def verify_doppelganger_endpoint(req: VerifyDoppelgangerRequest):
+    return tool_verify_doppelganger(
+        req.image_a, req.image_b, session=req.session
+    )
+
+
+@app.post("/prune_edges")
+def prune_edges_endpoint(req: PruneEdgesRequest):
+    return tool_prune_edges(req.pairs, session=req.session)
+
+
+@app.post("/bridge_components")
+def bridge_components_endpoint(req: BridgeComponentsRequest):
+    return tool_bridge_components(
+        req.comp_a_id, req.comp_b_id, req.budget, req.matcher, session=req.session
+    )
 
 
 @app.post("/sfm_run")

@@ -105,6 +105,33 @@ def evaluate_agent(
     return _summarize_results(results, "agent")
 
 
+def pair_episode_row(pair: ImagePair, ep: Any, pose_weight: float = 1.0) -> dict[str, Any]:
+    """Pose-aligned per-pair row for agent eval (matches ``run_baselines``).
+
+    ``success`` is ``pose_reward > 0``, not ``n_inliers > 0`` or ``total_reward > 0``.
+    ``geometric_reward`` is pose + inlier only (no first-call bonus).
+    """
+    rc = getattr(ep, "reward_components", None) or {}
+    final_match = getattr(ep, "final_match", None) or {}
+    pose_w = float(pose_weight) or 1.0
+    pose_reward = float(rc.get("pose_reward") or 0.0)
+    inlier_reward = float(rc.get("inlier_reward") or 0.0)
+    n_inliers = int(final_match.get("num_inliers") or 0)
+    return {
+        "pair_id": pair.pair_id,
+        "difficulty": pair.difficulty,
+        "reward": float(getattr(ep, "reward", 0.0) or 0.0),
+        "geometric_reward": pose_reward + inlier_reward,
+        "num_inliers": n_inliers,
+        "inlier_ratio": float(final_match.get("inlier_ratio") or 0.0),
+        "pose_auc": pose_reward / pose_w,
+        "num_tool_calls": len(getattr(ep, "tool_calls", None) or []),
+        "rotation_error": float(rc["rotation_error_deg"]) if "rotation_error_deg" in rc else -1.0,
+        "translation_error": float(rc["translation_error_deg"]) if "translation_error_deg" in rc else -1.0,
+        "success": pose_reward > 0.0,
+    }
+
+
 def select_eval_pairs(
     pairs: list[ImagePair],
     max_pairs: int | None = None,

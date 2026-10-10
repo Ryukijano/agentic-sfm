@@ -10,7 +10,7 @@ echo "Starting tool server on GPU ${GPU_ID}, port ${PORT}"
 cd "$(dirname "$0")/.."
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python -m uvicorn \
-    agentic_sfm.tools.server:app \
+    tools_server.server:app \
     --host 0.0.0.0 \
     --port "${PORT}" \
     --workers 1 &
