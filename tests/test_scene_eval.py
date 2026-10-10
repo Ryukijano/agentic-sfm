@@ -2,11 +2,14 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+_REPO = Path(__file__).parent.parent
+sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / "src"))
 
 from agentic_sfm.agent.policy import ToolCall
 from agentic_sfm.eval.scene_eval import (
@@ -365,3 +368,48 @@ class TestSceneReconstructionSuccess:
         assert mid == pytest.approx(0.5)
         assert scene_eval_score(1.0, 40.0) == 0.0
         assert scene_eval_score(0.5, 0.0) == pytest.approx(0.5)
+
+    def test_success_uses_computed_abs_rot_when_reported_missing(self):
+        """G2: direct left mean_pose_error_deg unset; abs rot was already computed."""
+        gt = _gt_poses(4)
+        ep = _make_episode(
+            recon_result={"num_registered": 4, "num_points3d": 400, "poses": gt},
+        )
+        m = compute_scene_metrics(ep, {"gt_recon": {"num_images": 4, "poses": gt}})
+        assert m["pose/reported_mean_error_deg"] is None
+        assert m["pose/abs_rot_err_mean_deg"] == pytest.approx(0.0, abs=1e-4)
+        assert m["reconstruction/success"] == 1.0
+        assert m["reconstruction/eval_score"] == pytest.approx(1.0)
+
+
+class TestDirectBaselinePoseInjection:
+    def test_direct_injects_pose_before_reward(self, monkeypatch):
+        from scripts.eval_scene import run_direct_scene_episode
+
+        gt = {"num_images": 4, "poses": _gt_poses(4)}
+        scene = {
+            "scene_id": "0015",
+            "image_paths": [f"images/{i}.jpg" for i in range(4)],
+            "gt_recon": gt,
+        }
+
+        client = MagicMock()
+        client.register_image.return_value = {"status": "ok"}
+        client.sfm_run.return_value = {
+            "num_registered": 4,
+            "num_points3d": 400,
+            # No mean_pose_error_deg — the pre-G2 direct bug.
+        }
+
+        def _fake_inject(ep, gt_recon):
+            assert gt_recon is gt
+            ep.recon_result["mean_pose_error_deg"] = 4.0
+
+        monkeypatch.setattr("scripts.eval_scene._inject_pose_error", _fake_inject)
+        ep = run_direct_scene_episode(scene, client, output_dir="/tmp/direct_g2")
+
+        assert ep.recon_result["mean_pose_error_deg"] == pytest.approx(4.0)
+        assert ep.recon_result["output_dir"] == "/tmp/direct_g2/0015"
+        assert ep.reward_components["pose_reward"] > 0.0
+        client.sfm_run.assert_called_once()
+        assert client.sfm_run.call_args.kwargs["output_dir"] == "/tmp/direct_g2/0015"

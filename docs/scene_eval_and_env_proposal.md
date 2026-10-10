@@ -126,3 +126,31 @@ Not verified or incorrect:
 1. Approve the ScanNet Terms of Use signature, if training scenes from ScanNet are wanted.
 2. Approve the scale of MegaDepth image downloads for new train and eval scenes.
 3. Approve a first step: write the frozen manifest and add the consecutive-frame and random-pair baselines before any GPU work.
+
+## 8. Implementation status (pose prior)
+
+Artifacts landed for section 4.1, none of them GPU-verified yet.
+
+- **`src/agentic_sfm/pose_prior.py`** — point-map model outputs → pairwise correspondences and relative poses. Pure numpy so it tests without torch or weights. `reciprocal_nn_matches` (reciprocal nearest neighbours in 3D point-map space, confidence-gated, deterministic, explicit tie-break), `extrinsics_to_relative_pose` (world-to-camera → A→B relative pose, unit-norm `t`, the same convention as `estimate_relative_pose`), `relative_pose_angular_error` (IMC-style rotation + translation-direction error).
+- **`tools_server/server.py`** — `matcher="vggt"` backend. One letterboxed forward per pair (both views on a common 518² canvas, so the two point maps share one frame), exact per-image inverse mapping for keypoints, pad-region correspondences filtered before they reach RANSAC or the match cache, confidence threshold 5.0 (VGGT's `world_points_conf` is `1 + exp(raw)` in `[1, ∞)`, not a probability — 5.0 mirrors VGGT's own demo default), and a LoFTR fallback tagged `matcher_fallback: "vggt->loftr"`. Returns the `_match_mast3r` contract plus `prior_pose` (the model's own extrinsics head) and `prior_confidence`.
+- **`scripts/freeze_scene_manifest.py` + `data/frozen_eval_manifest.json`** — 30 scenes from `scene0715_00` onward (`scene0718_00` excluded: 19 frames, below the 20-frame criterion). sha256 `d62928353a2c3bff7ac0aa77b0f8b844059dc8035d23bd336228036a56bd0825`, recomputable with `--verify`.
+- **`scripts/bench_pose_priors.py` + `jobs/bench_pose_priors.slurm`** — benchmarks `loftr` / `vggt` / `mast3r` on identical per-scene pair lists (19 consecutive + 20 seeded-random), GT intrinsics from `intrinsic_color.txt`, IMC-style worst-of-two error, AUC@5/10/20. Failures and fallbacks count as failures; the headline AUC excludes fallback pairs and a second "as-shipped" column includes them; a separate `prior_auc` scores VGGT's own pose head. `--dry-run` validated on `scene0715_00` (20 frames, 39 pairs). **Not submitted.**
+- **Tests** — 17 for `pose_prior` (synthetic ground truth, independent projection path, exact tie-break, NaN masking, degenerate inputs), 13 for the VGGT backend (GT pose agreement within 1°, pad filtering, single-forward assertion, fallback paths), plus the existing suites. Full suite: 319 passed, 1 pre-existing failure (`test_scene_smoke.py::scene_images_encoded`, fails identically at HEAD without these changes).
+
+### What is verified and what is not
+
+Verified: the module-level math against synthetic ground truth; the A→B pose convention against `cv2.recoverPose` semantics; the manifest hash; the harness plumbing (dry run).
+
+Not verified: any real VGGT output — no weights have been downloaded and no GPU job has run, so the accuracy claims in section 4.1 are still paper numbers. Also unverified: MASt3R is not installed in the environment, so the bench will record it as unavailable unless it is added first.
+
+### D4RT
+
+D4RT (CVPR 2026, arXiv 2512.08924) reports strong pose numbers (Re10K AUC@30 83.5, ScanNet ATE 0.014) and is a watch item, but it is not usable here yet: no official code or weights are released (the project page links only paper and blog; only unofficial reimplementations exist, unverified), it is video-oriented with no unordered sparse-view benchmark, and it does not accept intrinsics or poses as conditioning. It is excluded from the candidate table in 4.1.
+
+### License constraint
+
+VGGT's original weights and Pi3/Pi3X weights are non-commercial; MASt3R is CC BY-NC-SA. Fine for research publication. If commercial use is ever needed, MapAnything's Apache-2.0 weights are the alternative and the choice must be revisited.
+
+### Next gate
+
+Submitting `jobs/bench_pose_priors.slurm` requires approval: it downloads VGGT weights to `$SCRATCH` and runs on one L40S for up to 4 hours. Its result decides which prior is wired into the policy (Phase 2).

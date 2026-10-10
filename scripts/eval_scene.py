@@ -38,6 +38,7 @@ from agentic_sfm.eval.scene_eval import aggregate_scene_metrics, compute_scene_m
 from agentic_sfm.rewards.pose_rewards import compute_scene_reward
 from agentic_sfm.rl.scene_episode import (
     SceneRolloutEpisode,
+    _inject_pose_error,
     run_scene_episode,
     run_scene_oracle_episode,
 )
@@ -95,6 +96,7 @@ def run_direct_scene_episode(
         except Exception as e:
             logger.warning(f"[{scene['scene_id']}] register {path}: {e}")
 
+    dest = str(Path(output_dir) / scene["scene_id"])
     if image_paths:
         parent = Path(image_root) / Path(image_paths[0]).parent if image_root else Path(image_paths[0]).parent
         image_dir = str(parent)
@@ -104,16 +106,25 @@ def run_direct_scene_episode(
     try:
         recon = tool_client.sfm_run(
             image_dir=image_dir,
-            output_dir=str(Path(output_dir) / scene["scene_id"]),
+            output_dir=dest,
         )
     except Exception as e:
         recon = {"error": str(e), "num_registered": 0, "num_points3d": 0}
 
+    # Tool server usually echoes output_dir (sparse/0). Keep our dest if it
+    # does not — _inject_pose_error reads COLMAP from this path.
+    if isinstance(recon, dict) and not recon.get("output_dir"):
+        recon["output_dir"] = dest
+
     ep.recon_result = recon
     ep.tool_calls = [ToolCall(tool="sfm_run", args={}), ToolCall(tool="done", args={})]
     ep.results = [recon]
+    # G2: agent/oracle already inject GT pose before reward. Direct used to
+    # skip this, so mean_pose_error_deg stayed missing and success was 0
+    # even when COLMAP poses aligned under 20°.
+    _inject_pose_error(ep, scene.get("gt_recon"))
     ep.reward_components = compute_scene_reward(
-        recon, gt_recon=scene.get("gt_recon"), num_tool_calls=2, num_valid_calls=1
+        ep.recon_result, gt_recon=scene.get("gt_recon"), num_tool_calls=2, num_valid_calls=1
     )
     ep.reward = ep.reward_components["total_reward"]
     return ep

@@ -278,6 +278,24 @@ def _get_lightglue():
     return _LIGHTGLUE, _SUPERPOINT
 
 
+_VGGT = None
+
+
+def _get_vggt():
+    global _VGGT
+    if _VGGT is not None:
+        return _VGGT
+    try:
+        from vggt.models.vggt import VGGT
+    except ImportError:
+        raise ImportError("vggt package not available")
+    device = _torch_device()
+    ckpt = os.environ.get("AGENTIC_SFM_VGGT_CKPT", "facebook/VGGT-1B")
+    _VGGT = VGGT.from_pretrained(ckpt).to(device).eval()
+    logger.info("Cached VGGT on %s", device)
+    return _VGGT
+
+
 def register_image(image_id: str, path_or_array: str | np.ndarray) -> None:
     _IMAGE_STORE[image_id] = path_or_array
 
@@ -380,7 +398,7 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
     }
 
 
-_VALID_MATCHERS = ("loftr", "lightglue", "mast3r")
+_VALID_MATCHERS = ("loftr", "lightglue", "mast3r", "vggt")
 
 
 def tool_match(
@@ -427,6 +445,8 @@ def tool_match(
         return _match_loftr(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
     elif matcher == "lightglue":
         return _match_lightglue(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+    elif matcher == "vggt":
+        return _match_vggt(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
     else:
         return _match_mast3r(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
 
@@ -601,6 +621,255 @@ def _match_mast3r(
     finally:
         os.unlink(tmp_a)
         os.unlink(tmp_b)
+
+
+def _run_vggt_pair(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[str, Any]:
+    """Run VGGT on an image pair; returns point maps, confidence, extrinsics.
+
+    The ONLY function that talks to the model — tests monkeypatch this so the
+    matcher logic (NN correspondence, pose RANSAC, cache) is exercisable
+    without model weights or torch.
+
+    Both images are letterboxed (aspect-preserving resize + centered black
+    padding) onto a shared square canvas and run through a SINGLE S=2 forward
+    pass. This is required, not cosmetic: a single-view (S=1) forward emits
+    its point map in that view's own canonical camera frame, so two separate
+    forwards would produce points in unrelated coordinate frames and the
+    NN correspondences / extrinsics would be meaningless. Do NOT "optimize"
+    this into per-image forwards.
+
+    The per-image letterbox parameters are returned as ``map_a``/``map_b``
+    (``scale``, ``scale_y`` = post-/14-snap resize factors; ``pad_x``,
+    ``pad_y`` = centered offsets) so callers can invert point-map pixels to
+    original pixels exactly: ``x_orig = (x_pm - pad_x) / scale``. Note the
+    dense head predicts a point for EVERY canvas pixel, including the black
+    pad bars — callers must bound-check inverted coordinates against the
+    original image dimensions.
+    """
+    import torchvision.transforms as TF
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    model = _get_vggt()
+    device = _torch_device()
+    to_tensor = TF.ToTensor()
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_a, \
+         tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_b:
+        Image.fromarray(img_a).save(f_a.name)
+        Image.fromarray(img_b).save(f_b.name)
+        tmp_a, tmp_b = f_a.name, f_b.name
+
+    # Both views MUST go through ONE forward as an S=2 sequence: a single-view
+    # (S=1) forward puts that view's point map in its own canonical camera
+    # frame, so two separate forwards yield points in unrelated frames and the
+    # NN correspondences/extrinsics would be garbage. Letterboxing to a common
+    # square canvas keeps the mapping back to original pixels exact.
+    # Square canvas: VGGT is trained at 518 (37*14); /14 snap required by the
+    # patchify. max_size < 14 floors at 14 (never exceeds 518 either way).
+    canvas = min(518, max_size - max_size % 14)
+    canvas = max(canvas, 14)
+
+    def _prep(path: str) -> tuple[torch.Tensor, dict[str, float]]:
+        im = Image.open(path).convert("RGB")
+        w, h = im.size
+        scale = canvas / max(w, h)
+        new_w = min(canvas, max(14, round(w * scale / 14) * 14))
+        new_h = min(canvas, max(14, round(h * scale / 14) * 14))
+        scale = new_w / w  # after the /14 snap, x and y may differ
+        scale_y = new_h / h
+        im = im.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        pad_x = (canvas - new_w) // 2
+        pad_y = (canvas - new_h) // 2
+        sq = Image.new("RGB", (canvas, canvas), (0, 0, 0))
+        sq.paste(im, (pad_x, pad_y))
+        # Exact inverse: x_orig = (x_pm - pad_x) / scale
+        return to_tensor(sq), {
+            "scale": scale, "scale_y": scale_y,
+            "pad_x": float(pad_x), "pad_y": float(pad_y),
+        }
+
+    def _forward(t: torch.Tensor) -> dict[str, torch.Tensor]:
+        with torch.no_grad():
+            if device == "cuda":
+                dtype = (torch.bfloat16
+                         if torch.cuda.get_device_capability()[0] >= 8
+                         else torch.float16)
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    return model(t.to(device))
+            return model(t)
+
+    try:
+        t_a, map_a = _prep(tmp_a)  # (3, canvas, canvas)
+        t_b, map_b = _prep(tmp_b)
+        # One forward, S=2 sequence — model adds the batch dim itself.
+        preds = _forward(torch.stack([t_a, t_b]))
+
+        def _n(x: torch.Tensor) -> np.ndarray:
+            return x.detach().float().cpu().numpy()
+
+        ext, _int = pose_encoding_to_extri_intri(
+            preds["pose_enc"], (canvas, canvas)
+        )
+        ext = _n(ext[0])
+
+        return {
+            "points_a": _n(preds["world_points"][0, 0]).astype(np.float32),
+            "points_b": _n(preds["world_points"][0, 1]).astype(np.float32),
+            "conf_a": _n(preds["world_points_conf"][0, 0]).astype(np.float32),
+            "conf_b": _n(preds["world_points_conf"][0, 1]).astype(np.float32),
+            "ext_a": ext[0].astype(np.float64),
+            "ext_b": ext[1].astype(np.float64),
+            "map_a": map_a,
+            "map_b": map_b,
+        }
+    finally:
+        os.unlink(tmp_a)
+        os.unlink(tmp_b)
+
+
+def _json_sanitize(v):
+    """Recursively replace NaN/inf floats so nothing non-JSON leaks out."""
+    if isinstance(v, np.floating):
+        f = float(v)
+        return f if np.isfinite(f) else None
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.ndarray):
+        return _json_sanitize(v.tolist())
+    if isinstance(v, float):
+        return v if np.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _json_sanitize(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_sanitize(x) for x in v]
+    return v
+
+
+def _match_vggt(
+    img_a: np.ndarray, img_b: np.ndarray, max_size: int,
+    K_a=None, K_b=None, cache_pair: tuple[str, str] | None = None,
+    session: str = "",
+) -> dict[str, Any]:
+    """Match using VGGT dense point maps + extrinsics prior."""
+    try:
+        out = _run_vggt_pair(img_a, img_b, max_size)
+        from agentic_sfm.pose_prior import (
+            extrinsics_to_relative_pose,
+            reciprocal_nn_matches,
+        )
+    except ImportError:
+        logger.warning("VGGT not available, falling back to LoFTR")
+        res = _match_loftr(img_a, img_b, max_size, K_a=K_a, K_b=K_b,
+                           cache_pair=cache_pair, session=session)
+        res["matcher_fallback"] = "vggt->loftr"
+        return res
+    except Exception:
+        logger.warning("Cannot load/run VGGT, falling back to LoFTR", exc_info=True)
+        res = _match_loftr(img_a, img_b, max_size, K_a=K_a, K_b=K_b,
+                           cache_pair=cache_pair, session=session)
+        res["matcher_fallback"] = "vggt->loftr"
+        return res
+
+    # world_points_conf uses conf_activation="expp1" — conf = 1 + exp(raw),
+    # living in [1, inf), NOT a probability. 5.0 mirrors VGGT's own demo
+    # (demo_colmap.py conf_thres_value); 1.5 would only discard pixels the
+    # model actively asserts are background.
+    conf_thr = float(os.environ.get("AGENTIC_SFM_VGGT_CONF_THRESHOLD", "5.0"))
+    dist_thr_env = os.environ.get("AGENTIC_SFM_VGGT_DIST_THRESHOLD", "")
+    dist_thr = float(dist_thr_env) if dist_thr_env else None
+    max_pts = int(os.environ.get("AGENTIC_SFM_VGGT_MAX_POINTS", "20000"))
+
+    pts_a_pm, pts_b_pm = reciprocal_nn_matches(
+        out["points_a"], out["points_b"], out["conf_a"], out["conf_b"],
+        conf_threshold=conf_thr, dist_threshold=dist_thr, max_points=max_pts,
+    )
+
+    # Map matched pixels from the point-map frame back to ORIGINAL pixels.
+    # _run_vggt_pair letterboxes each image to a square canvas, so the exact
+    # inverse is x_orig = (x_pm - pad_x) / scale. If a stub omits the maps,
+    # fall back to plain proportional scaling (pm frame == full image).
+    h_a, w_a = img_a.shape[:2]
+    h_b, w_b = img_b.shape[:2]
+    Ha, Wa = out["points_a"].shape[:2]
+    Hb, Wb = out["points_b"].shape[:2]
+    matches_a = pts_a_pm.astype(np.float64)
+    matches_b = pts_b_pm.astype(np.float64)
+    if len(matches_a):
+        map_a = out.get("map_a")
+        map_b = out.get("map_b")
+        if map_a and map_b:
+            matches_a[:, 0] = (matches_a[:, 0] - map_a["pad_x"]) / map_a["scale"]
+            matches_a[:, 1] = (matches_a[:, 1] - map_a["pad_y"]) / map_a.get(
+                "scale_y", map_a["scale"])
+            matches_b[:, 0] = (matches_b[:, 0] - map_b["pad_x"]) / map_b["scale"]
+            matches_b[:, 1] = (matches_b[:, 1] - map_b["pad_y"]) / map_b.get(
+                "scale_y", map_b["scale"])
+        else:
+            matches_a[:, 0] *= w_a / max(float(Wa), 1.0)
+            matches_a[:, 1] *= h_a / max(float(Ha), 1.0)
+            matches_b[:, 0] *= w_b / max(float(Wb), 1.0)
+            matches_b[:, 1] *= h_b / max(float(Hb), 1.0)
+
+    # Drop correspondences that land outside the original images — the dense
+    # head predicts a point for every canvas pixel, including the letterbox
+    # bars, and bar-to-bar matches can be mutually consistent (same black
+    # bars in both views). Inverted pad pixels come out < 0 or >= w/h.
+    # Mirrors the MASt3R border filter; the COLMAP cache must never see
+    # out-of-bounds keypoints.
+    num_matches_raw = len(matches_a)
+    if num_matches_raw:
+        in_bounds = (
+            (matches_a[:, 0] >= 0) & (matches_a[:, 0] < w_a) &
+            (matches_a[:, 1] >= 0) & (matches_a[:, 1] < h_a) &
+            (matches_b[:, 0] >= 0) & (matches_b[:, 0] < w_b) &
+            (matches_b[:, 1] >= 0) & (matches_b[:, 1] < h_b)
+        )
+        matches_a = matches_a[in_bounds]
+        matches_b = matches_b[in_bounds]
+        pts_a_pm = pts_a_pm[in_bounds]
+        pts_b_pm = pts_b_pm[in_bounds]
+
+    pose_result = _estimate_pose_ransac(
+        matches_a, matches_b, (w_a, h_a), (w_b, h_b), K_a=K_a, K_b=K_b,
+    )
+
+    # Mean model confidence at the matched point-map pixels
+    conf_vals = []
+    if len(pts_a_pm):
+        ia = np.clip(pts_a_pm.astype(int), [0, 0], [Wa - 1, Ha - 1])
+        ib = np.clip(pts_b_pm.astype(int), [0, 0], [Wb - 1, Hb - 1])
+        conf_vals = np.concatenate([
+            out["conf_a"][ia[:, 1], ia[:, 0]],
+            out["conf_b"][ib[:, 1], ib[:, 0]],
+        ])
+    prior_conf = float(np.mean(conf_vals)) if len(conf_vals) else None
+
+    prior_pose = extrinsics_to_relative_pose(out["ext_a"], out["ext_b"])
+
+    if cache_pair is not None:
+        _record_agent_match(cache_pair[0], cache_pair[1], {
+            "keypoints_a": matches_a.tolist(),
+            "keypoints_b": matches_b.tolist(),
+            "inlier_mask": pose_result.get("inlier_mask") or [],
+            "matcher": "vggt",
+        }, session=session)
+
+    return _json_sanitize({
+        "matcher": "vggt",
+        "num_matches": len(matches_a),
+        "num_matches_raw": num_matches_raw,
+        "num_inliers": pose_result["num_inliers"],
+        "pose": pose_result["pose"],
+        "inlier_ratio": pose_result["inlier_ratio"],
+        "mean_residual": pose_result.get("mean_inlier_residual"),
+        "residual_units": pose_result.get("residual_units"),
+        "keypoints_a": matches_a.tolist()[:100],
+        "keypoints_b": matches_b.tolist()[:100],
+        "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
+        "prior_pose": prior_pose,
+        "prior_confidence": prior_conf,
+        "pointmap_size": [int(Wa), int(Ha)],
+    })
 
 
 def _match_lightglue(

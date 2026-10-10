@@ -818,6 +818,10 @@ def compute_scene_metrics(
     pose_err = recon.get("mean_pose_error_deg")
     if not isinstance(pose_err, (int, float)):
         pose_err = metrics.get("pose/reported_mean_error_deg")
+    # Direct used to skip pose injection, so reported was None while
+    # _pose_metrics already had Sim(3) abs rot from COLMAP + GT.
+    if not isinstance(pose_err, (int, float)):
+        pose_err = metrics.get("pose/abs_rot_err_mean_deg")
     if not isinstance(pose_err, (int, float)):
         pose_err = None
     metrics["reconstruction/success"] = float(
