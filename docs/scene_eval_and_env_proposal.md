@@ -71,6 +71,33 @@ These were checked against the repo and the eval JSON.
 - **Trainer:** keep the custom GRPO trainer. Migrating to veRL adds risk without evident benefit at this stage. A veRL migration can be considered after the gates pass.
 - **Files:** each episode creates one `sfm_run_*` directory per call. Use `$TMP_SHARED` for transient outputs. The file-count quota is 1.5M, and 1.19M are used.
 
+### 4.1 Pose estimation model
+
+Add a feed-forward pose model as a **tool the agent calls**, not as part of the policy input. Three distinct uses must not be conflated:
+
+1. GT pose as policy input: never. The policy would see the target it is scored on.
+2. Estimated pose as a tool output: yes. The agent gets relative pose plus confidence or inlier statistics and decides the next call.
+3. Pose/intrinsics as conditioning on a reconstruction model: optional, only when those quantities are actually known (e.g. EXIF intrinsics).
+
+Candidate models (paper numbers, not reproduced on our data):
+
+| Model | What it gives | Verified | Concern |
+|---|---|---|---|
+| VGGT (CVPR 2025, arXiv 2503.11651) | Cameras, depth, point maps in one pass, ~0.2 s | Yes (paper Table 1: AUC@30 85.3 Re10K, 88.2 CO3Dv2; 91.8 with BA) | Exported poses lose 1–2 dB PSNR vs COLMAP without BA (repo issue #79); license unchecked |
+| Pi3X (ICLR 2026, arXiv 2507.13347) | Permutation-equivariant poses; conditional injection of pose/intrinsics/depth; ~metric scale | Repo README only | Newer; benchmarks not cross-checked |
+| MapAnything (3DV 2026, arXiv 2509.13414) | Any mix of images + intrinsics/poses/depth → metric geometry | Repo README only | Heavier; conditioning matters only with known inputs |
+| MASt3R / MASt3R-SfM (arXiv 2409.19152) | Already in our tool server; sparse global alignment, own retrieval | Yes (in repo) | Small/medium scenes; it is the existing baseline |
+| COLMAP / GLOMAP | Classical reference + BA refinement | Yes | Slow; failures are the motivation for this project |
+
+Proposed wiring:
+
+- **Pose-prior tool:** run VGGT (Pi3X as the alternative) on the candidate subset; return pairwise relative pose, confidence/inlier stats, and cross-pair consistency. Never return GT.
+- **Decision use:** the agent reads the stats to pick the next action (re-match, bridge, stop).
+- **Final refinement:** COLMAP/GLOMAP BA on the chosen pairs — feed-forward poses alone are not accurate enough to stand in for BA.
+- **Baselines:** MASt3R-SfM and the same cached-match `sfm_run` path on the frozen split, equal budget.
+
+Selection protocol: before wiring either model in, run VGGT and MASt3R on the frozen held-out pairs and compare AUC@5/10/20 against COLMAP. Pick whichever wins as the pose-prior tool; keep the other as an arm in the evaluation. Both go through the same held-out evaluation as the policy — otherwise we are comparing an unverified pose prior against our own RL pipeline.
+
 ## 5. Prior art
 
 - The closest project is the author's own public write-up (`ryukijano.github.io/work/agentic-structure-from-motion`). Its claims need correction before publication. It states a training set of "1,535 hard pairs from 102 MegaDepth scenes" and a limit of 10 tool calls and 15 turns. The repo shows the pairs come from two scenes (0015: 402, 0022: 1,133), and the scene config uses 20 calls and 30 turns.
