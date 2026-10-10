@@ -16,7 +16,7 @@ Agentic SfM asks whether a small vision-language model (Qwen3.5-2B) can learn to
 | Pair-level SFT | Done | Warm-start adapter that emits valid tool-call JSON. | `outputs/sft/`, `outputs/phase1_hard/warmstart/` |
 | 1. Pair-level GRPO (hard pairs) | Stopped at about step 200 (2-day time limit). Best checkpoint evaluated. Worse than LoFTR. | Success 62% vs LoFTR 88% on hard val (n=50). | `outputs/eval_pair/phase1_hard_best_8019429.json` |
 | 2. Scene-level GRPO | Training finished (50 epochs). Evaluation on 10 scenes, protocol invalid as a benchmark. | Success 30%, but two of ten scenes were training scenes and the baselines are not comparable. | `outputs/phase2/run_8073061/`, `outputs/scene_eval/run_8085187/scene_eval_results.json`, `docs/scene_eval_and_env_proposal.md` |
-| Pose-prior study | Implemented and unit-tested. Benchmark job 8213282 is RUNNING (started 2026-10-10 21:05 on gpu022). No results yet. | Nothing measured yet. | `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm`, `data/frozen_eval_manifest.json` |
+| Pose-prior study | Benchmark (job 8213282) completed. VGGT's own pose head is the strongest pose source measured; its correspondence path returns few usable matches. MASt3R was not measured. | VGGT prior AUC@10 0.631 vs LoFTR RANSAC 0.260 on 1,170 ScanNet pairs (not yet checked for training-data overlap). | `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm`, `data/frozen_eval_manifest.json` |
 | Held-out evaluation | Manifest frozen (30 ScanNet scenes). Evaluation not run. | Nothing measured yet. | `data/frozen_eval_manifest.json`, `docs/scene_eval_and_env_proposal.md` |
 
 ## Motivation and core question
@@ -229,15 +229,25 @@ What exists:
 - `data/frozen_eval_manifest.json`: 30 ScanNet scenes from `scene0715_00` onward. `scene0718_00` is excluded (19 frames). The manifest's `sha256` field is `d62928353a2c3bff7ac0aa77b0f8b844059dc8035d23bd336228036a56bd0825`. It is a hash of the canonical JSON of all other fields, recomputable with `python scripts/freeze_scene_manifest.py --verify`. The file's byte-level sha256 is different.
 - `scripts/bench_pose_priors.py` and `jobs/bench_pose_priors.slurm`: benchmark `loftr`, `vggt`, and `mast3r` on identical per-scene pair lists (19 consecutive and 20 seeded-random pairs per scene), using GT intrinsics, IMC-style worst-of-two relative error, and AUC@5/10/20. Failures and fallbacks count as failures. A dry run on `scene0715_00` (20 frames, 39 pairs) passed.
 
-Job status: benchmark job 8213282 is **RUNNING** (started 2026-10-10 21:05 on gpu022) and has not yet produced results. MASt3R is not installed in the environment, so the benchmark will record it as unavailable unless it is added first.
+Job status: benchmark job 8213282 completed in 27 minutes on one L40S (gpu022). Output: `outputs/bench_pose_priors/run_8213282/` (`bench_pose_priors.json`, `summary.md`).
 
-Results table (to be filled from `outputs/bench_pose_priors/run_8213282/` after the job completes):
+Setup: 30 frozen ScanNet scenes, 39 identical pairs per scene (19 consecutive, 20 seeded-random), 1,170 pairs per matcher. Pair error is the worst of rotation and translation-direction error, in degrees. Pairs with no pose count as failures in every AUC, so the AUC denominator is always 1,170.
 
-| Matcher | AUC@5 | AUC@10 | AUC@20 | Fallback rate | Notes |
+| Pose source | AUC@5 | AUC@10 | AUC@20 | Pairs with a pose | Median error |
 |---|---|---|---|---|---|
-| LoFTR | pending | pending | pending | pending | |
-| VGGT | pending | pending | pending | pending | headline excludes fallback pairs |
-| MASt3R | pending | pending | pending | pending | not installed |
+| LoFTR, RANSAC essential matrix | 0.143 | 0.260 | 0.353 | 1,170 / 1,170 | 69.4° |
+| VGGT, RANSAC on VGGT correspondences | 0.059 | 0.099 | 0.123 | 256 / 1,170 | 11.9° (on the 256 pairs) |
+| VGGT, its own extrinsics head (`prior_pose`) | 0.372 | 0.631 | 0.772 | 1,170 / 1,170 | 6.8° |
+| MASt3R | not measured | | | 0 / 1,170 | every pair fell back to LoFTR |
+
+What this shows, and what it does not:
+
+- **VGGT's extrinsics head gives the best pose we measured.** It returned a pose for every pair, and its median error is 6.8°, against 69.4° for LoFTR.
+- **VGGT's correspondence path is starved.** 862 of 1,170 pairs had zero correspondences left after filtering. The confidence threshold (5.0, taken from VGGT's demo) is the likely cause. Lowering it needs another GPU run, and we have not made that change.
+- **The MASt3R row is not a result.** MASt3R is not installed, so all 1,170 pairs fell back to LoFTR, and the `ship*` columns show LoFTR numbers under the MASt3R name. The benchmark marks this row invalid.
+- **The VGGT prior result is not yet a clean comparison.** VGGT's training data may overlap with ScanNet, and we have not checked this. The median rotation error is small, but translation-direction error dominates the numbers on small indoor baselines, for every matcher.
+
+Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
 Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
@@ -350,7 +360,7 @@ sbatch jobs/eval_scene.slurm
 sbatch jobs/bench_pose_priors.slurm
 ```
 
-This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It is already submitted as job 8213282 and is running. Do not resubmit unless the first run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run` (see the script for its arguments).
+This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It has already been run as job 8213282, which completed in 27 minutes. Do not resubmit unless the first run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run` (see the script for its arguments).
 
 ## Repository layout
 
@@ -414,7 +424,7 @@ Research use of the components below is permitted under their stated terms. Comm
 
 ## Roadmap
 
-1. Finish the pose-prior benchmark (job 8213282, running). Read `outputs/bench_pose_priors/run_8213282/` and choose the pose prior for the policy.
+1. Check whether VGGT's training data overlaps the ScanNet evaluation scenes. Then decide whether to rerun the VGGT correspondence path with a lower confidence threshold, and install MASt3R so it is measured rather than skipped.
 2. Add the SFT-only arm and equal-budget consecutive and random baselines to the held-out evaluation.
 3. Run the held-out scene evaluation on the frozen manifest, at least 30 scenes, using the protocol above.
 4. Run further RL only after the gates in the protocol pass.
