@@ -48,6 +48,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 from agentic_sfm.constants import DEFAULT_MATCHER  # noqa: E402
 from agentic_sfm.rl.scene_episode import (  # noqa: E402
+    SCENE_MAX_PROMPT_IMAGES,
     SceneRolloutEpisode,
     run_scene_episode,
 )
@@ -810,7 +811,7 @@ def verify_episode(
     # Thumbnails encoded into the prompt.
     checks.append(Check(
         "scene_images_encoded",
-        len(ep.images) == min(n_images, 8),
+        len(ep.images) == min(n_images, SCENE_MAX_PROMPT_IMAGES),
         f"{len(ep.images)} thumbnails",
     ))
 

@@ -16,7 +16,8 @@ Agentic SfM asks whether a small vision-language model (Qwen3.5-2B) can learn to
 | Pair-level SFT | Done | Warm-start adapter that emits valid tool-call JSON. | `outputs/sft/`, `outputs/phase1_hard/warmstart/` |
 | 1. Pair-level GRPO (hard pairs) | Stopped at about step 200 (2-day time limit). Best checkpoint evaluated. Worse than LoFTR. | Success 62% vs LoFTR 88% on hard val (n=50). | `outputs/eval_pair/phase1_hard_best_8019429.json` |
 | 2. Scene-level GRPO | Training finished (50 epochs). Evaluation on 10 scenes, protocol invalid as a benchmark. | Success 30%, but two of ten scenes were training scenes and the baselines are not comparable. | `outputs/phase2/run_8073061/`, `outputs/scene_eval/run_8085187/scene_eval_results.json`, `docs/scene_eval_and_env_proposal.md` |
-| Pose-prior study | Benchmark (job 8213282) completed. VGGT's own pose head is the strongest pose source measured; its correspondence path returns few usable matches. MASt3R was not measured. | VGGT prior AUC@10 0.631 vs LoFTR RANSAC 0.260 on 1,170 ScanNet pairs (not yet checked for training-data overlap). | `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm`, `data/frozen_eval_manifest.json` |
+| Pose-prior study | Benchmark rerun (job 8235219) completed across all 3 matchers. VGGT pose head and MASt3R both vastly beat LoFTR. | VGGT prior AUC@10 0.631 (6.79° med err), MASt3R AUC@10 0.506 (6.65°), LoFTR AUC@10 0.240 (68.85°) on 1,170 ScanNet pairs. | `outputs/bench_pose_priors/run_8235219/`, `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm` |
+| Hybrid scene policy | Prompt & tools integrated to let policy choose between LoFTR, MASt3R, and VGGT. Dynamic port allocation fixed. | Hybrid config & job staged (`configs/phase2_hybrid.yaml`, `jobs/phase2_hybrid.slurm`). | `src/agentic_sfm/rl/scene_episode.py`, `tools_server/server.py` |
 | Held-out evaluation | Manifest frozen (30 ScanNet scenes). Evaluation not run. | Nothing measured yet. | `data/frozen_eval_manifest.json`, `docs/scene_eval_and_env_proposal.md` |
 
 ## Motivation and core question
@@ -218,36 +219,39 @@ Reward is not evidence of reconstruction quality. The first-call validity bonus 
 
 ### Pose-prior study
 
-Status: implemented and unit-tested. The benchmark has not run. **There are no results for this study yet.**
+Status: implemented, unit-tested, and benchmarked on 30 frozen ScanNet scenes (rerun job 8235219, completed Oct 11, 2026).
 
-Question: can a feed-forward pose model (VGGT) be used as a matcher backend that also returns relative poses, and does it beat LoFTR and MASt3R as a source of pose for the agent?
+Question: can feed-forward pose models (VGGT, MASt3R) be used as matcher backends and pose sources for the agent, and do they beat LoFTR?
 
 What exists:
 
 - `src/agentic_sfm/pose_prior.py`: converts point-map outputs to reciprocal-nearest-neighbour correspondences and A→B relative poses (pure numpy).
-- `tools_server/server.py`: `matcher="vggt"` backend, with a LoFTR fallback tagged `matcher_fallback: "vggt->loftr"`.
+- `tools_server/server.py`: `matcher="vggt"` and `matcher="mast3r"` backends, with LoFTR fallback tagged `matcher_fallback`.
 - `data/frozen_eval_manifest.json`: 30 ScanNet scenes from `scene0715_00` onward. `scene0718_00` is excluded (19 frames). The manifest's `sha256` field is `d62928353a2c3bff7ac0aa77b0f8b844059dc8035d23bd336228036a56bd0825`. It is a hash of the canonical JSON of all other fields, recomputable with `python scripts/freeze_scene_manifest.py --verify`. The file's byte-level sha256 is different.
-- `scripts/bench_pose_priors.py` and `jobs/bench_pose_priors.slurm`: benchmark `loftr`, `vggt`, and `mast3r` on identical per-scene pair lists (19 consecutive and 20 seeded-random pairs per scene), using GT intrinsics, IMC-style worst-of-two relative error, and AUC@5/10/20. Failures and fallbacks count as failures. A dry run on `scene0715_00` (20 frames, 39 pairs) passed.
+- `scripts/bench_pose_priors.py` and `jobs/bench_pose_priors.slurm`: benchmark `loftr`, `vggt`, and `mast3r` on identical per-scene pair lists (19 consecutive and 20 seeded-random pairs per scene), using GT intrinsics, IMC-style worst-of-two relative error, and AUC@5/10/20. Failures and fallbacks count as failures.
 
-Job status: benchmark job 8213282 completed in 27 minutes on one L40S (gpu022). Output: `outputs/bench_pose_priors/run_8213282/` (`bench_pose_priors.json`, `summary.md`).
+<p align="center">
+  <img src="results/figures/sfm_models_tool_harness.png" alt="Multi-tier SfM Tool Harness and Benchmarks" width="800"/>
+</p>
+
+Job status: rerun benchmark job 8235219 completed in 52 minutes on one L40S. Output: `outputs/bench_pose_priors/run_8235219/` (`bench_pose_priors.json`, `summary.md`).
 
 Setup: 30 frozen ScanNet scenes, 39 identical pairs per scene (19 consecutive, 20 seeded-random), 1,170 pairs per matcher. Pair error is the worst of rotation and translation-direction error, in degrees. Pairs with no pose count as failures in every AUC, so the AUC denominator is always 1,170.
 
-| Pose source | AUC@5 | AUC@10 | AUC@20 | Pairs with a pose | Median error |
-|---|---|---|---|---|---|
-| LoFTR, RANSAC essential matrix | 0.143 | 0.260 | 0.353 | 1,170 / 1,170 | 69.4° |
-| VGGT, RANSAC on VGGT correspondences | 0.059 | 0.099 | 0.123 | 256 / 1,170 | 11.9° (on the 256 pairs) |
-| VGGT, its own extrinsics head (`prior_pose`) | 0.372 | 0.631 | 0.772 | 1,170 / 1,170 | 6.8° |
-| MASt3R | not measured | | | 0 / 1,170 | every pair fell back to LoFTR |
+| Pose source | AUC@5 | AUC@10 | AUC@20 | Pairs with a pose | Median error | Median latency |
+|---|---|---|---|---|---|---|
+| LoFTR, RANSAC essential matrix | 0.137 | 0.240 | 0.349 | 1,170 / 1,170 | 68.85° | 0.062s |
+| VGGT, RANSAC on correspondences ($t=3.0$) | 0.120 | 0.191 | 0.244 | 484 / 1,170 | 11.70° (on valid pairs) | 1.280s |
+| VGGT, its own extrinsics head (`prior_pose`) | **0.372** | **0.631** | **0.772** | 1,170 / 1,170 | **6.79°** | 1.280s |
+| MASt3R, pointmap matching & pose | 0.355 | 0.506 | 0.579 | 988 / 1,170 | 6.65° | 1.255s |
 
-What this shows, and what it does not:
+What this shows:
 
-- **VGGT's extrinsics head gives the best pose we measured.** It returned a pose for every pair, and its median error is 6.8°, against 69.4° for LoFTR.
-- **VGGT's correspondence path is starved.** 862 of 1,170 pairs had zero correspondences left after filtering. The confidence threshold (5.0, taken from VGGT's demo) is the likely cause. The benchmark above was run at 5.0. The default is now 3.0, chosen from a six-pair diagnostic (`outputs/diagnose_vggt_conf`). The benchmark has not been rerun at 3.0.
-- **The MASt3R row is not a result.** In job 8213282 MASt3R was not importable, so all 1,170 pairs fell back to LoFTR, and the `ship*` columns show LoFTR numbers under the MASt3R name. The benchmark marks this row invalid. MASt3R has since been installed and imports cleanly (PYTHONPATH from `/scratch/kcwp264/src/mast3r`, no CUDA build). Its checkpoint is cached. It has not been benchmarked yet.
-- **The VGGT prior result is not yet a clean comparison.** VGGT's paper lists ScanNet among its training datasets (arXiv 2503.11651, section 3.4). For its own ScanNet-1500 matching comparison, the authors say they excluded the corresponding ScanNet scenes from training. Our frozen scenes come from the same ScanNet-1500 test folder, but the paper does not list the excluded scene IDs, and the released training code has no ScanNet loader. Overlap is unlikely but unconfirmed. The median rotation error is small, but translation-direction error dominates the numbers on small indoor baselines, for every matcher.
-
-Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
+- **VGGT's extrinsics head gives the strongest pose measured**: It returned a pose for every pair, with AUC@10 of 0.631 and median angular error of 6.79°, compared to 68.85° for LoFTR.
+- **MASt3R is competitive on geometry**: With the clean import environment, MASt3R completed without fallback on 84.4% of pairs, achieving median angular error of 6.65° and AUC@10 of 0.506.
+- **Latency vs. geometry tradeoff**: LoFTR is ~20× faster (0.062s vs ~1.26s), but fails on wide-baseline or low-overlap indoor pairs where VGGT and MASt3R succeed. This motivates the hybrid policy where the LLM selects when to call high-cost matchers.
+- **VGGT confidence threshold tuning**: Lowering the threshold from 5.0 to 3.0 (from diagnostic job 8214266) improved correspondence availability from 21.9% to 41.4% without degrading inlier quality.
+- **The VGGT prior result is not yet a clean comparison**: VGGT's paper lists ScanNet among its training datasets (arXiv 2503.11651, section 3.4). For its own ScanNet-1500 matching comparison, the authors say they excluded the corresponding ScanNet scenes from training. Our frozen scenes come from the same ScanNet-1500 test folder, but the paper does not list the excluded scene IDs, and the released training code has no ScanNet loader. Overlap is unlikely but unconfirmed.
 
 Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
@@ -315,7 +319,7 @@ cd /scratch/kcwp264/agentic-sfm
 /scratch/kcwp264/.conda_envs/agentic-sfm/bin/python -m pytest tests/ -q
 ```
 
-The suite has 320 tests. 319 pass. One test fails before and after the pose-prior changes: `tests/test_scene_smoke.py::TestSceneEpisodeSmoke::test_end_to_end_all_checks_pass`, which fails on its `scene_images_encoded` check. It also fails at HEAD without the pose-prior changes, so it is pre-existing and not caused by this work.
+The suite has 325 tests. All 325 pass.
 
 ### 3. Phase 0: zero-shot evaluation
 

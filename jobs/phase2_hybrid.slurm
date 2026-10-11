@@ -74,10 +74,15 @@ export SFM_OUTPUT_ROOT="${TMP_SHARED:-${TMPDIR:-/tmp}}/asfm_sfm_${SLURM_JOB_ID}"
 mkdir -p "${SFM_OUTPUT_ROOT}"
 echo "SFM_OUTPUT_ROOT=${SFM_OUTPUT_ROOT}"
 
-VLLM_PORT=$((39000 + SLURM_JOB_ID % 20000))
-TOOL_PORT=$((19000 + SLURM_JOB_ID % 20000))
+BASE_VLLM=$((39000 + SLURM_JOB_ID % 20000))
+BASE_TOOL=$((19000 + SLURM_JOB_ID % 20000))
+VLLM_PORT=$(find_free_port "${BASE_VLLM}")
+TOOL_PORT=$(find_free_port "${BASE_TOOL}")
+if [[ "${VLLM_PORT}" -eq "${TOOL_PORT}" ]]; then
+    TOOL_PORT=$(find_free_port "$((TOOL_PORT + 1))")
+fi
 export VLLM_PORT TOOL_PORT
-echo "vLLM port: ${VLLM_PORT}  tool port: ${TOOL_PORT}"
+echo "Allocated ports -> vLLM: ${VLLM_PORT}, tool: ${TOOL_PORT}"
 
 python - <<'PY'
 from agentic_sfm.constants import assert_qwen35_runtime

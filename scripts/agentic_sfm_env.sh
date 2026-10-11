@@ -31,3 +31,22 @@ if [[ -d "${CONDA_ENV}/lib/python3.11/site-packages/nvidia" ]]; then
     export LD_LIBRARY_PATH="$(IFS=:; echo "${_nv_libs[*]}"):${LD_LIBRARY_PATH:-}"
   fi
 fi
+
+find_free_port() {
+  local start_port="${1:-30000}"
+  python3 -c "
+import socket, sys
+start = int(sys.argv[1])
+for port in range(start, start + 3000):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('', port))
+            print(port)
+            sys.exit(0)
+    except OSError:
+        continue
+sys.exit(1)
+" "${start_port}"
+}
+export -f find_free_port 2>/dev/null || true

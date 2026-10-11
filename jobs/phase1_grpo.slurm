@@ -52,10 +52,15 @@ mkdir -p "${TRITON_CACHE_DIR}" "${FLASHINFER_WORKSPACE_DIR}" "${FLASHINFER_JIT_D
 cd "${PROJECT_ROOT}"
 
 # Shared GPU nodes: unique ports per job.
-VLLM_PORT=$((39000 + SLURM_JOB_ID % 20000))
-TOOL_SERVER_PORT=$((19000 + SLURM_JOB_ID % 20000))
+BASE_VLLM=$((39000 + SLURM_JOB_ID % 20000))
+BASE_TOOL=$((19000 + SLURM_JOB_ID % 20000))
+VLLM_PORT=$(find_free_port "${BASE_VLLM}")
+TOOL_SERVER_PORT=$(find_free_port "${BASE_TOOL}")
+if [[ "${VLLM_PORT}" -eq "${TOOL_SERVER_PORT}" ]]; then
+    TOOL_SERVER_PORT=$(find_free_port "$((TOOL_SERVER_PORT + 1))")
+fi
 export VLLM_PORT TOOL_SERVER_PORT
-echo "vLLM port: ${VLLM_PORT}  tool port: ${TOOL_SERVER_PORT}"
+echo "Allocated ports -> vLLM: ${VLLM_PORT}, tool: ${TOOL_SERVER_PORT}"
 
 # Warm-start adapter comes from the config — fail loudly if it is missing
 # rather than training from the base model by accident.

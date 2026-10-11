@@ -1,0 +1,2 @@
+Notice given 2026-09-22T20:50:34+01:00:
+Check the terms at https://info.arxiv.org/help/api/index.html and always check the license of papers retrieved by the arXiv search skill for any restrictions. This review uses search metadata/abstracts and does not redistribute paper content.
