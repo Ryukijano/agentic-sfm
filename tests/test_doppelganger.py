@@ -450,7 +450,7 @@ class TestGTImpostorScoring:
                 "status": "ok",
             }
 
-        def verify_doppelganger(self, image_a, image_b, session=""):
+        def verify_doppelganger(self, image_a, image_b, session="", matcher="loftr"):
             conf = float(self.flagged_confidence)
             return {
                 "pair": [image_a, image_b],

@@ -136,11 +136,11 @@ class ToolClient:
         return r.json()
 
     def verify_doppelganger(
-        self, image_a: str, image_b: str, session: str = ""
+        self, image_a: str, image_b: str, session: str = "", matcher: str = "loftr"
     ) -> dict[str, Any]:
         r = self.client.post(
             "/verify_doppelganger",
-            json={"image_a": image_a, "image_b": image_b, "session": session},
+            json={"image_a": image_a, "image_b": image_b, "session": session, "matcher": matcher},
         )
         r.raise_for_status()
         return r.json()

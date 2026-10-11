@@ -97,6 +97,7 @@ class VerifyDoppelgangerRequest(BaseModel):
     image_a: str
     image_b: str
     session: str = ""
+    matcher: str = "loftr"
 
 
 class PruneEdgesRequest(BaseModel):
@@ -771,10 +772,11 @@ def _match_vggt(
         return res
 
     # world_points_conf uses conf_activation="expp1" — conf = 1 + exp(raw),
-    # living in [1, inf), NOT a probability. 5.0 mirrors VGGT's own demo
-    # (demo_colmap.py conf_thres_value); 1.5 would only discard pixels the
-    # model actively asserts are background.
-    conf_thr = float(os.environ.get("AGENTIC_SFM_VGGT_CONF_THRESHOLD", "5.0"))
+    # living in [1, inf), NOT a probability. The 5.0 default (VGGT's demo
+    # value) left 862 of 1,170 benchmark pairs with no matches. On six ScanNet
+    # pairs (outputs/diagnose_vggt_conf) 3.0 kept every pair's matches except
+    # one that dropped from 6042 to 562, so 3.0 is the working default.
+    conf_thr = float(os.environ.get("AGENTIC_SFM_VGGT_CONF_THRESHOLD", "3.0"))
     dist_thr_env = os.environ.get("AGENTIC_SFM_VGGT_DIST_THRESHOLD", "")
     dist_thr = float(dist_thr_env) if dist_thr_env else None
     max_pts = int(os.environ.get("AGENTIC_SFM_VGGT_MAX_POINTS", "20000"))
@@ -1079,10 +1081,19 @@ def tool_build_initial_graph(
     # Initialize graph
     graph = ViewGraph(valid_ids)
 
-    # Batch match candidate pairs
+    # Batch match candidate pairs. Edges are labelled with the backend that
+    # actually produced them: a fallback (e.g. vggt->loftr) must not be
+    # recorded under the requested name.
+    n_fallback = n_zero = 0
+    inlier_counts: list[int] = []
     for u, v in sorted(candidate_pairs):
         match_res = tool_match(u, v, matcher=matcher, session=sess)
+        if match_res.get("matcher_fallback"):
+            n_fallback += 1
         num_inliers = int(match_res.get("num_inliers") or 0)
+        inlier_counts.append(num_inliers)
+        if int(match_res.get("num_matches") or 0) == 0:
+            n_zero += 1
         num_matches = int(match_res.get("num_matches") or 0)
         inlier_ratio = float(match_res.get("inlier_ratio") or 0.0)
         pose = match_res.get("pose")
@@ -1098,7 +1109,7 @@ def tool_build_initial_graph(
             inlier_ratio=inlier_ratio,
             R_rel=R_rel,
             t_rel=t_rel,
-            matcher=matcher,
+            matcher=match_res.get("matcher", matcher),
             status=status,
         )
         graph.add_edge(u, v, edge)
@@ -1107,6 +1118,10 @@ def tool_build_initial_graph(
 
     summary = graph.get_summary()
     summary["num_candidates_selected"] = len(candidate_pairs)
+    summary["matcher_requested"] = matcher
+    summary["pairs_fallback"] = n_fallback
+    summary["pairs_zero_matches"] = n_zero
+    summary["median_inliers"] = float(np.median(inlier_counts)) if inlier_counts else 0.0
     summary["status"] = "ok"
     return summary
 
@@ -1136,6 +1151,7 @@ def tool_verify_doppelganger(
     image_a: str,
     image_b: str,
     session: str = "",
+    matcher: str = "loftr",
 ) -> dict[str, Any]:
     """Verify if an image pair is a visual doppelganger using multi-modal evidence."""
     sess = session or _DEFAULT_SESSION
@@ -1168,7 +1184,12 @@ def tool_verify_doppelganger(
         ratio = edge.inlier_ratio
         R_uv = edge.R_rel
     else:
-        match_res = tool_match(image_a, image_b, matcher="loftr", session=sess)
+        match_res = tool_match(image_a, image_b, matcher=matcher, session=sess)
+        if match_res.get("error"):
+            # Surface matcher errors (e.g. an unknown matcher name) as an
+            # error so the episode counts the call as invalid, instead of
+            # reading missing fields as a genuine "no inliers" verdict.
+            return {"error": match_res["error"], "pair": [image_a, image_b]}
         inliers = int(match_res.get("num_inliers") or 0)
         ratio = float(match_res.get("inlier_ratio") or 0.0)
         pose = match_res.get("pose")
@@ -1919,7 +1940,7 @@ def inspect_graph_endpoint(req: InspectGraphRequest):
 @app.post("/verify_doppelganger")
 def verify_doppelganger_endpoint(req: VerifyDoppelgangerRequest):
     return tool_verify_doppelganger(
-        req.image_a, req.image_b, session=req.session
+        req.image_a, req.image_b, session=req.session, matcher=req.matcher
     )
 
 

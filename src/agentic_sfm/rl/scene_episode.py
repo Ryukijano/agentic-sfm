@@ -450,12 +450,18 @@ You are a Photogrammetry Director agent. Reconstruct the 3D scene from its image
 Tools:
 - build_initial_graph {"k_neighbors": 5, "matcher": "loftr"} -> initializes view graph via visual retrieval and batch matching; returns graph summary (num_components, isolated_images, bottlenecks, suspicious_cycles)
 - inspect_graph {} -> analyzes current view graph topology, connected components, articulation bridges, and rotation cycle residuals
-- verify_doppelganger {"image_a": "img_0000", "image_b": "img_0001"} -> checks if a pair is a visual doppelganger / symmetry ambiguity using cycle rotation consistency and appearance similarity
+- verify_doppelganger {"image_a": "img_0000", "image_b": "img_0001", "matcher": "loftr"} -> checks if a pair is a visual doppelganger / symmetry ambiguity using cycle rotation consistency and appearance similarity
 - prune_edges {"pairs": [["img_0000", "img_0001"]]} -> removes incorrect or ambiguous edges from the view graph before reconstruction
 - bridge_components {"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": "loftr"} -> searches for cross-component candidate pairs and attempts to connect disconnected subgraphs
 - sfm_run {} -> runs incremental SfM on the verified active view graph; returns num_registered, num_points3d, mean_reproj_error
 - inspect {} -> detailed statistics of the reconstruction
 - done {} -> end episode
+
+Matchers (the "matcher" argument of build_initial_graph, bridge_components and verify_doppelganger):
+- "loftr": dense detector-free matcher. Returns correspondences and an essential-matrix pose for every pair it can match.
+- "mast3r": 3D-aware matcher from a pretrained two-view reconstruction model. Returns correspondences and a pose.
+- "vggt": feed-forward multi-view geometry model. Its extrinsics prior is available for every pair, but on some pairs it yields few usable correspondences, and the backend can fall back to loftr.
+Each build_initial_graph summary reports matcher_requested, pairs_fallback (pairs that fell back to loftr because the requested matcher failed), pairs_zero_matches and median_inliers, so you can judge a matcher from its results.
 
 Workflow:
 1. Always start by calling build_initial_graph to create the initial view graph.
@@ -1014,7 +1020,10 @@ def _execute_scene_tool(
     if tc.tool == "verify_doppelganger":
         a = str(args.get("image_a", ""))
         b = str(args.get("image_b", ""))
-        res = tool_client.verify_doppelganger(image_a=a, image_b=b, session=ep.session_id)
+        res = tool_client.verify_doppelganger(
+            image_a=a, image_b=b, session=ep.session_id,
+            matcher=str(args.get("matcher", "loftr")),
+        )
         if isinstance(res, dict) and not res.get("error"):
             # Record every checked pair (flagged or not) so it stays "in
             # play" for GT doppelganger labelling; _sfm_pair_list still only

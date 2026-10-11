@@ -218,7 +218,7 @@ class MockToolClient:
             "status": "ok",
         }
 
-    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "") -> dict[str, Any]:
+    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "", matcher: str = "loftr") -> dict[str, Any]:
         self.call_log.append(f"verify_doppelganger:{image_a}:{image_b}")
         conf = float(self.doppelganger_confidence)
         is_dop = conf >= 0.5
@@ -305,7 +305,7 @@ class InstrumentedToolClient(ToolClient):
         self.call_log.append(f"inspect_graph:{session}")
         return super().inspect_graph(session=session)
 
-    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "") -> dict[str, Any]:
+    def verify_doppelganger(self, image_a: str, image_b: str, session: str = "", matcher: str = "loftr") -> dict[str, Any]:
         self.call_log.append(f"verify_doppelganger:{image_a}:{image_b}")
         return super().verify_doppelganger(image_a, image_b, session=session)
 

@@ -245,3 +245,81 @@ class TestGraphTools:
         assert res["status"] == "failed_empty_graph"
         assert res["num_registered"] == 0
         assert "aborted" in res["error"].lower()
+
+
+_REAL_TOOL_MATCH = TS.tool_match
+
+
+class TestMatcherChoice:
+    def test_fallback_edges_labelled_with_actual_backend(self, test_scene, monkeypatch):
+        """A vggt request that fell back to loftr must be stored as loftr, not vggt."""
+        real_mock = TS.tool_match
+
+        def fallback_match(a, b, matcher="loftr", session="", **kw):
+            res = real_mock(a, b, matcher="loftr", session=session)
+            res["matcher"] = "loftr"
+            res["matcher_fallback"] = "vggt->loftr"
+            return res
+
+        monkeypatch.setattr(TS, "tool_match", fallback_match)
+        sess = test_scene["session"]
+        res = TS.tool_build_initial_graph(
+            image_ids=test_scene["img_ids"], k_neighbors=2, matcher="vggt", session=sess,
+        )
+        edges = TS._SESSION_GRAPHS[sess].active_edges().values()
+        assert edges and all(e.matcher == "loftr" for e in edges)
+        assert res["matcher_requested"] == "vggt"
+        assert res["pairs_fallback"] == res["num_candidates_selected"]
+
+    def test_summary_reports_zero_match_and_median_inliers(self, test_scene, monkeypatch):
+        real_mock = TS.tool_match
+
+        def sparse_match(a, b, matcher="loftr", session="", **kw):
+            res = real_mock(a, b, matcher=matcher, session=session)
+            res["num_matches"] = 0
+            res["num_inliers"] = 0
+            return res
+
+        monkeypatch.setattr(TS, "tool_match", sparse_match)
+        res = TS.tool_build_initial_graph(
+            image_ids=test_scene["img_ids"], k_neighbors=2, session=test_scene["session"],
+        )
+        assert res["pairs_zero_matches"] == res["num_candidates_selected"]
+        assert res["median_inliers"] == 0.0
+        assert res["matcher_requested"] == "loftr"
+
+    def test_verify_doppelganger_uses_requested_matcher(self, test_scene, monkeypatch):
+        seen = []
+        real_mock = TS.tool_match
+
+        def spy(a, b, matcher="loftr", session="", **kw):
+            seen.append(matcher)
+            return real_mock(a, b, matcher=matcher, session=session)
+
+        monkeypatch.setattr(TS, "tool_match", spy)
+        ids = test_scene["img_ids"]
+        TS.tool_verify_doppelganger(ids[0], ids[1], session=test_scene["session"], matcher="mast3r")
+        assert seen == ["mast3r"]
+
+    def test_verify_doppelganger_defaults_to_loftr(self, test_scene, monkeypatch):
+        seen = []
+        real_mock = TS.tool_match
+
+        def spy(a, b, matcher="loftr", session="", **kw):
+            seen.append(matcher)
+            return real_mock(a, b, matcher=matcher, session=session)
+
+        monkeypatch.setattr(TS, "tool_match", spy)
+        ids = test_scene["img_ids"]
+        TS.tool_verify_doppelganger(ids[0], ids[1], session=test_scene["session"])
+        assert seen in ([], ["loftr"])
+
+    def test_verify_doppelganger_rejects_unknown_matcher(self, test_scene, monkeypatch):
+        # The fixture replaces tool_match with a permissive mock; restore the
+        # real function so the matcher validation under test is the real one.
+        monkeypatch.setattr(TS, "tool_match", _REAL_TOOL_MATCH)
+        ids = test_scene["img_ids"]
+        res = TS.tool_verify_doppelganger(
+            ids[0], ids[1], session=test_scene["session"], matcher="not_a_matcher",
+        )
+        assert res.get("error"), "unknown matcher must be an error, not a valid verdict"
