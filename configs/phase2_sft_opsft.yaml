@@ -1,0 +1,48 @@
+# Phase 2b: OPSFT-style constrained SFT for agentic SfM (arXiv 2609.36659)
+# LoRA fine-tuning of Qwen3.5-2B on oracle scene trajectories, constrained
+# per-step to the update direction extracted from a prior SFT->GRPO run.
+#
+# NOTE: model.init_adapter MUST equal the adapter the direction was measured
+# from (theta_base). opsft.direction_artifact is produced by:
+#   scripts/extract_update_direction.py --base <sft_adapter> --trained <grpo_ckpt>
+#
+# Data: scripts/build_scene_sft.py -> data/scene_sft_train.jsonl
+# Train: python scripts/run_sft_opsft.py --config configs/phase2_sft_opsft.yaml
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  init_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+opsft:
+  direction_artifact: "outputs/opsft/direction_scene_grpo.pt"
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  total_epochs: 5
+  batch_size: 1
+  gradient_accumulation_steps: 8  # effective batch size = 8
+  max_grad_norm: 1.0
+  save_freq: 1
+
+data:
+  sft_data: "data/scene_sft_graph_train.jsonl"
+  # 401,408 px = <=512 vision tokens/image at patch16+merge2; 8 image slots
+  # -> ~4k vision tokens per example (was ~8k at 1,003,520 px).
+  max_image_pixels: 401408
+
+output:
+  checkpoint_dir: "outputs/scene_opsft_base/checkpoints"
+  results_dir: "outputs/scene_opsft_base"
+  log_dir: "logs/scene_opsft_base"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-scene-opsft-qwen35-2b"
+  wandb_enabled: true

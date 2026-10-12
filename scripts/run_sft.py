@@ -234,6 +234,12 @@ class SFTTrainer:
 
         return mask
 
+    def _pre_optim_step(self):
+        """Hook called just before grad clipping + optimizer.step(). No-op."""
+
+    def _post_optim_step(self):
+        """Hook called just after optimizer.step(). No-op."""
+
     def train_step(self, examples: list[dict], accum_step: int = 0,
                    is_last_accum: bool = True) -> dict:
         """One SFT step on a batch of examples."""
@@ -245,6 +251,7 @@ class SFTTrainer:
 
         for ex in examples:
             messages = ex["messages"]
+            backward_started = False
             try:
                 # Load images
                 images = _load_example_images(ex)
@@ -273,6 +280,7 @@ class SFTTrainer:
                 )
 
                 loss = loss / self.grad_accum
+                backward_started = True
                 loss.backward()
 
                 total_loss = total_loss + loss.detach()
@@ -282,16 +290,22 @@ class SFTTrainer:
                     f"SFT step failed for "
                     f"{ex.get('pair_id') or ex.get('scene_id', '?')}: {e}"
                 )
-                self._optimizer.zero_grad(set_to_none=True)
+                if backward_started:
+                    # A mid-backward failure may have written partial grads;
+                    # they are unrecoverable, so the window's accumulated
+                    # grads must be discarded rather than stepped on.
+                    self._optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 continue
 
         if valid_count > 0 and is_last_accum:
+            self._pre_optim_step()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self._model.parameters() if p.requires_grad],
                 self.max_grad_norm,
             )
             self._optimizer.step()
+            self._post_optim_step()
             self._optimizer.zero_grad()
 
         if is_last_accum:
