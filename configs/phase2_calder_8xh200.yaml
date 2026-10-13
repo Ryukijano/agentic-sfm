@@ -1,0 +1,195 @@
+# Phase 2: Full agentic SfM with COLMAP + doppelganger tools — Calder 8xH200 NVL.
+# Scene-level episodes with reconstruction-quality rewards.
+#
+# Differences vs configs/phase2_hybrid.yaml (Aire 3xL40S, job 8237240):
+#   * group_size 6 (H200 141 GB fits 6 rollouts per group; L40S OOMed at 6)
+#   * vLLM runs TP=2 on GPUs 0,1 with --max-model-len 16384 (job 8237240 hit
+#     129 "Input length > 8192" truncations on 20-image scenes)
+#   * ScanNet indoor scenes ENABLED: 40 scene-disjoint scenes
+#     (scene0707_00..scene0714_00 + scene0746_00..scene0777_00), strictly
+#     disjoint from the frozen 30-scene eval manifest (scene0715_00..scene0745_00
+#     minus scene0718_00). LoFTR fails on low-texture ScanNet (68.85 deg median)
+#     while MASt3R (6.65) and VGGT (6.79) succeed — giving GRPO a strong reward
+#     gradient for matcher selection that the MegaDepth-only run lacked.
+#   * kl_device "cuda:1": inside the training process (CUDA_VISIBLE_DEVICES=3,4),
+#     cuda:0 is the trainable LoRA (physical GPU 3) and cuda:1 is the frozen KL
+#     anchor (physical GPU 4) — bf16 KL scoring on GPU instead of CPU.
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  # Scene SFT (graph-grammar retry 2) is the JSON contract for
+  # build_initial_graph/verify_doppelganger/prune_edges/sfm_run.
+  checkpoint: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  sft_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  kl_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "custom"
+  group_size: 6           # N trajectories per scene (H200 141 GB fits 6; L40S OOMed)
+  max_tool_calls: 20      # more tools per episode than Phase 1
+  max_turns: 30           # more turns for multi-step pipeline
+  temperature: 1.0
+  top_p: 0.95
+  # DAPO-style improvements
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  # S-GRPO CGI: inject oracle trajectory when all rollouts fail
+  sgrpo_cgi: true
+  # Dynamic reward scaling
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 20
+
+tools:
+  enabled: ["build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "bridge_components", "sfm_run", "inspect", "done"]
+  matchers: ["loftr", "mast3r", "vggt"]   # hybrid: the policy chooses among LoFTR, MASt3R and VGGT
+  sfm_backend: "colmap"
+
+reward:
+  registration_weight: 0.5   # fraction of images registered
+  pose_weight: 1.0           # mean pose error (1 - err/20)
+  split_penalty: 0.5         # penalty when 0 images registered
+  doppelganger_weight: 0.3   # F1 of pruned edges vs GT-derived impostors
+  allow_self_certified_doppelganger: false
+  graph_cost_weight: 0.2
+  tool_cost: 0.0             # legacy (disabled)
+  accumulative_tool_coef: 0.1
+  use_accumulative_tool_reward: true
+  format_weight: 0.1
+  invalid_penalty: 0.2
+  first_call_validity_weight: 0.5
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
+  use_ntep_rewards: false
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
+
+curriculum:
+  enabled: true
+  # Never raise max_images above 20 — 50-image sequences blew activations on
+  # Aire (job 7975335). Stage 3 opens ALL loaded train scenes at 20 images:
+  # 2 MegaDepth + 32 scene-disjoint ScanNet train scenes.
+  stages:
+    - epochs: 10
+      max_images: 12
+      scenes: ["0015", "0022", "scene0707_00", "scene0708_00", "scene0709_00", "scene0710_00"]   # 2 MegaDepth + 4 ScanNet warmup
+    - epochs: 20
+      max_images: 20
+      scenes: ["0015", "0022", "scene0707_00", "scene0708_00", "scene0709_00", "scene0710_00", "scene0711_00", "scene0712_00", "scene0713_00", "scene0714_00", "scene0746_00", "scene0747_00", "scene0748_00", "scene0749_00", "scene0750_00", "scene0751_00", "scene0752_00", "scene0753_00"]   # 18 scenes outdoor + indoor
+    - epochs: 20
+      max_images: 20
+      scenes: null           # all loaded train scenes: 2 MegaDepth + 32 ScanNet
+
+training:
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 200
+  total_epochs: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 5
+  eval_freq: 5
+  eval_num_scenes: 8
+  eval_min_registered_frac: 0.5
+  eval_max_pose_error_deg: 20.0
+  log_freq: 10
+  kl_coef: 0.03
+  # Frozen SFT KL anchor on a dedicated GPU. The trainer process is launched
+  # with CUDA_VISIBLE_DEVICES=3,4, so cuda:0 = trainable LoRA (physical GPU 3)
+  # and cuda:1 = frozen KL reference (physical GPU 4). On L40S this was "cpu".
+  kl_device: "cuda:1"
+  off_support_threshold: -9.0
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"   # overridden to $CALDER_FLASH in the slurm script
+
+rollout:
+  vllm_gpu: 0             # informational on Calder: vLLM spans physical GPUs 0,1 (TP=2)
+  training_gpu: 1         # informational: training process sees GPUs 3,4 as 0,1
+  matcher_gpu: 2          # tool server on physical GPU 2 (matchers + COLMAP)
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 4
+  batch_size: 1           # one scene per step
+  min_p: 0.05
+  top_k: 50
+
+data:
+  # Relative paths — unpack_on_calder.sh symlinks data/megadepth ->
+  # $CALDER_SCRATCH/data/megadepth on Calder.
+  scene_info_dir: "data/megadepth/scene_info_full/scene_info"
+  image_root: "data/megadepth/megadepth_test_1500"
+  scannet_root: "data/megadepth/scannet_test_1500/scannet_test_1500"
+  # 40 ScanNet scenes, strictly disjoint from the frozen eval manifest
+  # (scene0715_00..scene0745_00). 8 are held out as val_scene_ids below,
+  # leaving 32 ScanNet + 2 MegaDepth = 34 training scenes.
+  scannet_scene_ids:
+    - "scene0707_00"
+    - "scene0708_00"
+    - "scene0709_00"
+    - "scene0710_00"
+    - "scene0711_00"
+    - "scene0712_00"
+    - "scene0713_00"
+    - "scene0714_00"
+    - "scene0746_00"
+    - "scene0747_00"
+    - "scene0748_00"
+    - "scene0749_00"
+    - "scene0750_00"
+    - "scene0751_00"
+    - "scene0752_00"
+    - "scene0753_00"
+    - "scene0754_00"
+    - "scene0755_00"
+    - "scene0756_00"
+    - "scene0757_00"
+    - "scene0758_00"
+    - "scene0759_00"
+    - "scene0760_00"
+    - "scene0761_00"
+    - "scene0762_00"
+    - "scene0763_00"
+    - "scene0764_00"
+    - "scene0765_00"
+    - "scene0766_00"
+    - "scene0767_00"
+    - "scene0768_00"
+    - "scene0769_00"
+    - "scene0770_00"
+    - "scene0771_00"
+    - "scene0772_00"
+    - "scene0773_00"
+    - "scene0774_00"
+    - "scene0775_00"
+    - "scene0776_00"
+    - "scene0777_00"
+  # 8 held-out ScanNet validation scenes (excluded from training by
+  # run_scene_grpo.py), still disjoint from the frozen eval manifest.
+  val_scene_ids:
+    - "scene0770_00"
+    - "scene0771_00"
+    - "scene0772_00"
+    - "scene0773_00"
+    - "scene0774_00"
+    - "scene0775_00"
+    - "scene0776_00"
+    - "scene0777_00"
+  max_images_per_scene: 20
+  min_images_per_scene: 5
+  matcher: "loftr"
+  doppelganger_dataset: "data/doppelgangers"
+
+output:
+  checkpoint_dir: "outputs/phase2/checkpoints"
+  results_dir: "outputs/phase2"
+  log_dir: "logs/phase2"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-hybrid-grpo-calder-8xh200"

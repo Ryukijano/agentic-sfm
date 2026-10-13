@@ -672,9 +672,18 @@ class SceneGRPOTrainer(GRPOTrainer):
                     )
 
             rewards = [e.reward for e in group_episodes]
+            grp_matchers = {"loftr": 0, "mast3r": 0, "vggt": 0}
+            for e in group_episodes:
+                for tc in getattr(e, "tool_calls", None) or []:
+                    if tc.tool in ("build_initial_graph", "bridge_components",
+                                   "verify_doppelganger", "doppelganger_check",
+                                   "match", "crop_and_match"):
+                        m = str((tc.args or {}).get("matcher") or DEFAULT_MATCHER).lower()
+                        if m in grp_matchers:
+                            grp_matchers[m] += 1
             logger.info(
                 f"  {scene['scene_id']}: rewards={[f'{r:.3f}' for r in rewards]}, "
-                f"mean={np.mean(rewards):.3f}"
+                f"mean={np.mean(rewards):.3f}, matchers={grp_matchers}"
             )
             episodes.extend(group_episodes)
 
@@ -758,6 +767,27 @@ class SceneGRPOTrainer(GRPOTrainer):
             float((ep.recon_result or {}).get("num_doppelgangers_filtered", 0) or 0)
             for ep in episodes
         ]))
+        # Specialist matcher selection telemetry across graph/pair/doppelganger tools
+        matcher_counts = {"loftr": 0, "mast3r": 0, "vggt": 0}
+        fallback_pairs = 0
+        for ep in episodes:
+            for tc in getattr(ep, "tool_calls", None) or []:
+                if tc.tool in ("build_initial_graph", "bridge_components",
+                               "verify_doppelganger", "doppelganger_check",
+                               "match", "crop_and_match"):
+                    m = str((tc.args or {}).get("matcher") or DEFAULT_MATCHER).lower()
+                    if m in matcher_counts:
+                        matcher_counts[m] += 1
+            for res in getattr(ep, "results", None) or []:
+                if isinstance(res, dict):
+                    fallback_pairs += int(res.get("pairs_fallback", 0) or 0)
+                    if res.get("matcher_fallback"):
+                        fallback_pairs += 1
+        total_m = max(sum(matcher_counts.values()), 1)
+        for m_name, cnt in matcher_counts.items():
+            metrics[f"scene/matcher_calls_{m_name}"] = float(cnt)
+            metrics[f"scene/matcher_frac_{m_name}"] = float(cnt) / float(total_m)
+        metrics["scene/matcher_fallback_pairs"] = float(fallback_pairs)
         return metrics
 
     # ------------------------------------------------------------------
