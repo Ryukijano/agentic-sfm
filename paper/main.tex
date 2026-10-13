@@ -1,0 +1,561 @@
+% Agentic SfM — paper draft (CVPR 2027 target / ICCV 2027 fallback)
+%
+% This file is intentionally self-contained: it compiles with a stock TeX
+% installation via `pdflatex main.tex` (article class, two column). For
+% submission, replace the \documentclass + preamble block below with the
+% official CVPR template (cvpr.sty) and move the front-matter into the
+% template's format; the body from \section{Introduction} onward is
+% drop-in compatible.
+%
+% Convention: every empirical number below is traceable to an artifact in
+% this repository (path noted in comments / footnotes). Cells marked
+% \pending{} are placeholders for the Calder 8xH200 experiment matrix
+% (jobs/calder_8xh200_hybrid.slurm) and MUST NOT be read as results.
+%
+% Status: WORKING DRAFT — reports confirmed results honestly, including
+% negative results. Not yet a complete paper.
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+% --- helpers ------------------------------------------------------------
+\newcommand{\pending}[1]{\textcolor{red}{\textbf{[PENDING: #1]}}}
+\newcommand{\tool}[1]{\texttt{#1}}
+\newcommand{\method}{Agentic-SfM}
+\newtheorem{definition}{Definition}
+
+\title{\method{}: Reinforcement-Learned Orchestration of Geometric
+Specialists for Hard Structure-from-Motion}
+
+\author{Anonymous CVPR submission\\
+\ Institution\\
+{\tt\small paper id: TBD}
+% For internal draft: Gyanateet Dutta (Ryukijano), University of Leeds.
+% Idea credit: Gabriele Berton's public research idea \#11 (LinkedIn,
+% July 2026) — must be credited in the acknowledgements.
+}
+
+\begin{document}
+\maketitle
+
+% =========================================================================
+\begin{abstract}
+Structure-from-motion (SfM) pipelines still fail on scenes with wide
+baselines, low overlap, repeated texture, and doppelganger views, because
+a fixed matcher cannot adapt its strategy to the scene. We study whether
+a small multimodal language model can \emph{orchestrate} a toolbox of
+geometric specialists — dense and sparse matchers (LoFTR, MASt3R), a
+feed-forward pose prior (VGGT), doppelganger filtering, and COLMAP —
+rather than replace them. The policy is trained on-policy with GRPO under
+a fully machine-verifiable reward derived from ground-truth camera poses,
+and consolidated with a direction-constrained SFT variant (OPSFT) that
+restricts post-RL supervised updates to the sign and support of the RL
+update. Our preliminary findings are honest and mixed: (i) specialist
+heterogeneity is real and large — on 1,170 frozen ScanNet pairs the VGGT
+pose head reaches AUC@10$^\circ$ 0.631 and MASt3R 0.506 versus 0.240 for
+LoFTR — establishing that \emph{which} tool is called matters;
+(ii) a 2B-parameter policy can be RL-trained end-to-end in the loop
+(mean scene reward 0.85$\to$1.64 over 50 epochs), but the current warm
+start collapses matcher choice to LoFTR and never explores the stronger
+specialists; and (iii) direction-constrained SFT is implementable for
+LoRA adapters, though exact RL update support is near-dense under AdamW
+(99.998\%), motivating sparse top-$k$ support approximations. We release
+the environment, reward, frozen evaluation manifest, and direction
+artifacts, and outline a staged plan on 8$\times$H200 to determine whether
+learned budget-aware routing over specialists beats equally-budgeted fixed
+baselines.
+\end{abstract}
+
+% =========================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Structure-from-motion remains a prerequisite for 3D reconstruction,
+localization, and neural rendering, yet classical pipelines are brittle:
+correspondence estimators fail on low-overlap and wide-baseline pairs,
+repeated texture produces doppelganger views that corrupt the view graph,
+and incremental reconstruction can split a scene into disconnected
+components. Each of these failure modes has a specialized remedy —
+better matchers~\cite{loftr,mast3r}, feed-forward camera/geometry
+priors~\cite{vggt}, doppelganger classifiers~\cite{doppelgangerspp}, and
+bundle adjustment~\cite{colmap} — but selecting \emph{which} remedy to
+apply, on \emph{which} image pairs, under a \emph{limited compute budget}
+is itself a sequential decision problem that no fixed pipeline solves.
+
+Recent work in reinforcement learning for vision-language models (RLVR)
+shows that small multimodal models can learn verifiable tool-use
+behavior~\cite{visualrft,dapo}. This suggests a reframing of SfM: keep the
+geometric specialists frozen and exact, and learn a \emph{policy} that
+orchestrates them — constructing the view graph, choosing matchers per
+edge, pruning doppelgangers, bridging components, invoking reconstruction,
+and deciding when to stop. This idea was articulated publicly by
+Berton~\cite{bertonidea}; to our knowledge no trained system has yet been
+reported, and the closest concurrent work applies RL to direct matching
+rather than tool orchestration~\cite{reasonmatch}.
+
+We build that system and report what is true so far — including the parts
+that do not yet work:
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+  \item \textbf{Environment.} A scene-level SfM environment where a
+  Qwen3.5-2B policy issues structured tool calls against a stateful tool
+  server hosting LoFTR, MASt3R, VGGT, doppelganger checks, and COLMAP
+  (\S\ref{sec:env}). Rewards are computed from ground-truth camera poses —
+  no human or learned preference labels.
+  \item \textbf{Measured specialist heterogeneity.} On 1,170 pairs from a
+  frozen 30-scene ScanNet manifest, VGGT's extrinsics head attains
+  AUC@10$^\circ$ of 0.631 (median error $6.79^\circ$), MASt3R 0.506
+  ($6.65^\circ$), and LoFTR 0.240 ($68.85^\circ$) — a $2.6\times$ spread
+  that makes per-edge tool selection a real decision
+  (\S\ref{sec:specialist-bench}).
+  \item \textbf{A trained scene policy, honestly assessed.} GRPO trains
+  the agent in the loop (mean reward $0.847 \!\to\! 1.643$; best held-out
+  scene score 0.608) but the SFT warm start collapses matcher selection to
+  LoFTR — a specialization of \emph{interaction collapse}
+  \S\ref{sec:hybrid}. We show where the entropy went and what fixes it.
+  \item \textbf{OPSFT for adapters.} We adapt direction-constrained SFT
+  \cite{opsft} from full-parameter to LoRA training, implement exact and
+  top-$k$ support masks, and report the surprising near-density of AdamW
+  LoRA update support ($99.998\%$), which changes what the constraint can
+  mean (\S\ref{sec:opsft}).
+  \item \textbf{A frozen, auditable protocol.} 30 held-out ScanNet scenes
+  with a content-hashed manifest, equal-budget baselines through an
+  identical reconstruction path, and explicit gates that must pass before
+  any routing claim (\S\ref{sec:protocol}).
+\end{itemize}
+
+Our central claim is deliberately narrow at this stage: \emph{learned,
+budget-aware orchestration over classical and feed-forward 3D specialists
+is a feasible training problem}, and the infrastructure, verifiable reward,
+and evaluation gates exist to answer it. Whether the trained router beats
+the best equally-budgeted fixed matcher is exactly what the frozen protocol
+is designed to decide; we do not claim it does.
+
+% =========================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{RL for vision-language models.}
+GRPO~\cite{grpo} and its descendants (DAPO's clip-higher and dynamic
+sampling~\cite{dapo}; Visual-RFT~\cite{visualrft}) established that small
+VLMs improve under verifiable rewards. S-GRPO~\cite{sgrpo} unifies SFT and
+RL via conditional ground-truth trajectory injection when all rollouts in
+a group fail; we adopt both its injection mechanism and its motivation
+that naive SFT-then-RL can lock in a single expert mode (cf.\ DCRL's
+finding that SFT can hurt transfer~\cite{reasonmatch}). PyVision-RL
+documents \emph{interaction collapse} — policies that reduce tool usage
+under RL — and proposes accumulative tool reward~\cite{pyvisionrl}; our
+observed matcher-choice collapse is a categorical analogue on the tool
+\emph{identity} axis rather than the tool \emph{count} axis.
+
+\paragraph{Agentic tool use.}
+Multi-turn visual tool agents (VISTA-Gym~\cite{vista}, MGPO~\cite{mgpo},
+NTEP~\cite{ntep}) show grounding and evidence-seeking can emerge from
+outcome rewards alone, and LiteSearch-VL~\cite{litesearch} shows a small
+model must first learn the ``agent contract'' — valid tool-call syntax —
+via a minimal SFT stage, which our pipeline implements.
+
+\paragraph{SfM, matching, and feed-forward 3D.}
+LoFTR~\cite{loftr} remains a strong frozen matcher; MASt3R~\cite{mast3r}
+and VGGT~\cite{vggt} regress dense point maps and camera parameters
+feed-forward. Doppelganger detection~\cite{doppelgangerspp,xdg} and global
+SfM with 3D foundation models (GLOMAP~\cite{glomap}, Glob3R~\cite{glob3r})
+supply complementary specialists and baselines. ReasonMatch/DCRL
+\cite{reasonmatch} is the closest RL work but trains the MLLM to
+\emph{match directly} with 220k pairs — no tools, cropping, or SfM. Our
+contribution is complementary: the MLLM never produces correspondences
+itself; it decides \emph{which specialist runs where and when}.
+
+\paragraph{Constrained post-training.}
+OPSFT~\cite{opsft} shows that the \emph{direction} of on-policy RL updates
+carries the generalization signal: constraining SFT to that support and
+sign reproduces RL-level behavior. We adapt it to LoRA adapters
+(\S\ref{sec:opsft}), where — unlike the paper's full-parameter regime —
+AdamW makes the exact support nearly dense.
+
+% =========================================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem formulation}
+\label{sec:env}
+
+An SfM episode is a tool-augmented Markov decision process. The state $s_t$
+is the current view graph: registered images, per-edge correspondence
+caches, component structure, and reconstruction summaries. The policy
+$\pi_\theta$ (Qwen3.5-2B, LoRA $r{=}32$, $\alpha{=}64$) observes a
+bounded set of images plus the textual graph state and emits one
+structured action per turn. Actions call tools on a stateful FastAPI
+server (\tool{crop}, \tool{match}, \tool{retrieve},
+\tool{build\_initial\_graph}, \tool{inspect\_graph},
+\tool{verify\_doppelganger}, \tool{prune\_edges},
+\tool{bridge\_components}, \tool{sfm\_run}, \tool{inspect}, \tool{done});
+each \tool{sfm\_run} executes COLMAP in a child process so a backend
+abort cannot kill the server. The matcher choice set is
+$\{\text{LoFTR}, \text{MASt3R}, \text{VGGT}\}$, exposed to the policy as a
+\emph{parameter of the match/graph actions}, so routing is a learned
+decision rather than a pipeline constant. Budgets are capped
+(20 tool calls, 30 turns per scene episode).
+
+Crucially, ground-truth poses are used \emph{only} by the reward function
+— never exposed to the policy — so the agent must infer progress from
+tool outputs (match counts, registration counts, confidence).
+
+\subsection{Verifiable reward}
+\label{sec:reward}
+
+The scene reward combines (i) registered-fraction credit, (ii) pose
+accuracy credit ($1 - \bar{e}/20^\circ$ clipped, with $\bar{e}$ the mean
+relative-pose angular error), (iii) a split penalty for zero-registration
+episodes, (iv) a doppelganger term scored against impostor edges derived
+from the covisibility matrix (no self-certification), (v) a bounded
+graph-sparsity cost applied only at high coverage, and (vi) PyVision-RL's
+accumulative tool reward — a bonus proportional to tool-call count paid
+\emph{only} on successful outcomes, replacing the per-call penalty that
+incentivizes interaction collapse~\cite{pyvisionrl}. A first-call validity
+gate prevents degenerate opening calls from winning a GRPO group; we note
+in \S\ref{sec:limitations} that this bonus still distorts the reward scale.
+
+\subsection{On-policy training}
+\label{sec:grpo}
+
+We train with GRPO over groups of $G{=}4$ scene rollouts
+(Calder config: $G{=}6$) with group-normalized advantages, PPO-style
+clipping with asymmetric clip-high $0.28$, DAPO dynamic sampling, a frozen
+KL reference adapter (coefficient $0.03$, K3 estimator), and S-GRPO
+conditional injection of the oracle trajectory when every rollout in a
+group fails. Rollouts run on vLLM with the trainable LoRA hot-reloaded
+each step; training and the frozen KL leash occupy separate GPUs.
+Training is LoRA-only on bf16 with AdamW ($\mathrm{lr}{=}5\!\times\!10^{-6}$).
+
+\subsection{Direction-constrained SFT (OPSFT for adapters)}
+\label{sec:opsft}
+
+Let $\theta_{\mathrm{base}}$ be the SFT adapter GRPO started from and
+$\theta_{\mathrm{on}}$ the RL endpoint. Following OPSFT~\cite{opsft} we
+extract a support mask $M$ and elementwise sign
+$D = \operatorname{sign}(\theta_{\mathrm{on}}-\theta_{\mathrm{base}})$
+(computed in float32 to avoid bf16 cancellation). Constrained SFT then
+enforces two projections per step: \textbf{(1)} before the optimizer step,
+$g \leftarrow g \odot M$ and $g_i \leftarrow 0$ wherever the descent
+movement opposes $D$ ($g_i D_i > 0$); \textbf{(2)} after the step,
+parameters outside $M$ are restored to $\theta_0$ and parameters that
+crossed against $D$ are snapped back. Because the paper's exact-support
+definition proved near-dense under AdamW LoRA training
+($99.998\%$ of elements differ; \S\ref{sec:support-density}) we introduce
+a \emph{top-$k$} mask selecting the global top-$f$ fraction of
+$|\Delta\theta|$ (we use $f{=}0.1$), recovering a genuinely sparse
+constraint. Two arms exist: \emph{from-base} (constrained SFT reproducing
+the RL direction from scratch) and \emph{continue} (constrained SFT
+extending a GRPO checkpoint).
+
+\subsection{Evaluation protocol}
+\label{sec:protocol}
+
+The scene is the statistical unit. Thirty ScanNet scenes
+(\texttt{scene0715\_00} onward, 20 frames each, content-hashed manifest)
+are frozen and excluded from all training; MegaDepth 0015/0022 are
+training scenes and never appear in held-out claims. Metrics: registered
+fraction (unregistered images count as failures), relative-pose
+AUC@5/10/20 over all pairs, component count, and failure taxonomy.
+Baselines run through the \emph{same} cached-match reconstruction path at
+equal tool budget: consecutive frames, random pairs, top-$k$ retrieval
+($k{=}5,10$), direct matching, a GT-overlap oracle, the SFT-only
+checkpoint, and each fixed specialist. Superiority requires a scene-level
+paired bootstrap interval excluding zero (\S\ref{sec:limitations} lists
+why the earlier 10-scene protocol could not support claims).
+
+% =========================================================================
+\section{Experiments}
+\label{sec:exp}
+
+\subsection{Setup}
+
+All Aire runs use 3$\times$L40S (48\,GB): GPU\,0 vLLM rollout, GPU\,1
+LoRA training, GPU\,2 matcher + COLMAP server. The Calder staging
+(\S\ref{sec:calder-plan}) scales to one 8$\times$H200 node with vLLM
+tensor-parallel inference at 16k context. Unless stated otherwise, numbers
+are from the artifacts named in each table.
+
+\subsection{Do specialists differ enough to make routing worth learning?}
+\label{sec:specialist-bench}
+
+Before any routing claim we measured the raw material: identical pair
+lists (19 consecutive + 20 seeded-random per scene, 1,170 pairs) over the
+frozen 30-scene ScanNet manifest, GT intrinsics, IMC-style worst-of-two
+angular error. Failures and fallbacks count as failures.
+
+\begin{table}[t]
+\centering\small
+\caption{Equal-budget specialist benchmark on 1,170 frozen ScanNet pairs
+(run 8235219). ``Avail.'' = fraction returning a pose; VGGT-\emph{prior}
+uses the model's own extrinsics head. Latency is per-pair median.}
+\label{tab:specialists}
+\begin{tabular}{lccccc}
+\toprule
+Backend & AUC@5 & AUC@10 & AUC@20 & Med.\ err.\ & Avail.\ \\
+\midrule
+LoFTR + RANSAC & 0.137 & 0.240 & 0.349 & $68.85^\circ$ & 1.00 \\
+VGGT corr.\ + RANSAC & 0.120 & 0.191 & 0.244 & $11.70^\circ$\!$^*$ & 0.41 \\
+\textbf{VGGT prior head} & \textbf{0.372} & \textbf{0.631} & \textbf{0.772} & $\mathbf{6.79^\circ}$ & \textbf{1.00} \\
+MASt3R + pose & 0.355 & 0.506 & 0.579 & $6.65^\circ$ & 0.84 \\
+\bottomrule
+\end{tabular}
+\\[2pt]{\footnotesize $^*$median over the 41.4\% of pairs that returned a pose.}
+\end{table}
+
+Table~\ref{tab:specialists} is the empirical premise of this project:
+specialists disagree by $2$--$3\times$ in AUC and by an order of magnitude
+in latency (LoFTR 0.06\,s vs.\ VGGT/MASt3R $\sim$1.26\,s median), so a
+router that spends expensive calls only where cheap ones fail could beat
+every fixed choice per budget. Two caveats bound the claim: this ordering
+is measured on ScanNet and may not transfer to outdoor MegaDepth
+(different overlap/texture statistics), and VGGT lists ScanNet among its
+training corpora — overlap with our frozen scenes is unlikely but
+unconfirmed~\cite{vggt}.
+
+\subsection{Zero-shot and pair-level RL (Phases 0--1)}
+
+\textbf{Phase 0 (negative).} Stock Qwen3.5-2B with a crop tool does not
+beat direct matching on hard MegaDepth pairs (mean inliers 8.9 vs.\ 12.4;
+pose AUC unchanged at 0.017). On real scenes 0015/0022 the zero-shot
+policy degenerated to full-frame crops, so agent and direct matching are
+identical there. Conclusion: the tool-use prior must be \emph{trained}.
+
+\textbf{Phase 1 (negative).} Pair-level GRPO on the hard-pair split,
+warm-started from oracle-crop SFT, was stopped at $\sim$200 steps at the
+2-day wall-clock limit (final logged training reward 1.493, including a
++0.5 first-call bonus — not comparable to baselines). Its best checkpoint
+underperforms the fixed matcher on the hard validation split ($n{=}50$):
+62\% success vs.\ 88\% for plain LoFTR and 90\% for an oracle crop;
+geometric reward 0.595 vs.\ 0.965. The trained agent also falls below
+LoFTR on the full 153-pair validation set (58\% success). We report these
+as negative results: at the pair level, learned orchestration did not beat
+the matcher it orchestrates.
+
+\subsection{Scene-level GRPO and the matcher-choice collapse}
+\label{sec:hybrid}
+
+\textbf{Pipeline (Phase 2).} The scene agent runs the tool grammar of
+\S\ref{sec:env} over 20-image scenes with the composite reward of
+\S\ref{sec:reward}. An initial 50-epoch LoFTR-only run (job 8073061)
+completed and produced a functioning scene policy; its accompanying
+10-scene evaluation reached only 30\% success, and we subsequently showed
+that protocol invalid for benchmark purposes (two training scenes inside
+the eval; a direct baseline whose 0\% success was a missing-key artefact;
+an ``oracle'' matching only five pairs). That audit, not the score,
+motivated the frozen protocol of \S\ref{sec:protocol}.
+
+\textbf{Hybrid run (8237240).} We then exposed all three matchers to the
+policy and retrained 50 epochs on MegaDepth scenes 0015+0022
+($3\times$L40S, $\sim$31\,h). Training reward rose from
+$0.847$ (epoch 0) to $1.643$ (epoch 49) with a monotone-ish trend, and the
+in-training evaluation peaked at epoch 25 (eval score 0.608; 100\% of the
+2-scene eval set successful; mean registered fraction 0.70; mean pose
+error $2.62^\circ$; Table~\ref{tab:hybrid}). Weight-space distance from
+the SFT init grew to $0.259$ (L2 over LoRA) by epoch 50 — the adapter
+genuinely trained.
+
+\begin{table}[t]
+\centering\small
+\caption{Hybrid GRPO run 8237240 ($3\times$L40S, 50 epochs, scenes
+0015/0022). ``Eval'' is the in-training 2-scene check — both are training
+scenes, so these are \emph{not} held-out numbers.}
+\label{tab:hybrid}
+\begin{tabular}{lccc}
+\toprule
+ & Ep.\ 0 & Best (ep.\ 25) & Final (ep.\ 50) \\
+\midrule
+Train mean reward & 0.847 & 1.324 & 1.643 \\
+Eval score & --- & \textbf{0.608} & 0.450 \\
+Eval pose err.\ & $3.70^\circ$ (ep.\ 4) & $\mathbf{2.62^\circ}$ & $6.14^\circ$ \\
+Eval reg.\ frac.\ & 0.275 & \textbf{0.700} & 0.650 \\
+$\|\theta-\theta_0\|_2$ & 0 & 0.194 & 0.259 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The collapse.} Despite MASt3R and VGGT being exposed and strictly
+better on the indoor benchmark (Table~\ref{tab:specialists}), the policy
+issued \emph{zero} calls to either across 50 epochs: matcher-token
+probability had collapsed to LoFTR during the LoFTR-only SFT warm start,
+and GRPO — an on-policy method — never sampled the alternatives, so no
+learning signal existed for them. This is interaction collapse on the
+tool-identity axis and is now directly measurable: per-step matcher
+fractions $\{\text{loftr}, \text{mast3r}, \text{vggt}\}$ and fallback
+counts are logged in the trainer. Fixes staged for Calder
+(\S\ref{sec:calder-plan}): forced specialist exploration, mixed-specialist
+SFT trajectories, and cost-shaped rewards that make LoFTR's failure mode
+(68.85$^\circ$ median error on indoor pairs) expensive.
+
+\subsection{OPSFT direction extraction}
+\label{sec:support-density}
+
+From the pair (scene-SFT epoch-5 $\to$ hybrid epoch-50) we extracted exact
+and top-$k$ direction artifacts over the 33.64M trainable LoRA elements:
+
+\begin{table}[h]
+\centering\small
+\caption{OPSFT direction artifacts over the LoRA adapter
+(33,638,400 elements). Exact support is near-dense under AdamW; the
+top-10\% mask is the meaningful sparse regime.}
+\label{tab:opsft}
+\begin{tabular}{lcc}
+\toprule
+Artifact & Selected elems.\ & Fraction \\
+\midrule
+Exact support & 33,637,819 & 99.9983\% \\
+Top-10\% $|\Delta\theta|$ & 3,363,841 & 10.000\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The near-density finding matters beyond implementation detail: under
+AdamW, LoRA \emph{exact}-support constraints leave only the sign rule
+binding, so the paper's ``sparse update'' interpretation requires the
+top-$k$ variant we added. Constrained-SFT runs (from-base and continue
+arms) are staged in the Calder job; outcomes are \pending{frozen-manifest
+evaluation of OPSFT topk-10\% vs.\ exact vs.\ GRPO-continue}.
+
+\subsection{Planned Calder 8$\times$H200 matrix}
+\label{sec:calder-plan}
+
+The staged Calder job dedicates GPUs 0--1 to vLLM (TP\,=\,2, 16k context —
+the 8k cap caused 129 context-overflow episodes on Aire), GPU\,2 to the
+tool server, GPUs 3--4 to GRPO + frozen KL leash, GPUs 5--6 to parallel
+OPSFT arms (top-10\% and exact support), and GPU\,7 to an evaluation
+server plus automatic frozen-manifest benchmarking at job end. The
+curriculum mixes MegaDepth with 32 scene-disjoint ScanNet training scenes
+and 8 validation scenes — verified zero-overlap with the 30 frozen scenes.
+Planned rows (each one job): hybrid GRPO; single-specialist controls
+(LoFTR-only / MASt3R-only / VGGT-only at identical budget — the fairness
+gate for any routing claim); group-size, context, KL, and curriculum
+ablations; frozen-manifest benchmarking of every arm; and an OPSFT vs.\
+GRPO head-to-head. All outcomes are \pending{Calder runs; no numbers
+exist yet}.
+
+% =========================================================================
+\section{Limitations and threats to validity}
+\label{sec:limitations}
+
+We deliberately surface these rather than bury them:
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{No routing evidence yet.} The hybrid run never called
+  MASt3R/VGGT, so it cannot support a routing claim; Table~
+  \ref{tab:specialists} shows headroom, not realized benefit.
+  \item \textbf{Prior held-out eval was invalid.} The 10-scene Phase-2
+  evaluation contained training scenes, an artefactual 0\%-success direct
+  arm, and a 5-pair ``oracle''. All headline claims await the frozen
+  30-scene protocol.
+  \item \textbf{Reward scale is inflated.} The +0.5 first-call validity
+  bonus contributes roughly half of several episode rewards; reward curves
+  are not quality curves.
+  \item \textbf{Domain gap.} Specialist ordering is ScanNet-measured;
+  MegaDepth ordering is unmeasured and could differ.
+  \item \textbf{VGGT train/test overlap} with ScanNet-1500 is unconfirmed
+  (its paper does not list excluded scene IDs)~\cite{vggt}.
+  \item \textbf{OPSFT is an adaptation.} LoRA-scoped, bf16, AdamW
+  $2\!\times\!10^{-5}$ vs.\ the paper's full-parameter FP32 at
+  $10^{-7}$; its claims do not transfer directly.
+  \item \textbf{Two MegaDepth scenes} carried all scene-level training so
+  far; the Calder curriculum broadens this but data scale remains below
+  concurrent work (220k pairs~\cite{reasonmatch}).
+  \item \textbf{Phase-1 checkpoint integrity.} An earlier checkpoint
+  persistence bug wrote adapters byte-identical to their init; affected
+  endpoints were excluded from analysis.
+\end{enumerate}
+
+% =========================================================================
+\section{Conclusion}
+
+We built and trained a multimodal agent that orchestrates — rather than
+replaces — the geometric specialists of SfM, with rewards verified from
+camera geometry. The evidence so far supports three honest conclusions:
+the specialists differ enough that routing is worth learning; a 2B policy
+trains in the loop under GRPO but inherited a collapsed tool-choice
+distribution that on-policy RL could not escape; and OPSFT-style
+direction-constrained SFT is implementable on adapters but must respect
+the near-dense support that AdamW produces. The frozen evaluation protocol
+and 8$\times$H200 matrix are designed to turn the remaining question —
+\emph{does learned routing beat the best equally-budgeted fixed
+specialist?} — into a decidable experiment.
+
+% =========================================================================
+\begin{thebibliography}{99}\small
+
+\bibitem{grpo} Shao et al. DeepSeekMath: pushing the limits of
+mathematical reasoning — GRPO. arXiv:2402.03300, 2024.
+
+\bibitem{visualrft} Liu et al. Visual-RFT: visual reinforcement
+fine-tuning. ICCV 2025.
+
+\bibitem{dapo} Yu et al. DAPO: an open-source LLM RL system at scale.
+NeurIPS 2025. arXiv:2503.14476.
+
+\bibitem{sgrpo} S-GRPO: conditional ground-truth trajectory injection
+unifying SFT and RL. arXiv:2604.16557, 2026.
+
+\bibitem{pyvisionrl} PyVision-RL: interaction collapse and accumulative
+tool reward for visual agents. ICML 2026. arXiv:2602.20739.
+
+\bibitem{mgpo} MGPO: multi-turn grounding policy optimization. ACL 2026.
+arXiv:2507.05920.
+
+\bibitem{vista} VISTA-R1 / VISTA-Gym: scalable tool-integrated visual
+reasoning environment. CVPR 2026.
+
+\bibitem{ntep} NTEP: necessary tool-evidence path rewards. arXiv:2609.03493.
+
+\bibitem{litesearch} LiteSearch-VL: trajectory distillation + step-DPO for
+small multimodal agents. arXiv:2608.29357.
+
+\bibitem{reasonmatch} ReasonMatch / DCRL: RL for wide-baseline matching.
+CVPR 2026. arXiv:2606.03577. (Closest concurrent work: direct matching,
+no tool orchestration.)
+
+\bibitem{opsft} Shen et al. On-policy parameter update direction underlies
+generalization in LLM post-training (OPSFT). arXiv:2609.36659.
+
+\bibitem{loftr} Sun et al. LoFTR: detector-free local feature matching.
+CVPR 2021.
+
+\bibitem{mast3r} Leroy et al. MASt3R: grounding image matching in 3D.
+arXiv:2406.09756; MASt3R-SfM arXiv:2409.19152.
+
+\bibitem{vggt} Wang et al. VGGT: visual geometry grounded transformer.
+CVPR 2025. arXiv:2503.11651. (ScanNet listed among training corpora —
+overlap with our frozen scenes unconfirmed.)
+
+\bibitem{colmap} Sch\"onberger and Frahm. COLMAP: SfM/MVS revisited. CVPR
+2016.
+
+\bibitem{glomap} Pan et al. GLOMAP: global structure-from-motion
+revisited. ECCV 2024.
+
+\bibitem{glob3r} Glob3R: global SfM with 3D foundation models.
+arXiv:2607.09225.
+
+\bibitem{doppelgangerspp} Doppelgangers++: transformer doppelganger
+classification with 3D features. CVPR 2025 (venue unconfirmed).
+
+\bibitem{xdg} XDG: efficient doppelganger disambiguation via LoRA on
+depth models. arXiv:2608.29733.
+
+\bibitem{bertonidea} Berton, G. Public research idea \#11: ``agentic
+SfM — train an MLLM with RL to use tools for cropping, matching,
+doppelgangers, SfM.'' LinkedIn, July 2026. We execute this idea; all
+system design, training infrastructure, and results here are ours.
+
+\end{thebibliography}
+
+\end{document}

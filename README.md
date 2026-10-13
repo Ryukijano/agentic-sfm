@@ -6,7 +6,7 @@
 
 Agentic SfM asks whether a small vision-language model (Qwen3.5-2B) can learn to orchestrate geometric tools (crop, match, doppelganger check, sparse reconstruction) so that structure-from-motion succeeds where a fixed matcher fails. The reward is computed from ground-truth poses, not from human labels. The central question is whether learned tool orchestration improves reconstruction over simple, equally budgeted baselines.
 
-**Current status: negative.** The pair-level RL agent does not beat plain LoFTR matching on the hard validation set (success 62% vs 88%). The scene-level agent has not been compared against valid baselines, and the evaluation used to report it has known protocol defects (Section "Known problems"). A pose-prior study (a feed-forward pose model exposed as a matcher backend) is implemented, but its benchmark job is queued and has not run, so it has no results yet. No claim in this repository should be read as the agent outperforming a baseline.
+**Current status: mixed, with named blockers.** The pair-level RL agent does not beat plain LoFTR matching on the hard validation set (success 62% vs 88%). A completed 50-epoch scene-level hybrid run (job 8237240) trained successfully (mean reward 0.847→1.643, best in-training eval score 0.608) but the policy never sampled the exposed MASt3R or VGGT matchers — matcher choice collapsed to LoFTR at the SFT warm start, so no routing benefit can be claimed. A pose-prior benchmark on 1,170 frozen ScanNet pairs is done and shows specialist heterogeneity is large (VGGT prior AUC@10 0.631, MASt3R 0.506, LoFTR 0.240). An OPSFT-style direction-constrained SFT path is implemented and tested (exact support is ~99.998% dense under AdamW; a top-10% variant exists). Calder 8×H200 staging and the scene-disjoint experiment matrix are prepared but not yet run. No claim in this repository should be read as the agent outperforming an equally-budgeted baseline.
 
 ## Status at a glance
 
@@ -17,8 +17,10 @@ Agentic SfM asks whether a small vision-language model (Qwen3.5-2B) can learn to
 | 1. Pair-level GRPO (hard pairs) | Stopped at about step 200 (2-day time limit). Best checkpoint evaluated. Worse than LoFTR. | Success 62% vs LoFTR 88% on hard val (n=50). | `outputs/eval_pair/phase1_hard_best_8019429.json` |
 | 2. Scene-level GRPO | Training finished (50 epochs). Evaluation on 10 scenes, protocol invalid as a benchmark. | Success 30%, but two of ten scenes were training scenes and the baselines are not comparable. | `outputs/phase2/run_8073061/`, `outputs/scene_eval/run_8085187/scene_eval_results.json`, `docs/scene_eval_and_env_proposal.md` |
 | Pose-prior study | Benchmark rerun (job 8235219) completed across all 3 matchers. VGGT pose head and MASt3R both vastly beat LoFTR. | VGGT prior AUC@10 0.631 (6.79° med err), MASt3R AUC@10 0.506 (6.65°), LoFTR AUC@10 0.240 (68.85°) on 1,170 ScanNet pairs. | `outputs/bench_pose_priors/run_8235219/`, `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm` |
-| Hybrid scene policy | Prompt & tools integrated to let policy choose between LoFTR, MASt3R, and VGGT. Dynamic port allocation fixed. | Hybrid config & job staged (`configs/phase2_hybrid.yaml`, `jobs/phase2_hybrid.slurm`). | `src/agentic_sfm/rl/scene_episode.py`, `tools_server/server.py` |
-| Held-out evaluation | Manifest frozen (30 ScanNet scenes). Evaluation not run. | Nothing measured yet. | `data/frozen_eval_manifest.json`, `docs/scene_eval_and_env_proposal.md` |
+| Hybrid scene policy | 50-epoch GRPO run 8237240 completed on 3×L40S. Reward 0.847→1.643; best in-training eval 0.608 (ep25). Matcher choice collapsed to LoFTR — MASt3R/VGGT never sampled. | Training works; routing does not emerge from a LoFTR-only SFT warm start. | `outputs/phase2_hybrid/run_8237240/`, `configs/phase2_hybrid.yaml`, `jobs/phase2_hybrid.slurm` |
+| OPSFT constrained SFT | Implemented and tested (17 dedicated tests). Direction artifacts extracted from run 8237240. | Exact support is 99.998% dense under AdamW; top-10% mask selects 3,363,841/33,638,400 elements. No constrained training results yet. | `src/agentic_sfm/opsft.py`, `scripts/run_sft_opsft.py`, `scripts/extract_update_direction.py`, `docs/opsft.md` |
+| Calder 8×H200 migration | Staging bundle built on Aire (2.4 GB, checksummed), Calder config + job + runbook committed. Not yet transferred. | One 8×H200 node: vLLM TP=2 @16k ctx, tool server, GRPO+KL, two OPSFT arms, frozen-eval GPU. | `scripts/stage_for_calder.sh`, `jobs/calder_8xh200_hybrid.slurm`, `docs/calder_h200_runbook.md` |
+| Held-out evaluation | Manifest frozen (30 ScanNet scenes). Equal-budget baselines planned in Calder matrix. | Nothing measured yet on the frozen manifest. | `data/frozen_eval_manifest.json`, `docs/scene_eval_and_env_proposal.md` |
 
 ## Motivation and core question
 
@@ -57,7 +59,7 @@ The core question has two parts. First, does a learned policy beat simple strate
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Each `sfm_run` call is a child process, so a COLMAP abort does not kill the tool server. LoFTR is a frozen matcher and is not trained. The pose-prior tool (Section "Pose-prior study") is a planned addition: it returns pairwise relative pose and confidence to the agent as a tool output. Ground-truth pose is never given to the policy.
+Each `sfm_run` call is a child process, so a COLMAP abort does not kill the tool server. LoFTR is a frozen matcher and is not trained. The matcher backend is a *parameter* of the match/graph actions: the policy may choose `loftr`, `mast3r`, or `vggt` (VGGT additionally returns `prior_pose` from its extrinsics head and `prior_confidence`). Fallbacks to LoFTR are tagged `matcher_fallback` in the tool response and counted in the training metrics. Ground-truth pose is never given to the policy.
 
 <p align="center">
   <img src="results/figures/agentic_sfm_phase1_architecture.png" alt="Phase 1 training architecture" width="700"/>
@@ -255,6 +257,49 @@ What this shows:
 
 Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
+### Hybrid scene GRPO (run 8237240)
+
+Source: `outputs/phase2_hybrid/run_8237240/` and `/scratch/kcwp264/logs/agentic-sfm/phase2_train_8237240.log`. Config: `configs/phase2_hybrid.yaml` (all three matchers exposed; group_size 4; 50 epochs; scenes 0015+0022 only — ScanNet was disabled in this run). The job ran ~31 h on 3×L40S (gpu023) after dynamic-port allocation fixed the vLLM startup collision that killed job 8235218.
+
+Training trajectory (from the log):
+
+| Metric | Epoch 0 | Best eval (ep 25) | Final (ep 50) |
+|---|---:|---:|---:|
+| Mean train reward | 0.847 | 1.324 | 1.643 |
+| In-training eval score | — | **0.608** | 0.450 |
+| Eval pose error | 3.70° (ep 4) | **2.62°** | 6.14° |
+| Eval registered fraction | 0.275 | **0.700** | 0.650 |
+| LoRA L2 distance from SFT init | 0 | 0.194 | 0.259 |
+
+Caveats:
+
+1. **The eval is not held out.** The in-training eval uses scenes 0015 and 0022, which are also the training scenes. Best-eval 0.608 is a training-set number.
+2. **Matcher collapse.** The policy issued zero MASt3R or VGGT calls across 50 epochs. The SFT warm start contained LoFTR-only trajectories, so matcher-token probability collapsed before RL; on-policy GRPO then never sampled the alternatives. `run_scene_grpo.py` now logs `scene/matcher_frac_{loftr,mast3r,vggt}` and `scene/matcher_fallback_pairs` per step/eval to make this visible.
+3. **Context overflow.** 129 episodes hit the 8,192-token vLLM cap. The Calder config raises `max_model_len` to 16,384.
+4. **Reward includes the +0.5 first-call bonus**; it is not a pure quality measure.
+
+### OPSFT-style constrained SFT
+
+Implementation of "On-Policy Parameter Update Direction Underlies Generalization in LLM Post-Training" (arXiv 2609.36659), adapted from full-parameter FP32 to **LoRA adapters under bf16** — an adaptation experiment, not a direct reproduction.
+
+What exists:
+
+- `src/agentic_sfm/opsft.py`: `canonical_lora_name`, `extract_direction` (exact-support or global top-k |Δθ|), `save_direction`/`load_direction`, `mask_gradients_` (pre-step: zero off-support grads and grads whose descent opposes `D`), `project_parameters_` (post-step: restore off-support params to θ0 and snap back wrong-direction movement), `fingerprint_state_dict`.
+- `scripts/run_sft_opsft.py`: `OPSFTTrainer(SFTTrainer)` — loads `init_adapter`, snapshots θ0, verifies direction coverage over every trainable adapter param, and applies stage-1 masking before grad clipping and stage-2 projection after `optimizer.step()` under `no_grad`.
+- `scripts/run_sft.py` gained no-op `_pre_optim_step`/`_post_optim_step` hooks (ordinary SFT unchanged).
+- `scripts/extract_update_direction.py`, `configs/phase2_sft_opsft.yaml`, `jobs/sft_opsft.slurm`, `docs/opsft.md`.
+
+Measured direction statistics (scene-SFT epoch-5 → hybrid run 8237240 epoch-50, 33,638,400 LoRA elements):
+
+| Artifact | Selected elements | Fraction |
+|---|---:|---:|
+| Exact support | 33,637,819 | 99.9983% |
+| Top-10% \|Δθ\| | 3,363,841 | 10.000% |
+
+**Dense-support caveat (measured):** under AdamW the LoRA update touches ~99.998% of elements, so `exact_support` leaves only the sign constraint binding. The top-k selection approximates the paper's sparse-update regime. Pre-extracted artifacts for run 8237240 (best_eval and epoch_50) are staged under `outputs/opsft/` and in the Calder bundle.
+
+No constrained-SFT results exist yet; both arms (from-base, continue) run inside `jobs/calder_8xh200_hybrid.slurm`.
+
 ## Known problems and invalid results
 
 This section lists what must not be cited.
@@ -268,8 +313,10 @@ This section lists what must not be cited.
 | Scene eval with 10 scenes (Section Phase 2) | Not a valid benchmark | Two training scenes, ScanNet scenes already used in design, direct success is an artefact, oracle is 5 pairs. |
 | Reward climb 0.374 → 0.496 (earlier README, W&B) | Not re-verified | Not reproduced in this snapshot. Omitted from results. |
 | Phase 1 reward 1.493 at step 200 | Verified in `grpo_hard_training_7969850.log`; step 200 is the last logged step | See Phase 1 section. Includes validity bonus; not comparable to LoFTR. |
-| Agent beats LoFTR or any baseline | Not supported | Phase 1 is worse than LoFTR and the oracle crop baseline on hard val. Phase 2 has no valid baseline comparison. |
+| Agent beats LoFTR or any baseline | Not supported | Phase 1 is worse than LoFTR and the oracle crop baseline on hard val. Phase 2 has no valid baseline comparison. The hybrid run never sampled MASt3R/VGGT, so it cannot support a routing claim either. |
+| "Hybrid routing works" | Not supported | Run 8237240 issued zero calls to MASt3R/VGGT (matcher collapse at SFT warm start). Routing benefit is unproven pending forced-exploration/mixed-trajectory fixes and a LoFTR-only control at identical budget. |
 | Phase 1 and Phase 2 "running" | Incorrect | Phase 1 was stopped at about step 200. Phase 2 training finished; its evaluation is not a valid benchmark. |
+| Phase-1 GRPO checkpoints (`outputs/phase1*/checkpoints/{best,best_eval,epoch_5,latest}`) | Untrusted | These were written byte-identical to their SFT init (a checkpoint persistence bug). Changed adapters exist only under `outputs/sgrpo_smoke/checkpoints/latest` and `outputs/phase2_hybrid/run_8237240/checkpoints/`. |
 | Hard-pair distribution figure (`results/figures/agentic_sfm_hardpairs_distribution.png`) | Provenance not checked | It may show the older build. Do not use it for pair counts. |
 
 ## Evaluation protocol (next)
@@ -319,7 +366,7 @@ cd /scratch/kcwp264/agentic-sfm
 /scratch/kcwp264/.conda_envs/agentic-sfm/bin/python -m pytest tests/ -q
 ```
 
-The suite has 325 tests. All 325 pass.
+The suite has 350 tests. All 350 pass.
 
 ### 3. Phase 0: zero-shot evaluation
 
@@ -364,7 +411,34 @@ sbatch jobs/eval_scene.slurm
 sbatch jobs/bench_pose_priors.slurm
 ```
 
-This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It has already been run as job 8213282, which completed in 27 minutes. Do not resubmit unless the first run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run` (see the script for its arguments).
+This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It has already been rerun as job 8235219 (52 minutes; the numbers in "Pose-prior study"). Do not resubmit unless the run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run` (see the script for its arguments).
+
+### 7. OPSFT constrained SFT
+
+```bash
+# Extract a direction artifact from an SFT→GRPO checkpoint pair
+python scripts/extract_update_direction.py \
+  --base outputs/scene_sft_graph_retry2/checkpoints/epoch_5 \
+  --trained outputs/phase2_hybrid/run_8237240/checkpoints/epoch_50 \
+  --selection topk --topk-frac 0.1 \
+  --output outputs/opsft/direction_scene_grpo.pt
+
+# Constrained SFT (auto-extracts if the artifact is missing)
+sbatch jobs/sft_opsft.slurm
+```
+
+See [`docs/opsft.md`](docs/opsft.md) for the mapping to the paper, the two experiment arms (from-base / continue), and known differences.
+
+### 8. Calder 8×H200 run
+
+```bash
+bash scripts/stage_for_calder.sh           # on Aire: build 2.4 GB bundle
+# rsync bundle to Calder (Leeds-internal), then on Calder:
+AGENTIC_SFM_ROOT=$HOME/agentic-sfm bash unpack_on_calder.sh
+sbatch jobs/calder_8xh200_hybrid.slurm
+```
+
+See [`docs/calder_h200_runbook.md`](docs/calder_h200_runbook.md) for the storage budget, GPU layout, and the E1–E10 experiment matrix.
 
 ## Repository layout
 
@@ -380,16 +454,21 @@ agentic-sfm/
 │   ├── tools/              # Tool client
 │   ├── constants.py
 │   ├── geometry.py
+│   ├── opsft.py            # OPSFT direction extraction + constraint enforcement
 │   ├── pose_prior.py       # Point-map → correspondences and relative pose (pose-prior study)
 │   ├── verl_agent_loop.py  # VeRL multi-turn agent loop (experimental)
 │   └── verl_reward.py      # VeRL reward hook (experimental)
 ├── tools_server/
 │   ├── server.py           # FastAPI tool server (match, crop, sfm_run, ...)
 │   └── sfm_worker.py       # sfm_run child process
-├── configs/                # Phase configs (phase0, phase1_*, phase2_*), VeRL overrides
+├── configs/                # Phase configs (phase0, phase1_*, phase2_* incl. OPSFT + Calder)
 ├── scripts/                # Training, evaluation, data, and benchmark entry points
 │   ├── freeze_scene_manifest.py   # builds and verifies the frozen scene manifest
 │   ├── bench_pose_priors.py       # equal-budget matcher benchmark
+│   ├── extract_update_direction.py  # OPSFT direction extraction CLI
+│   ├── run_sft_opsft.py             # constrained SFT trainer
+│   ├── stage_for_calder.sh          # Aire→Calder slim staging packager
+│   ├── calder_agentic_sfm_env.sh    # Calder H200 env helper
 │   ├── eval_scene.py, run_scene_grpo.py, run_grpo.py, run_pair_eval.py, ...
 ├── data/
 │   ├── frozen_eval_manifest.json  # 30 frozen ScanNet scenes, sha256 in file
@@ -398,9 +477,12 @@ agentic-sfm/
 │   ├── hard_pairs_val.json        # 153 pairs
 │   └── sft_*.jsonl                # SFT traces
 ├── docs/
-│   └── scene_eval_and_env_proposal.md   # evaluation protocol, audit, pose-prior design
-├── jobs/                   # Slurm launchers (AIRE L40S)
-├── tests/                  # 320 tests
+│   ├── scene_eval_and_env_proposal.md   # evaluation protocol, audit, pose-prior design
+│   ├── opsft.md                          # OPSFT constrained-SFT design + commands
+│   └── calder_h200_runbook.md            # Aire→Calder migration + experiment matrix
+├── paper/main.tex          # CVPR-style paper draft (self-contained LaTeX)
+├── jobs/                   # Slurm launchers (AIRE L40S + Calder H200)
+├── tests/                  # 350 tests
 ├── results/                # Bundled Phase 0 outputs and figures (see results/README.md)
 └── outputs/                # Run artifacts referenced above (eval JSON, checkpoints)
 ```
@@ -428,11 +510,15 @@ Research use of the components below is permitted under their stated terms. Comm
 
 ## Roadmap
 
-1. Run the VGGT confidence diagnostic (`jobs/diagnose_vggt_conf.slurm`, job 8214266, queued), then rerun the benchmark with a threshold chosen from it. MASt3R is now installed and its checkpoint is cached, so the rerun will measure it instead of skipping it. The paper does not list the excluded ScanNet scene IDs, so overlap with our frozen scenes stays unconfirmed until that is resolved.
-2. Add the SFT-only arm and equal-budget consecutive and random baselines to the held-out evaluation.
-3. Run the held-out scene evaluation on the frozen manifest, at least 30 scenes, using the protocol above.
-4. Run further RL only after the gates in the protocol pass.
-5. Correct the public project page: pair count, scene count, agent limits, and the Phase 1 and Phase 2 status.
+Publication target: CVPR 2027 (ICCV 2027 fallback). Working thesis: **learned, budget-aware orchestration over classical and feed-forward 3D specialists**.
+
+1. ~~Run the VGGT confidence diagnostic and rerun the matcher benchmark.~~ Done: `diagnose_vggt_conf` (job 8214266) lowered the VGGT confidence threshold to 3.0; benchmark rerun job 8235219 produced the pose-prior table above. VGGT train/test overlap with our ScanNet scenes remains unconfirmed.
+2. **Fix the matcher collapse** (the blocker for any routing claim): forced specialist exploration and/or mixed-specialist SFT trajectories; matcher-fraction telemetry already lands in `run_scene_grpo.py`.
+3. **Run the Calder 8×H200 matrix** (`jobs/calder_8xh200_hybrid.slurm`, `docs/calder_h200_runbook.md`): hybrid GRPO on the multi-domain curriculum, parallel OPSFT top-10%/exact arms, and automatic frozen-manifest eval — plus LoFTR-only and single-specialist controls at identical budget.
+4. **Run the held-out evaluation** on the 30-scene frozen manifest with equal-budget baselines (consecutive, random, top-k retrieval, direct, GT-overlap oracle, SFT-only, each fixed specialist) and scene-level paired bootstrap intervals.
+5. **OPSFT vs GRPO head-to-head** on the frozen manifest; report whether constrained SFT preserves the RL direction's gains.
+6. Write up: `paper/main.tex` is the working draft. Correct the public project page (pair count, scene count, agent limits, Phase 1/2 status) before any public claim.
+7. Fix phase-1 checkpoint persistence so written adapters are verified non-identical to init (see Known problems).
 
 ## Citation
 
