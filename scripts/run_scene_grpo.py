@@ -586,6 +586,22 @@ class SceneGRPOTrainer(GRPOTrainer):
         # Scene-level reward weights passed to run_scene_episode through
         # agent.reward_config. Keys match compute_scene_reward's kwargs.
         self._base_reward_config: dict[str, Any] = dict(config.get("reward", {}) or {})
+        rl_cfg = config.get("rl", {}) or {}
+        tools_cfg = config.get("tools", {}) or {}
+        self.matcher_explore_eps: float = float(rl_cfg.get("matcher_explore_eps", 0.0))
+        self.matcher_explore_decay_epochs: int = max(1, int(rl_cfg.get("matcher_explore_decay_epochs", 10)))
+        self.allowed_matchers: tuple[str, ...] = tuple(
+            str(m).lower()
+            for m in (tools_cfg.get("matchers") or ["loftr", "mast3r", "vggt", "mapanything"])
+        )
+        self._explore_rng = np.random.default_rng(int(config.get("seed", 42)))
+
+    def _current_matcher_explore_eps(self) -> float:
+        """Linearly decayed specialist exploration epsilon at ``self.current_epoch``."""
+        if self.matcher_explore_eps <= 0.0:
+            return 0.0
+        frac = max(0.0, 1.0 - float(self.current_epoch) / float(self.matcher_explore_decay_epochs))
+        return float(self.matcher_explore_eps * frac)
 
     # ------------------------------------------------------------------
     # Grouping / rollout collection
@@ -620,10 +636,18 @@ class SceneGRPOTrainer(GRPOTrainer):
         rollout_agent.reward_config = self._scheduled_reward_config()
         episodes: list[SceneRolloutEpisode] = []
         cgi_injections = 0
-        for scene in scenes:
+        cur_eps = self._current_matcher_explore_eps()
+        non_default_specialists = [m for m in self.allowed_matchers if m != DEFAULT_MATCHER]
+        for s_idx, scene in enumerate(scenes):
             group_episodes: list[SceneRolloutEpisode] = []
             all_failed = True
-            for _ in range(self.group_size):
+            for g_idx in range(self.group_size):
+                forced_m: str | None = None
+                if cur_eps > 0.0 and non_default_specialists and self.group_size >= 2:
+                    # Stratify at least one rollout slot per group onto a 3D specialist
+                    # so GRPO always observes specialist contrast inside the group.
+                    if g_idx == self.group_size - 1:
+                        forced_m = non_default_specialists[(self.current_epoch + s_idx) % len(non_default_specialists)]
                 ep = run_scene_episode(
                     agent=rollout_agent,
                     scene_id=scene["scene_id"],
@@ -635,6 +659,10 @@ class SceneGRPOTrainer(GRPOTrainer):
                     max_tool_calls=self.max_tool_calls,
                     max_turns=self.max_turns,
                     image_root=self.image_root,
+                    forced_specialist_matcher=forced_m,
+                    matcher_explore_eps=cur_eps,
+                    allowed_matchers=self.allowed_matchers,
+                    explore_rng=self._explore_rng,
                 )
                 group_episodes.append(ep)
                 if ep.reward > 0:
@@ -672,7 +700,7 @@ class SceneGRPOTrainer(GRPOTrainer):
                     )
 
             rewards = [e.reward for e in group_episodes]
-            grp_matchers = {"loftr": 0, "mast3r": 0, "vggt": 0}
+            grp_matchers = {"loftr": 0, "mast3r": 0, "vggt": 0, "mapanything": 0}
             for e in group_episodes:
                 for tc in getattr(e, "tool_calls", None) or []:
                     if tc.tool in ("build_initial_graph", "bridge_components",
@@ -768,7 +796,7 @@ class SceneGRPOTrainer(GRPOTrainer):
             for ep in episodes
         ]))
         # Specialist matcher selection telemetry across graph/pair/doppelganger tools
-        matcher_counts = {"loftr": 0, "mast3r": 0, "vggt": 0}
+        matcher_counts = {"loftr": 0, "mast3r": 0, "vggt": 0, "mapanything": 0}
         fallback_pairs = 0
         for ep in episodes:
             for tc in getattr(ep, "tool_calls", None) or []:
@@ -788,6 +816,7 @@ class SceneGRPOTrainer(GRPOTrainer):
             metrics[f"scene/matcher_calls_{m_name}"] = float(cnt)
             metrics[f"scene/matcher_frac_{m_name}"] = float(cnt) / float(total_m)
         metrics["scene/matcher_fallback_pairs"] = float(fallback_pairs)
+        metrics["scene/matcher_explore_eps"] = float(self._current_matcher_explore_eps())
         return metrics
 
     # ------------------------------------------------------------------
@@ -1005,6 +1034,12 @@ def main():
     parser.add_argument("--vllm-url", default="http://localhost:8000")
     parser.add_argument("--output-dir", default="outputs/phase2")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    parser.add_argument(
+        "--max-epochs-this-run",
+        type=int,
+        default=None,
+        help="Optional cap on epochs executed in this Slurm slice (saves latest/trainer_state.json for seamless resume).",
+    )
     args = parser.parse_args()
 
     import yaml
@@ -1168,8 +1203,14 @@ def main():
     active_dataset = train_dataset
     current_stage = -1
     global_step = trainer._global_step
+    end_epoch = total_epochs
+    if args.max_epochs_this_run is not None and args.max_epochs_this_run > 0:
+        end_epoch = min(total_epochs, start_epoch + int(args.max_epochs_this_run))
+        logger.info(
+            f"Bounded slice mode: running epochs [{start_epoch}, {end_epoch}) of {total_epochs}"
+        )
 
-    for epoch in range(start_epoch, total_epochs):
+    for epoch in range(start_epoch, end_epoch):
         trainer.current_epoch = epoch
 
         # Curriculum: re-filter the dataset at stage boundaries.

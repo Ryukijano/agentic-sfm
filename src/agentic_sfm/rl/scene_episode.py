@@ -458,10 +458,11 @@ Tools:
 - done {} -> end episode
 
 Matchers (the "matcher" argument of build_initial_graph, bridge_components and verify_doppelganger):
-- "loftr": dense detector-free matcher. Returns correspondences and an essential-matrix pose for every pair it can match.
+- "loftr": dense detector-free matcher (fast, ~0.06s/pair). Best on textured outdoor scenes.
 - "mast3r": 3D-aware matcher from a pretrained two-view reconstruction model. Returns correspondences and a pose.
-- "vggt": feed-forward multi-view geometry model. Its extrinsics prior is available for every pair, but on some pairs it yields few usable correspondences, and the backend can fall back to loftr.
-Each build_initial_graph summary reports matcher_requested, pairs_fallback (pairs that fell back to loftr because the requested matcher failed), pairs_zero_matches and median_inliers, so you can judge a matcher from its results.
+- "vggt": feed-forward multi-view geometry model. Its extrinsics prior is available for every pair, rescuing low-texture indoor pairs where LoFTR fails.
+- "mapanything": universal metric 3D reconstruction model (facebook/map-anything-apache). Predicts metric 3D point maps and camera poses across wide baselines.
+Each build_initial_graph summary reports matcher_requested, pairs_fallback (pairs that fell back to loftr because the requested matcher failed), pairs_zero_matches and median_inliers, so you can judge a matcher from its results and route to a 3D specialist ("vggt", "mast3r", or "mapanything") when LoFTR inliers are low or components split.
 
 Workflow:
 1. Always start by calling build_initial_graph to create the initial view graph.
@@ -582,6 +583,10 @@ def run_scene_episode(
     max_tool_calls: int = 20,
     max_turns: int = 30,
     image_root: str = "",
+    forced_specialist_matcher: str | None = None,
+    matcher_explore_eps: float = 0.0,
+    allowed_matchers: tuple[str, ...] = ("loftr", "mast3r", "vggt", "mapanything"),
+    explore_rng: np.random.Generator | None = None,
 ) -> SceneRolloutEpisode:
     """Run a scene-level SfM episode.
 
@@ -670,6 +675,30 @@ def run_scene_episode(
             continue
 
         num_tool_calls += 1
+        # Anti-collapse specialist exploration: when forced_specialist_matcher
+        # is provided for this rollout slot or with probability matcher_explore_eps,
+        # rewrite the matcher argument on matcher-accepting tools AND synchronize
+        # the assistant JSON text in ep.messages / ep.assistant_responses so GRPO
+        # computes policy-gradient updates on the actual explored specialist tokens.
+        if tc.tool in ("build_initial_graph", "bridge_components", "verify_doppelganger", "match"):
+            chosen_m: str | None = None
+            if forced_specialist_matcher:
+                chosen_m = str(forced_specialist_matcher).lower()
+                # Only force the primary graph-building call once unless random exploration triggers later
+                forced_specialist_matcher = None
+            elif matcher_explore_eps > 0.0 and allowed_matchers:
+                _rng = explore_rng if explore_rng is not None else np.random.default_rng()
+                if float(_rng.random()) < float(matcher_explore_eps):
+                    non_default = [m for m in allowed_matchers if m != str(tc.args.get("matcher", DEFAULT_MATCHER)).lower()]
+                    pool = non_default or list(allowed_matchers)
+                    chosen_m = str(pool[int(_rng.integers(0, len(pool)))]).lower()
+            if chosen_m:
+                tc.args = dict(tc.args or {})
+                tc.args["matcher"] = chosen_m
+                rewritten_json = json.dumps({"tool": tc.tool, "args": tc.args})
+                ep.assistant_responses[-1] = rewritten_json
+                ep.messages[-1]["content"] = rewritten_json
+
         ep.tool_calls.append(tc)
 
         if tc.tool == "done":

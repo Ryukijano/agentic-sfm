@@ -194,10 +194,20 @@ def keep_best_match(
     current: dict[str, Any] | None,
     candidate: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Keep the higher-quality match result."""
+    """Keep the higher-quality match result (strict floor over uncropped baseline)."""
     if candidate is None:
         return current
-    if match_quality(candidate) >= match_quality(current):
+    q_cand = match_quality(candidate)
+    q_curr = match_quality(current)
+    if (
+        current
+        and not current.get("cropped_image_id")
+        and candidate.get("cropped_image_id")
+    ):
+        if q_cand > q_curr:
+            return candidate
+        return current
+    if q_cand >= q_curr:
         return candidate
     return current
 

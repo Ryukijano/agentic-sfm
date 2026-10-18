@@ -209,6 +209,7 @@ class AgenticSfmAgentLoop(AgentLoopBase):
         response_mask: list[int] = []
 
         final_match_result: dict[str, Any] = {}
+        full_frame_baseline: dict[str, Any] | None = None
         num_tool_calls = 0
         num_valid_calls = 0
         num_invalid_calls = 0
@@ -280,6 +281,13 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             tool_results.append(result)
 
             if tc.tool in ("match", "crop_and_match") or result.get("pose") is not None:
+                if (
+                    tc.tool == "match"
+                    and not result.get("cropped_image_id")
+                    and not result.get("error")
+                    and full_frame_baseline is None
+                ):
+                    full_frame_baseline = result
                 kept = keep_best_match(final_match_result or None, result)
                 final_match_result = kept or result
             elif "match_result" in result:
@@ -366,6 +374,10 @@ class AgenticSfmAgentLoop(AgentLoopBase):
                 "ntep_intent_coef",
                 "ntep_redundancy_penalty",
                 "use_ntep_rewards",
+                "first_call_validity_weight",
+                "first_call_invalid_penalty",
+                "gate_geometry_on_validity",
+                "baseline_delta_weight",
             }
         }
         reward_components = compute_pair_reward(
@@ -376,6 +388,7 @@ class AgenticSfmAgentLoop(AgentLoopBase):
             num_valid_calls=num_valid_calls,
             tool_calls=tool_calls,
             tool_results=tool_results,
+            full_frame_baseline=full_frame_baseline,
             **reward_kwargs,
         )
         total_reward = float(reward_components.get("total_reward", 0.0))

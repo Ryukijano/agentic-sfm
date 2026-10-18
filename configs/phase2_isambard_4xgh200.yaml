@@ -1,0 +1,174 @@
+# Phase 2: Full agentic SfM with COLMAP + doppelganger tools — Isambard-AI Phase 2 (4x GH200).
+# Scene-level episodes with reconstruction-quality rewards and monotonic correspondence union.
+#
+# Hardware target: Isambard-AI Phase 2 single node (4x NVIDIA GH200 Grace Hopper Superchips,
+# 96 GB HBM3 per GPU, 288 Grace ARM64 CPU cores, aarch64 NGC PyTorch container).
+#
+# GPU layout (1 node, 4x GH200):
+#   * GPU 0   : vLLM rollout server (Qwen/Qwen3.5-2B, bf16, --max-model-len 16384)
+#   * GPU 1   : Tool server (LoFTR + MASt3R + VGGT-1B + pycolmap; Grace CPU COLMAP workers)
+#   * GPU 2,3 : run_scene_grpo.py (cuda:0 = GPU 2 trainable LoRA, cuda:1 = GPU 3 frozen KL anchor)
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  checkpoint: "outputs/scene_sft_mixed_specialists/checkpoints/epoch_5"
+  sft_adapter: "outputs/scene_sft_mixed_specialists/checkpoints/epoch_5"
+  kl_adapter: "outputs/scene_sft_mixed_specialists/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "custom"
+  group_size: 6
+  max_tool_calls: 20
+  max_turns: 30
+  temperature: 1.0
+  top_p: 0.95
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  sgrpo_cgi: true
+  matcher_explore_eps: 0.25
+  matcher_explore_decay_epochs: 10
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 20
+
+tools:
+  enabled: ["build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "bridge_components", "sfm_run", "inspect", "done"]
+  matchers: ["loftr", "mast3r", "vggt", "mapanything"]
+  sfm_backend: "colmap"
+
+reward:
+  registration_weight: 0.5
+  pose_weight: 1.0
+  baseline_delta_weight: 0.5
+  split_penalty: 0.5
+  doppelganger_weight: 0.3
+  allow_self_certified_doppelganger: false
+  graph_cost_weight: 0.2
+  tool_cost: 0.0
+  accumulative_tool_coef: 0.1
+  use_accumulative_tool_reward: true
+  format_weight: 0.0
+  invalid_penalty: 0.2
+  first_call_validity_weight: 0.0
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
+  use_ntep_rewards: false
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
+
+curriculum:
+  enabled: true
+  stages:
+    - epochs: 10
+      max_images: 12
+      scenes: ["0015", "0022", "scene0707_00", "scene0708_00", "scene0709_00", "scene0710_00"]
+    - epochs: 20
+      max_images: 20
+      scenes: ["0015", "0022", "scene0707_00", "scene0708_00", "scene0709_00", "scene0710_00", "scene0711_00", "scene0712_00", "scene0713_00", "scene0714_00", "scene0746_00", "scene0747_00", "scene0748_00", "scene0749_00", "scene0750_00", "scene0751_00", "scene0752_00", "scene0753_00"]
+    - epochs: 20
+      max_images: 20
+      scenes: null
+
+training:
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 200
+  total_epochs: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 5
+  eval_freq: 5
+  eval_num_scenes: 8
+  eval_min_registered_frac: 0.5
+  eval_max_pose_error_deg: 20.0
+  log_freq: 10
+  kl_coef: 0.03
+  kl_device: "cuda:1"
+  off_support_threshold: -9.0
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"
+
+rollout:
+  vllm_gpu: 0
+  matcher_gpu: 1
+  training_gpu: 2
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 4
+  batch_size: 1
+  min_p: 0.05
+  top_k: 50
+
+data:
+  scene_info_dir: "data/megadepth/scene_info_full/scene_info"
+  image_root: "data/megadepth/megadepth_test_1500"
+  scannet_root: "data/megadepth/scannet_test_1500/scannet_test_1500"
+  scannet_scene_ids:
+    - "scene0707_00"
+    - "scene0708_00"
+    - "scene0709_00"
+    - "scene0710_00"
+    - "scene0711_00"
+    - "scene0712_00"
+    - "scene0713_00"
+    - "scene0714_00"
+    - "scene0746_00"
+    - "scene0747_00"
+    - "scene0748_00"
+    - "scene0749_00"
+    - "scene0750_00"
+    - "scene0751_00"
+    - "scene0752_00"
+    - "scene0753_00"
+    - "scene0754_00"
+    - "scene0755_00"
+    - "scene0756_00"
+    - "scene0757_00"
+    - "scene0758_00"
+    - "scene0759_00"
+    - "scene0760_00"
+    - "scene0761_00"
+    - "scene0762_00"
+    - "scene0763_00"
+    - "scene0764_00"
+    - "scene0765_00"
+    - "scene0766_00"
+    - "scene0767_00"
+    - "scene0768_00"
+    - "scene0769_00"
+    - "scene0770_00"
+    - "scene0771_00"
+    - "scene0772_00"
+    - "scene0773_00"
+    - "scene0774_00"
+    - "scene0775_00"
+    - "scene0776_00"
+    - "scene0777_00"
+  val_scene_ids:
+    - "scene0770_00"
+    - "scene0771_00"
+    - "scene0772_00"
+    - "scene0773_00"
+    - "scene0774_00"
+    - "scene0775_00"
+    - "scene0776_00"
+    - "scene0777_00"
+  max_images_per_scene: 20
+  min_images_per_scene: 5
+  matcher: "loftr"
+  doppelganger_dataset: "data/doppelgangers"
+
+output:
+  checkpoint_dir: "outputs/phase2_isambard/checkpoints"
+  results_dir: "outputs/phase2_isambard"
+  log_dir: "logs/phase2_isambard"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-hybrid-grpo-isambard-4xgh200"

@@ -210,25 +210,166 @@ def _store_path(id_or_path: str) -> str | None:
     return None
 
 
-def _record_agent_match(
-    path_a: str, path_b: str, result: dict[str, Any], session: str = ""
+def _root_path_and_offset(image_id: str) -> tuple[str | None, tuple[float, float]]:
+    """Resolve an image id (or crop id / raw path) to its root full-frame path and (ox, oy) offset."""
+    meta = _CROP_META.get(image_id)
+    if meta is not None:
+        origin = meta.get("origin_xy", [0.0, 0.0])
+        ox, oy = float(origin[0]), float(origin[1])
+        parent_id = meta.get("parent_id")
+        if not parent_id and isinstance(image_id, str) and "_crop_" in image_id:
+            parent_id = image_id.split("_crop_")[0]
+        visited: set[str] = {image_id}
+        while parent_id and parent_id in _CROP_META and parent_id not in visited:
+            visited.add(parent_id)
+            pmeta = _CROP_META[parent_id]
+            parent_id = pmeta.get("parent_id")
+        root_path = _store_path(parent_id) if parent_id else None
+        return root_path, (ox, oy)
+    return _store_path(image_id), (0.0, 0.0)
+
+
+def _record_agent_match_union(
+    path_a: str,
+    path_b: str,
+    result: dict[str, Any],
+    session: str = "",
+    offset_a: tuple[float, float] | list[float] | None = None,
+    offset_b: tuple[float, float] | list[float] | None = None,
 ) -> None:
-    """Cache a match result's keypoints for later COLMAP import."""
+    """Remap crop keypoints to root full-frame coords and union-merge into ``_match_store``.
+
+    Correspondences are deduplicated at 0.1 px rounding so subsequent crop matches
+    monotonically grow (and never overwrite or shrink) the full-frame correspondence
+    set for an image pair.
+    """
     if not (result.get("keypoints_a") and result.get("keypoints_b")):
         return
+
+    resolved_a, meta_off_a = _root_path_and_offset(path_a)
+    resolved_b, meta_off_b = _root_path_and_offset(path_b)
+    actual_path_a = resolved_a or _CROP_META.get(path_a, {}).get("parent_id") or path_a
+    actual_path_b = resolved_b or _CROP_META.get(path_b, {}).get("parent_id") or path_b
+
+    if offset_a is not None:
+        ox_a, oy_a = float(offset_a[0]), float(offset_a[1])
+    elif result.get("offset_a") is not None:
+        ox_a, oy_a = float(result["offset_a"][0]), float(result["offset_a"][1])
+    else:
+        ox_a, oy_a = meta_off_a
+
+    if offset_b is not None:
+        ox_b, oy_b = float(offset_b[0]), float(offset_b[1])
+    elif result.get("offset_b") is not None:
+        ox_b, oy_b = float(result["offset_b"][0]), float(result["offset_b"][1])
+    else:
+        ox_b, oy_b = meta_off_b
+
+    raw_kpts_a = result["keypoints_a"]
+    raw_kpts_b = result["keypoints_b"]
+    n_pts = min(len(raw_kpts_a), len(raw_kpts_b))
+    if n_pts == 0:
+        return
+
+    shifted_a = [
+        [float(raw_kpts_a[i][0]) + ox_a, float(raw_kpts_a[i][1]) + oy_a]
+        for i in range(n_pts)
+    ]
+    shifted_b = [
+        [float(raw_kpts_b[i][0]) + ox_b, float(raw_kpts_b[i][1]) + oy_b]
+        for i in range(n_pts)
+    ]
+    raw_mask = list(result.get("inlier_mask") or [])
+
     sess = session or _DEFAULT_SESSION
     bucket = _match_store.setdefault(sess, OrderedDict())
     _match_store.move_to_end(sess)
     while len(_match_store) > _MATCH_STORE_MAX_SESSIONS:
         _match_store.popitem(last=False)
-    bucket[tuple(sorted((os.path.abspath(path_a), os.path.abspath(path_b))))] = {
-        "path_a": os.path.abspath(path_a),
-        "path_b": os.path.abspath(path_b),
-        "keypoints_a": result["keypoints_a"],
-        "keypoints_b": result["keypoints_b"],
-        "inlier_mask": result.get("inlier_mask") or [],
-        "matcher": result.get("matcher", "agent"),
-    }
+
+    abs_a = os.path.abspath(actual_path_a)
+    abs_b = os.path.abspath(actual_path_b)
+    key = tuple(sorted((abs_a, abs_b)))
+
+    existing = bucket.get(key)
+    if existing is None:
+        dedup_a: list[list[float]] = []
+        dedup_b: list[list[float]] = []
+        dedup_mask: list[bool] = []
+        seen: dict[tuple[float, float, float, float], int] = {}
+        has_mask = len(raw_mask) > 0
+        for i in range(n_pts):
+            ka, kb = shifted_a[i], shifted_b[i]
+            inl = bool(raw_mask[i]) if i < len(raw_mask) else True
+            ck = (round(ka[0], 1), round(ka[1], 1), round(kb[0], 1), round(kb[1], 1))
+            if ck not in seen:
+                seen[ck] = len(dedup_a)
+                dedup_a.append(ka)
+                dedup_b.append(kb)
+                if has_mask:
+                    dedup_mask.append(inl)
+            elif has_mask and inl:
+                dedup_mask[seen[ck]] = True
+        bucket[key] = {
+            "path_a": abs_a,
+            "path_b": abs_b,
+            "keypoints_a": dedup_a,
+            "keypoints_b": dedup_b,
+            "inlier_mask": dedup_mask if has_mask else [],
+            "matcher": result.get("matcher", "agent"),
+        }
+    else:
+        if abs_a == existing["path_b"] and abs_b == existing["path_a"] and abs_a != abs_b:
+            shifted_a, shifted_b = shifted_b, shifted_a
+        merged_a = list(existing["keypoints_a"])
+        merged_b = list(existing["keypoints_b"])
+        existing_mask = list(existing.get("inlier_mask") or [])
+        has_mask = bool(existing_mask) or bool(raw_mask)
+        if has_mask and len(existing_mask) < len(merged_a):
+            existing_mask.extend([True] * (len(merged_a) - len(existing_mask)))
+
+        seen = {}
+        for idx, (ka, kb) in enumerate(zip(merged_a, merged_b)):
+            ck = (
+                round(float(ka[0]), 1),
+                round(float(ka[1]), 1),
+                round(float(kb[0]), 1),
+                round(float(kb[1]), 1),
+            )
+            seen[ck] = idx
+
+        for i in range(n_pts):
+            ka, kb = shifted_a[i], shifted_b[i]
+            inl = bool(raw_mask[i]) if i < len(raw_mask) else True
+            ck = (round(ka[0], 1), round(ka[1], 1), round(kb[0], 1), round(kb[1], 1))
+            if ck not in seen:
+                seen[ck] = len(merged_a)
+                merged_a.append(ka)
+                merged_b.append(kb)
+                if has_mask:
+                    existing_mask.append(inl)
+            elif has_mask and inl:
+                existing_mask[seen[ck]] = True
+
+        existing["keypoints_a"] = merged_a
+        existing["keypoints_b"] = merged_b
+        existing["inlier_mask"] = existing_mask if has_mask else []
+        if result.get("matcher"):
+            existing["matcher"] = result["matcher"]
+
+
+def _record_agent_match(
+    path_a: str,
+    path_b: str,
+    result: dict[str, Any],
+    session: str = "",
+    offset_a: tuple[float, float] | list[float] | None = None,
+    offset_b: tuple[float, float] | list[float] | None = None,
+) -> None:
+    """Cache a match result's keypoints for later COLMAP import (monotonic union)."""
+    _record_agent_match_union(
+        path_a, path_b, result, session=session, offset_a=offset_a, offset_b=offset_b
+    )
 
 # Matcher weights are large; instantiate once per process (GRPO calls match every step).
 _LOFTR = None
@@ -295,6 +436,24 @@ def _get_vggt():
     _VGGT = VGGT.from_pretrained(ckpt).to(device).eval()
     logger.info("Cached VGGT on %s", device)
     return _VGGT
+
+
+_MAPANYTHING = None
+
+
+def _get_mapanything():
+    global _MAPANYTHING
+    if _MAPANYTHING is not None:
+        return _MAPANYTHING
+    try:
+        from mapanything.models import MapAnything
+    except ImportError:
+        raise ImportError("mapanything package not available")
+    device = _torch_device()
+    ckpt = os.environ.get("AGENTIC_SFM_MAPANYTHING_CKPT", "facebook/map-anything-apache")
+    _MAPANYTHING = MapAnything.from_pretrained(ckpt).to(device).eval()
+    logger.info("Cached MapAnything (%s) on %s", ckpt, device)
+    return _MAPANYTHING
 
 
 def register_image(image_id: str, path_or_array: str | np.ndarray) -> None:
@@ -381,7 +540,8 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
     parent = _CROP_META.get(image_id, {})
     ox = int(parent.get("origin_xy", [0, 0])[0]) + px1
     oy = int(parent.get("origin_xy", [0, 0])[1]) + py1
-    _CROP_META[new_id] = {"origin_xy": [ox, oy]}
+    parent_id = parent.get("parent_id", image_id)
+    _CROP_META[new_id] = {"origin_xy": [ox, oy], "parent_id": parent_id}
     crop_path = str(Path(tempfile.gettempdir()) / f"{new_id}.jpg")
     try:
         Image.fromarray(cropped).save(crop_path)
@@ -390,6 +550,7 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
     return {
         "cropped_image_id": new_id,
         "crop_id": new_id,
+        "parent_id": parent_id,
         "origin_xy": [ox, oy],
         "crop_size": [px2 - px1, py2 - py1],
         "bbox_normalized": [round(px1 / w, 3), round(py1 / h, 3),
@@ -399,7 +560,7 @@ def tool_crop(image_id: str, bbox: list[float]) -> dict[str, Any]:
     }
 
 
-_VALID_MATCHERS = ("loftr", "lightglue", "mast3r", "vggt")
+_VALID_MATCHERS = ("loftr", "lightglue", "mast3r", "vggt", "mapanything")
 
 
 def tool_match(
@@ -433,23 +594,31 @@ def tool_match(
         return {"error": str(e), "num_inliers": 0, "inlier_ratio": 0.0}
     kwargs = {"K_a": Ka, "K_b": Kb, "session": session}
 
-    # Resolve both images to real file paths for the agent-matches → COLMAP
-    # cache; entries stored as arrays (in-memory crops) have no path to key
-    # on, so they are skipped.
-    path_a = _store_path(image_a)
-    path_b = _store_path(image_b)
+    # Resolve both images (including crops) to root full-frame file paths for
+    # the agent-matches -> COLMAP correspondence union cache.
+    path_a, _off_a = _root_path_and_offset(image_a)
+    path_b, _off_b = _root_path_and_offset(image_b)
     if path_a and path_b and os.path.abspath(path_a) == os.path.abspath(path_b):
         return {"error": "image_a and image_b resolve to the same file — self-match is not informative"}
-    cache_pair = (path_a, path_b) if (path_a and path_b) else None
+    cache_pair = (
+        (image_a if image_a in _CROP_META else path_a),
+        (image_b if image_b in _CROP_META else path_b),
+    ) if (path_a and path_b) else None
 
     if matcher == "loftr":
-        return _match_loftr(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+        res = _match_loftr(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
     elif matcher == "lightglue":
-        return _match_lightglue(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+        res = _match_lightglue(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
     elif matcher == "vggt":
-        return _match_vggt(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+        res = _match_vggt(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+    elif matcher == "mapanything":
+        res = _match_mapanything(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
     else:
-        return _match_mast3r(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+        res = _match_mast3r(img_a, img_b, max_size, cache_pair=cache_pair, **kwargs)
+
+    if cache_pair is not None and not res.get("error"):
+        _record_agent_match_union(cache_pair[0], cache_pair[1], res, session=session)
+    return res
 
 
 def _match_loftr(
@@ -648,9 +817,16 @@ def _run_vggt_pair(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[
     original image dimensions.
     """
     import torchvision.transforms as TF
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
     model = _get_vggt()
+    try:
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    except ImportError:
+        def pose_encoding_to_extri_intri(pose_enc: torch.Tensor, image_size_hw: tuple[int, int]):
+            b, s, _ = pose_enc.shape
+            ext = torch.eye(4, dtype=pose_enc.dtype, device=pose_enc.device)[:3, :4].unsqueeze(0).unsqueeze(0).expand(b, s, 3, 4).clone()
+            intri = torch.eye(3, dtype=pose_enc.dtype, device=pose_enc.device).unsqueeze(0).unsqueeze(0).expand(b, s, 3, 3).clone()
+            return ext, intri
     device = _torch_device()
     to_tensor = TF.ToTensor()
 
@@ -858,6 +1034,169 @@ def _match_vggt(
 
     return _json_sanitize({
         "matcher": "vggt",
+        "num_matches": len(matches_a),
+        "num_matches_raw": num_matches_raw,
+        "num_inliers": pose_result["num_inliers"],
+        "pose": pose_result["pose"],
+        "inlier_ratio": pose_result["inlier_ratio"],
+        "mean_residual": pose_result.get("mean_inlier_residual"),
+        "residual_units": pose_result.get("residual_units"),
+        "keypoints_a": matches_a.tolist()[:100],
+        "keypoints_b": matches_b.tolist()[:100],
+        "inlier_mask": (pose_result.get("inlier_mask") or [])[:100],
+        "prior_pose": prior_pose,
+        "prior_confidence": prior_conf,
+        "pointmap_size": [int(Wa), int(Ha)],
+    })
+
+
+def _run_mapanything_pair(img_a: np.ndarray, img_b: np.ndarray, max_size: int) -> dict[str, Any]:
+    """Run MapAnything (facebook/map-anything-apache) on a two-view pair.
+
+    Returns the same point-map + confidence + extrinsics dictionary contract as
+    ``_run_vggt_pair`` so ``_match_mapanything`` shares the exact reciprocal-NN
+    and ``extrinsics_to_relative_pose`` pipeline.
+    """
+    import torchvision.transforms as TF
+
+    model = _get_mapanything()
+    device = _torch_device()
+    to_tensor = TF.ToTensor()
+
+    canvas = min(518, max_size - max_size % 14)
+    canvas = max(canvas, 14)
+
+    def _prep_arr(arr: np.ndarray) -> tuple[torch.Tensor, dict[str, float]]:
+        im = Image.fromarray(arr).convert("RGB")
+        w, h = im.size
+        scale = canvas / max(w, h)
+        new_w = min(canvas, max(14, round(w * scale / 14) * 14))
+        new_h = min(canvas, max(14, round(h * scale / 14) * 14))
+        sx = new_w / w
+        sy = new_h / h
+        im = im.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        pad_x = (canvas - new_w) // 2
+        pad_y = (canvas - new_h) // 2
+        sq = Image.new("RGB", (canvas, canvas), (0, 0, 0))
+        sq.paste(im, (pad_x, pad_y))
+        return to_tensor(sq), {
+            "scale": sx,
+            "scale_y": sy,
+            "pad_x": float(pad_x),
+            "pad_y": float(pad_y),
+        }
+
+    t_a, map_a = _prep_arr(img_a)
+    t_b, map_b = _prep_arr(img_b)
+    views = [{"img": t_a.unsqueeze(0).to(device)}, {"img": t_b.unsqueeze(0).to(device)}]
+    with torch.no_grad():
+        preds = model(views)
+
+    def _n(x: torch.Tensor) -> np.ndarray:
+        return x.detach().float().cpu().numpy()
+
+    p0, p1 = preds[0], preds[1]
+    pts_a = _n(p0["pts3d"][0]).astype(np.float32)
+    pts_b = _n(p1["pts3d"][0]).astype(np.float32)
+    conf_a = _n(p0.get("conf", torch.ones_like(p0["pts3d"][..., 0]))[0]).astype(np.float32)
+    conf_b = _n(p1.get("conf", torch.ones_like(p1["pts3d"][..., 0]))[0]).astype(np.float32)
+    ext_a = _n(p0.get("camera_poses", torch.eye(4).unsqueeze(0))[0])[:3, :4].astype(np.float64)
+    ext_b = _n(p1.get("camera_poses", torch.eye(4).unsqueeze(0))[0])[:3, :4].astype(np.float64)
+    return {
+        "points_a": pts_a,
+        "points_b": pts_b,
+        "conf_a": conf_a,
+        "conf_b": conf_b,
+        "ext_a": ext_a,
+        "ext_b": ext_b,
+        "map_a": map_a,
+        "map_b": map_b,
+    }
+
+
+def _match_mapanything(
+    img_a: np.ndarray, img_b: np.ndarray, max_size: int,
+    K_a=None, K_b=None, cache_pair: tuple[str, str] | None = None,
+    session: str = "",
+) -> dict[str, Any]:
+    """Match using MapAnything metric 3D point maps + camera pose prior."""
+    try:
+        out = _run_mapanything_pair(img_a, img_b, max_size)
+        from agentic_sfm.pose_prior import (
+            extrinsics_to_relative_pose,
+            reciprocal_nn_matches,
+        )
+    except Exception:
+        logger.warning("MapAnything not available, falling back to LoFTR")
+        res = _match_loftr(img_a, img_b, max_size, K_a=K_a, K_b=K_b,
+                           cache_pair=cache_pair, session=session)
+        res["matcher_fallback"] = "mapanything->loftr"
+        return res
+
+    conf_thr = float(os.environ.get("AGENTIC_SFM_MAPANYTHING_CONF_THRESHOLD", "1.5"))
+    max_pts = int(os.environ.get("AGENTIC_SFM_MAPANYTHING_MAX_POINTS", "20000"))
+    pts_a_pm, pts_b_pm = reciprocal_nn_matches(
+        out["points_a"], out["points_b"], out["conf_a"], out["conf_b"],
+        conf_threshold=conf_thr, dist_threshold=None, max_points=max_pts,
+    )
+
+    h_a, w_a = img_a.shape[:2]
+    h_b, w_b = img_b.shape[:2]
+    Ha, Wa = out["points_a"].shape[:2]
+    Hb, Wb = out["points_b"].shape[:2]
+    matches_a = pts_a_pm.astype(np.float64)
+    matches_b = pts_b_pm.astype(np.float64)
+    if len(matches_a):
+        map_a = out.get("map_a")
+        map_b = out.get("map_b")
+        if map_a and map_b:
+            matches_a[:, 0] = (matches_a[:, 0] - map_a["pad_x"]) / map_a["scale"]
+            matches_a[:, 1] = (matches_a[:, 1] - map_a["pad_y"]) / map_a.get("scale_y", map_a["scale"])
+            matches_b[:, 0] = (matches_b[:, 0] - map_b["pad_x"]) / map_b["scale"]
+            matches_b[:, 1] = (matches_b[:, 1] - map_b["pad_y"]) / map_b.get("scale_y", map_b["scale"])
+        else:
+            matches_a[:, 0] *= w_a / max(float(Wa), 1.0)
+            matches_a[:, 1] *= h_a / max(float(Ha), 1.0)
+            matches_b[:, 0] *= w_b / max(float(Wb), 1.0)
+            matches_b[:, 1] *= h_b / max(float(Hb), 1.0)
+
+    num_matches_raw = len(matches_a)
+    if num_matches_raw:
+        in_bounds = (
+            (matches_a[:, 0] >= 0) & (matches_a[:, 0] < w_a) &
+            (matches_a[:, 1] >= 0) & (matches_a[:, 1] < h_a) &
+            (matches_b[:, 0] >= 0) & (matches_b[:, 0] < w_b) &
+            (matches_b[:, 1] >= 0) & (matches_b[:, 1] < h_b)
+        )
+        matches_a = matches_a[in_bounds]
+        matches_b = matches_b[in_bounds]
+        pts_a_pm = pts_a_pm[in_bounds]
+        pts_b_pm = pts_b_pm[in_bounds]
+
+    pose_result = _estimate_pose_ransac(
+        matches_a, matches_b, (w_a, h_a), (w_b, h_b), K_a=K_a, K_b=K_b,
+    )
+    conf_vals = []
+    if len(pts_a_pm):
+        ia = np.clip(pts_a_pm.astype(int), [0, 0], [Wa - 1, Ha - 1])
+        ib = np.clip(pts_b_pm.astype(int), [0, 0], [Wb - 1, Hb - 1])
+        conf_vals = np.concatenate([
+            out["conf_a"][ia[:, 1], ia[:, 0]],
+            out["conf_b"][ib[:, 1], ib[:, 0]],
+        ])
+    prior_conf = float(np.mean(conf_vals)) if len(conf_vals) else None
+    prior_pose = extrinsics_to_relative_pose(out["ext_a"], out["ext_b"])
+
+    if cache_pair is not None:
+        _record_agent_match(cache_pair[0], cache_pair[1], {
+            "keypoints_a": matches_a.tolist(),
+            "keypoints_b": matches_b.tolist(),
+            "inlier_mask": pose_result.get("inlier_mask") or [],
+            "matcher": "mapanything",
+        }, session=session)
+
+    return _json_sanitize({
+        "matcher": "mapanything",
         "num_matches": len(matches_a),
         "num_matches_raw": num_matches_raw,
         "num_inliers": pose_result["num_inliers"],

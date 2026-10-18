@@ -274,6 +274,8 @@ def compute_pair_reward(
     first_call_validity_weight: float = 0.5,
     first_call_invalid_penalty: float = 1.0,
     gate_geometry_on_validity: bool = True,
+    full_frame_baseline: dict[str, Any] | None = None,
+    baseline_delta_weight: float = 0.0,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a pair-level matching episode.
@@ -330,17 +332,35 @@ def compute_pair_reward(
     ratio_term = min(inlier_ratio, 1.0)
     components["inlier_reward"] = inlier_weight * (0.5 * ratio_term + 0.5 * count_term)
 
+    current_pose_auc = 0.0
     if gt_pose is not None and match_result.get("pose") is not None:
         pred_R = np.array(match_result["pose"]["R"])
         pred_t = np.array(match_result["pose"]["t"])
         gt_R = np.array(gt_pose["R"])
         gt_t = np.array(gt_pose["t"])
         pe = compute_pose_error(pred_R, pred_t, gt_R, gt_t)
-        components["pose_reward"] = pose_weight * pose_auc_score(pe)
+        current_pose_auc = pose_auc_score(pe)
+        components["pose_reward"] = pose_weight * current_pose_auc
         components["rotation_error_deg"] = pe.rotation_error_deg
         components["translation_error_deg"] = pe.translation_error_deg
     else:
         components["pose_reward"] = 0.0
+
+    if full_frame_baseline is not None and gt_pose is not None and baseline_delta_weight > 0.0:
+        if full_frame_baseline.get("pose") is not None:
+            base_R = np.array(full_frame_baseline["pose"]["R"])
+            base_t = np.array(full_frame_baseline["pose"]["t"])
+            gt_R = np.array(gt_pose["R"])
+            gt_t = np.array(gt_pose["t"])
+            base_pe = compute_pose_error(base_R, base_t, gt_R, gt_t)
+            base_pose_auc = pose_auc_score(base_pe)
+        else:
+            base_pose_auc = 0.0
+        components["baseline_delta_reward"] = float(
+            baseline_delta_weight * max(0.0, current_pose_auc - base_pose_auc)
+        )
+    else:
+        components["baseline_delta_reward"] = 0.0
 
     if use_accumulative_tool_reward:
         # PyVision-RL: reward tool calls only when outcome is correct.
@@ -374,6 +394,7 @@ def compute_pair_reward(
     if gate_geometry_on_validity and first_valid is False:
         components["inlier_reward"] = 0.0
         components["pose_reward"] = 0.0
+        components["baseline_delta_reward"] = 0.0
         components["accumulative_tool_reward"] = 0.0
         components["tool_cost"] = 0.0
         components["validity_gated"] = True

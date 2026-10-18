@@ -674,6 +674,47 @@ def _synth_sfm_result(
 # Oracle trajectory
 # ---------------------------------------------------------------------------
 
+SPECIALIST_MATCHERS: tuple[str, ...] = ("loftr", "mast3r", "vggt", "mapanything")
+HEAVY_3D_SPECIALISTS: tuple[str, ...] = ("vggt", "mast3r", "mapanything")
+
+
+def select_diagnostic_specialist_matcher(
+    scene_id: str,
+    median_overlap: float,
+    ep_idx: int,
+    rng: np.random.Generator,
+    requested_matcher: str = "mixed",
+    stage: str = "initial",
+) -> str:
+    """Diagnostic-conditioned specialist router for SFT trajectory generation.
+
+    Prevents the 100% LoFTR warm-start collapse observed in run 8237240:
+      - If ``requested_matcher`` is an explicit specialist name (not ``"mixed"``),
+        returns ``requested_matcher`` directly for backwards compatibility.
+      - When ``requested_matcher == "mixed"``:
+        * On ``stage == "bridge"`` (repairing disconnected components where the
+          initial graph left a gap), escalates to a 3D specialist
+          (``"vggt"``, ``"mast3r"``, or ``"mapanything"``).
+        * On indoor/low-texture ScanNet scenes (``scene_id`` starting with
+          ``"scene"``) or low covisibility (``median_overlap < 0.22``), favors
+          feed-forward 3D priors (``"vggt"``, ``"mast3r"``, ``"mapanything"``).
+        * Otherwise stratifies across ``SPECIALIST_MATCHERS`` using ``ep_idx``
+          so every specialist has non-zero probability mass at the SFT warm start.
+    """
+    req = str(requested_matcher or DEFAULT_MATCHER).lower()
+    if req != "mixed":
+        return req
+    if stage == "bridge":
+        return str(HEAVY_3D_SPECIALISTS[(ep_idx + int(rng.integers(0, len(HEAVY_3D_SPECIALISTS)))) % len(HEAVY_3D_SPECIALISTS)])
+    is_indoor = str(scene_id).lower().startswith("scene")
+    if is_indoor or median_overlap < 0.22:
+        return str(HEAVY_3D_SPECIALISTS[ep_idx % len(HEAVY_3D_SPECIALISTS)])
+    # Stratified rotation across all 4 matchers with 40% LoFTR, 20% each 3D specialist
+    slot = ep_idx % 5
+    if slot in (0, 1):
+        return "loftr"
+    return str(HEAVY_3D_SPECIALISTS[(slot - 2) % len(HEAVY_3D_SPECIALISTS)])
+
 
 def build_oracle_episode(
     scene: dict[str, Any],
@@ -763,8 +804,27 @@ def build_oracle_episode(
             edge_ok[i, j] = edge_ok[j, i] = True
 
     cand_list = list(cand_pairs)
+    pos_overlaps = [float(sub_om[i, j]) for i, j in cand_list if sub_om[i, j] > 0]
+    median_overlap = float(np.median(pos_overlaps)) if pos_overlaps else 0.0
+    init_matcher = select_diagnostic_specialist_matcher(
+        scene_id=scene_id,
+        median_overlap=median_overlap,
+        ep_idx=ep_idx,
+        rng=rng,
+        requested_matcher=matcher,
+        stage="initial",
+    )
+    bridge_matcher = select_diagnostic_specialist_matcher(
+        scene_id=scene_id,
+        median_overlap=median_overlap,
+        ep_idx=ep_idx,
+        rng=rng,
+        requested_matcher=matcher,
+        stage="bridge",
+    )
     init_res = _synth_initial_graph_result(n, cand_list, list(verified_pairs), edge_ok, rng)
-    _emit("build_initial_graph", {"k_neighbors": k_neighbors, "matcher": matcher}, init_res)
+    init_res["matcher_requested"] = init_matcher
+    _emit("build_initial_graph", {"k_neighbors": k_neighbors, "matcher": init_matcher}, init_res)
 
     # ---- 2. inspect_graph ------------------------------------------------
     suspicious = [doppel_ij] if (run_doppel_check and doppel_ij is not None and (min(doppel_ij), max(doppel_ij)) in verified_pairs) else []
@@ -817,7 +877,7 @@ def build_oracle_episode(
                 verified_pairs.add((bu, bv))
                 edge_ok[bu, bv] = edge_ok[bv, bu] = True
                 b_res = _synth_bridge_components_result(0, 1, [[ids[bu], ids[bv]]], verified_pairs, n, ids)
-                _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": matcher}, b_res)
+                _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": bridge_matcher}, b_res)
 
     # ---- 5. sfm_run ------------------------------------------------------
     out_dir = f"{output_base}/{scene_id}_ep{ep_idx:04d}/sparse/0"
@@ -840,7 +900,7 @@ def build_oracle_episode(
                 break
         if added:
             b_res = _synth_bridge_components_result(0, 1, [[ids[i], ids[j]]], verified_pairs, n, ids)
-            _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 2, "matcher": matcher}, b_res)
+            _emit("bridge_components", {"comp_a_id": 0, "comp_b_id": 1, "budget": 2, "matcher": bridge_matcher}, b_res)
             recon = _synth_sfm_result(
                 scene, sub_om, flagged_keys, ids, num_checks, rng, out_dir,
                 stragglers=0, active_edge_count=len(verified_pairs),
@@ -1016,6 +1076,7 @@ def main() -> None:
 
     # Summary sidecar, mirroring build_oracle_sft.py's oracle_sft_summary.json.
     tool_hist: dict[str, int] = {}
+    matcher_hist: dict[str, int] = {}
     n_flagged = 0
     for ex in examples:
         seen_flag = False
@@ -1028,6 +1089,10 @@ def main() -> None:
                 continue
             tool = call.get("tool", "?")
             tool_hist[tool] = tool_hist.get(tool, 0) + 1
+            args_dict = call.get("args") or {}
+            if isinstance(args_dict, dict) and "matcher" in args_dict:
+                m_name = str(args_dict["matcher"]).lower()
+                matcher_hist[m_name] = matcher_hist.get(m_name, 0) + 1
             if tool == "verify_doppelganger":
                 seen_flag = True
         n_flagged += int(seen_flag)
@@ -1036,6 +1101,7 @@ def main() -> None:
         "num_episodes": len(examples),
         "scenes": sorted({ex["scene_id"] for ex in examples}),
         "tool_histogram": tool_hist,
+        "matcher_histogram": matcher_hist,
         "episodes_with_doppelganger_verification": n_flagged,
         "mean_images": float(np.mean([ex["num_images"] for ex in examples])) if examples else 0.0,
         "mean_reward": float(np.mean([ex["reward"] for ex in examples])) if examples else 0.0,

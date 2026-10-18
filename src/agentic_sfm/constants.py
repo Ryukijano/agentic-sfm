@@ -46,6 +46,8 @@ REWARD_TOTAL_KEYS = (
     "ntep_redundancy_penalty",
     # First-call validity gate — the policy's most controllable decision
     "first_call_validity_reward",
+    # Monotonic baseline improvement reward (0 unless baseline_delta_weight > 0)
+    "baseline_delta_reward",
 )
 
 
