@@ -53,18 +53,35 @@ tools:
   sfm_backend: "colmap"
 
 reward:
+  # --- Reconstruction-first 4-pillar stack (docs/reconstruction_losses.md) ---
+  # Camera trajectory: coverage-coupled rotation reward + all-pairs mAA + ATE.
   registration_weight: 0.5   # fraction of images registered
-  pose_weight: 1.0           # mean pose error (1 - err/20)
+  pose_weight: 1.0           # mean pose error (1 - err/20), coverage-coupled
+  all_pairs_maa_weight: 0.4  # all-pairs relative-pose mAA (unregistered -> 180 deg)
+  ate_weight: 0.2            # Sim(3)-aligned camera-centre ATE
+  # Intrinsic bundle quality (no GT needed): track-conditioned BA reproj +
+  # Fiedler lambda2 + 3-cycle rotation consistency.
+  ba_weight: 0.3
+  # 3D geometry vs GT: voxel-normalized Chamfer F1@10cm + projected
+  # log-depth/depth-gradient consistency on ScanNet depth (skipped on
+  # MegaDepth, which ships poses only — per-scene GRPO groups make the
+  # cross-dataset reward-scale difference safe).
+  pointcloud_f1_weight: 0.25
+  depth_weight: 0.25
+  # Visual 3D model loss: orthographic BEV/front/side occupancy IoU + RGB/depth
+  # consistency of the rendered model vs the GT cloud (doppelganger-fold killer).
+  visual_3d_weight: 0.3
+  # --- Non-reconstruction terms ---
   split_penalty: 0.5         # penalty when 0 images registered
   doppelganger_weight: 0.3   # F1 of pruned edges vs GT-derived impostors
   allow_self_certified_doppelganger: false
   graph_cost_weight: 0.2
   tool_cost: 0.0             # legacy (disabled)
-  accumulative_tool_coef: 0.1
+  accumulative_tool_coef: 0.1  # small tie-breaker, paid only when outcome-correct
   use_accumulative_tool_reward: true
   format_weight: 0.1
   invalid_penalty: 0.2
-  first_call_validity_weight: 0.5
+  first_call_validity_weight: 0.0   # dropped per R1+: validity gate + penalty remain
   first_call_invalid_penalty: 1.0
   gate_geometry_on_validity: true
   use_ntep_rewards: false

@@ -123,7 +123,7 @@ def _subsample_scene(scene: dict[str, Any], max_images: int) -> dict[str, Any]:
             new[key] = [val[i] for i in pos]
     gt = scene.get("gt_recon")
     if isinstance(gt, dict) and isinstance(gt.get("poses"), dict):
-        new["gt_recon"] = {
+        new_gt = {
             **gt,
             "num_images": len(pos),
             "poses": {
@@ -132,6 +132,21 @@ def _subsample_scene(scene: dict[str, Any], max_images: int) -> dict[str, Any]:
                 if str(i) in gt["poses"]
             },
         }
+        # Remap per-position lists nested inside gt_recon (ScanNet depth
+        # paths / per-frame intrinsics) so they stay aligned with the
+        # subsampled image order. gt_points3d/gt_colors are frame-pooled
+        # clouds and do not need remapping.
+        for key in ("depth_paths", "pose_paths", "frame_ids", "intrinsics"):
+            val = gt.get(key)
+            if isinstance(val, (list, tuple)) and len(val) == n:
+                new_gt[key] = [val[i] for i in pos]
+            elif isinstance(val, dict):
+                new_gt[key] = {
+                    str(j): val[str(i)]
+                    for j, i in enumerate(pos)
+                    if str(i) in val
+                }
+        new["gt_recon"] = new_gt
     return new
 
 
@@ -276,6 +291,28 @@ def _load_scannet_scene(scene_dir: Path,
         for j, i in enumerate(indices)
     }
 
+    # Dense GT point cloud + per-position depth paths / depth intrinsics so
+    # _inject_pose_error can score point-cloud F1, orthographic visual loss,
+    # and projected-depth consistency.  The cloud is unprojected only from
+    # the frames this episode sampled (frame_stems) — surfaces no episode
+    # camera could see are not counted against recall.  k_depth (not
+    # k_color) is the correct K for projecting into 480x640 depth pixels.
+    gt_pts = np.zeros((0, 3))
+    gt_cols = np.zeros((0, 3))
+    if depth_dir.is_dir() and (intrinsic_dir / "intrinsic_depth.txt").exists():
+        try:
+            from agentic_sfm.eval.viz import gt_pointcloud_arrays
+
+            gt_pts, gt_cols, _ = gt_pointcloud_arrays(
+                depth_dir, color_dir, pose_dir,
+                intrinsic_dir / "intrinsic_depth.txt",
+                max_points=80000,
+                frame_stems={str(frames[i][0]) for i in indices},
+            )
+        except Exception as e:
+            logger.warning(f"GT cloud build failed for {scene_dir.name}: {e}")
+    k_depth3 = k_depth[:3, :3].tolist() if k_depth is not None else None
+
     return {
         "scene_id": scene_dir.name,
         "dataset": "scannet",
@@ -295,6 +332,12 @@ def _load_scannet_scene(scene_dir: Path,
         "gt_recon": {
             "num_images": len(image_paths),
             "poses": gt_poses,
+            "depth_paths": depth_paths,
+            "intrinsics": (
+                [k_depth3] * len(image_paths) if k_depth3 is not None else None
+            ),
+            "gt_points3d": gt_pts,
+            "gt_colors": gt_cols,
         },
     }
 
@@ -614,12 +657,17 @@ class SceneGRPOTrainer(GRPOTrainer):
         """Reward config for the current ``_global_step`` under the schedule.
 
         Mirrors the pair-level dynamic schedule: during warmup
-        (``_global_step < reward_warmup_steps``) the pose term is scaled down
-        so registration/format signal dominates while the policy is cold.
+        (``_global_step < reward_warmup_steps``) the geometric reconstruction
+        terms are scaled down so registration/format signal dominates while
+        the policy is cold.  The whole reconstruction pillar scales together
+        so the intended relative balance is preserved.
         """
         cfg = dict(self._base_reward_config)
         if self.reward_schedule == "dynamic" and self._global_step < self.reward_warmup_steps:
-            cfg["pose_weight"] = cfg.get("pose_weight", 1.0) * (1.0 / 3.0)
+            for k in ("pose_weight", "all_pairs_maa_weight", "ate_weight",
+                      "ba_weight", "pointcloud_f1_weight", "depth_weight",
+                      "visual_3d_weight"):
+                cfg[k] = cfg.get(k, 1.0) * (1.0 / 3.0)
         return cfg
 
     def collect_scene_rollouts(

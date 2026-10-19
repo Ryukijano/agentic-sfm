@@ -270,6 +270,7 @@ def gt_pointcloud_arrays(
     max_points: int = 200000,
     max_depth: float = 10.0,
     depth_scale: float = 1000.0,
+    frame_stems: set[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Back-project RGB-D frames into a world-frame coloured point cloud.
 
@@ -288,6 +289,10 @@ def gt_pointcloud_arrays(
     Returns ``(points (N,3) float64, colours (N,3) float64 in [0,1],
     camera_centres (M,3))``.  ``points`` is randomly subsampled to
     ``max_points``; frames are sub-strided so the budget is spread evenly.
+
+    ``frame_stems`` optionally restricts unprojection to the given colour
+    frame stems (e.g. only the frames an episode actually sampled), so the
+    GT cloud covers only the surfaces the episode cameras could see.
     """
     depth_dir = Path(depth_dir)
     color_dir = Path(color_dir)
@@ -323,6 +328,8 @@ def gt_pointcloud_arrays(
     for img in sorted(color_dir.glob("*.jpg"),
                       key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
         stem = img.stem
+        if frame_stems is not None and stem not in frame_stems:
+            continue
         d_path, p_path = depth_dir / f"{stem}.png", pose_dir / f"{stem}.txt"
         if d_path.exists() and p_path.exists():
             frames.append((img, d_path, p_path))
