@@ -429,6 +429,12 @@ def compute_scene_reward(
     first_call_invalid_penalty: float = 1.0,
     gate_geometry_on_validity: bool = True,
     allow_self_certified_doppelganger: bool = False,
+    ba_weight: float = 0.0,
+    all_pairs_maa_weight: float = 0.0,
+    ate_weight: float = 0.0,
+    pointcloud_f1_weight: float = 0.0,
+    depth_weight: float = 0.0,
+    visual_3d_weight: float = 0.0,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Compute reward for a scene-level SfM episode.
@@ -528,9 +534,29 @@ def compute_scene_reward(
         components["doppelganger_reward"] = 0.0
         components["doppelganger_scored"] = False
 
+    # Mathematical + Visual 3D reconstruction loss rewards (0.0 unless weights > 0)
+    components["intrinsic_ba_reward"] = ba_weight * float(recon_result.get("intrinsic_ba_reward") or 0.0)
+    components["all_pairs_maa_reward"] = all_pairs_maa_weight * float(recon_result.get("all_pairs_maa") or 0.0)
+    components["ate_reward"] = ate_weight * float(recon_result.get("ate_reward") or 0.0)
+    components["pointcloud_f1_reward"] = pointcloud_f1_weight * float(recon_result.get("f1_3d") or 0.0)
+    components["depth_consistency_reward"] = depth_weight * float(recon_result.get("depth_consistency_reward") or 0.0)
+
+    vis_3d = recon_result.get("visual_3d_reward")
+    if vis_3d is None:
+        vis_terms = [
+            float(recon_result[k])
+            for k in ("ortho_visual_reward", "splat_visual_reward", "patch_consistency_reward")
+            if recon_result.get(k) is not None
+        ]
+        vis_3d = sum(vis_terms) / len(vis_terms) if vis_terms else 0.0
+    components["visual_3d_reward"] = visual_3d_weight * float(vis_3d or 0.0)
+
     # Accumulative tool reward (replaces per-call penalty)
     if use_accumulative_tool_reward:
-        outcome_correct = float(components["pose_reward"]) > pose_weight * 0.5
+        outcome_correct = (
+            float(components["pose_reward"]) > pose_weight * 0.5
+            or float(components["all_pairs_maa_reward"]) > all_pairs_maa_weight * 0.5 > 0.0
+        )
         components["accumulative_tool_reward"] = (
             accumulative_tool_coef * num_valid_calls * (1.0 if outcome_correct else 0.0)
         )
@@ -555,6 +581,12 @@ def compute_scene_reward(
         components["doppelganger_reward"] = 0.0
         components["tool_cost"] = 0.0
         components["graph_cost"] = 0.0
+        components["intrinsic_ba_reward"] = 0.0
+        components["all_pairs_maa_reward"] = 0.0
+        components["ate_reward"] = 0.0
+        components["pointcloud_f1_reward"] = 0.0
+        components["depth_consistency_reward"] = 0.0
+        components["visual_3d_reward"] = 0.0
         components["validity_gated"] = True
     else:
         components["validity_gated"] = False
@@ -570,6 +602,12 @@ def compute_scene_reward(
         + components["ntep_redundancy_penalty"]
         + components["first_call_validity_reward"]
         + components["graph_cost"]
+        + components["intrinsic_ba_reward"]
+        + components["all_pairs_maa_reward"]
+        + components["ate_reward"]
+        + components["pointcloud_f1_reward"]
+        + components["depth_consistency_reward"]
+        + components["visual_3d_reward"]
     )
     return components
 

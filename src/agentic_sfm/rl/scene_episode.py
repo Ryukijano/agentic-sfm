@@ -438,6 +438,66 @@ def _inject_pose_error(
         if errs:
             recon["mean_pose_error_deg"] = float(np.mean(errs))
             recon["num_poses_evaluated"] = len(matched)
+
+        # Inject mathematical + visual 3D reconstruction metrics
+        from agentic_sfm.rewards.reconstruction_loss import (
+            align_poses_and_points_sim3,
+            compute_all_pairs_pose_maa,
+            compute_intrinsic_ba_metrics,
+            compute_orthographic_3d_render_loss,
+            compute_pointcloud_f1,
+            compute_projected_depth_loss,
+            extract_colmap_point_arrays,
+        )
+
+        n_total_imgs = max(int(ep.num_images or 0), len(gt_poses))
+        maa_info = compute_all_pairs_pose_maa(
+            pred_poses, gt_poses, num_total_images=n_total_imgs
+        )
+        recon.update(maa_info)
+
+        pts3d = np.zeros((0, 3))
+        cols3d = np.zeros((0, 3))
+        try:
+            colmap_arrays = extract_colmap_point_arrays(str(output_dir))
+            pts3d = colmap_arrays["points3d"]
+            cols3d = colmap_arrays["colors"]
+            ba_info = compute_intrinsic_ba_metrics(
+                colmap_arrays["reproj_errors"],
+                colmap_arrays["track_lengths"],
+            )
+            recon.update(ba_info)
+        except Exception:
+            pass
+
+        sim3_info = align_poses_and_points_sim3(pred_poses, gt_poses, points3d=pts3d)
+        for k in ("mean_ate_m", "normalized_ate", "ate_reward"):
+            if sim3_info.get(k) is not None:
+                recon[k] = sim3_info[k]
+        aligned_pts = sim3_info["aligned_points3d"]
+
+        gt_pts = gt_recon.get("gt_points3d")
+        gt_cols = gt_recon.get("gt_colors")
+        if gt_pts is not None and len(aligned_pts) > 0:
+            f1_info = compute_pointcloud_f1(aligned_pts, np.asarray(gt_pts))
+            recon.update(f1_info)
+            ortho_info = compute_orthographic_3d_render_loss(
+                aligned_pts, cols3d, np.asarray(gt_pts),
+                np.asarray(gt_cols) if gt_cols is not None else np.full_like(np.asarray(gt_pts), 0.7),
+            )
+            recon.update(ortho_info)
+
+        depth_maps = gt_recon.get("depth_maps") or gt_recon.get("depth_paths")
+        intrinsics = gt_recon.get("intrinsics")
+        if depth_maps and intrinsics is not None and len(aligned_pts) > 0:
+            if isinstance(depth_maps, (list, tuple)):
+                depth_dict = {i: p for i, p in enumerate(depth_maps) if p}
+            else:
+                depth_dict = {int(k): v for k, v in depth_maps.items() if str(k).isdigit()}
+            depth_info = compute_projected_depth_loss(
+                aligned_pts, gt_poses, intrinsics, depth_dict
+            )
+            recon.update(depth_info)
     except Exception as e:
         logger.debug(f"Pose-error injection skipped: {e}")
 
@@ -569,6 +629,12 @@ def _scene_reward_kwargs(agent: Any) -> dict[str, Any]:
         "allow_self_certified_doppelganger": cfg.get(
             "allow_self_certified_doppelganger", False
         ),
+        "ba_weight": cfg.get("ba_weight", 0.0),
+        "all_pairs_maa_weight": cfg.get("all_pairs_maa_weight", 0.0),
+        "ate_weight": cfg.get("ate_weight", 0.0),
+        "pointcloud_f1_weight": cfg.get("pointcloud_f1_weight", 0.0),
+        "depth_weight": cfg.get("depth_weight", 0.0),
+        "visual_3d_weight": cfg.get("visual_3d_weight", 0.0),
     }
 
 
