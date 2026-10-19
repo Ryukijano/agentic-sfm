@@ -1,0 +1,116 @@
+# Smoke config: same stack as phase2_calder_8xh200.yaml but tiny —
+# 1 epoch on 2 scenes, group_size 2, no OPSFT arms, eval skipped.
+# Purpose: verify vLLM + tool server + fused kernels + W&B + new reward
+# plumbing end-to-end on real GPUs before burning a whole 8xH200 node.
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  checkpoint: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  sft_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  kl_adapter: "outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+rl:
+  algorithm: "grpo"
+  framework: "custom"
+  group_size: 2           # minimum GRPO group (needs variance)
+  max_tool_calls: 20
+  max_turns: 30
+  temperature: 1.0
+  top_p: 0.95
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling: true
+  sgrpo_cgi: true
+  reward_schedule: "dynamic"
+  reward_warmup_steps: 20
+
+tools:
+  enabled: ["build_initial_graph", "inspect_graph", "verify_doppelganger", "prune_edges", "bridge_components", "sfm_run", "inspect", "done"]
+  matchers: ["loftr", "mast3r", "vggt"]
+  sfm_backend: "colmap"
+
+reward:
+  registration_weight: 0.5
+  pose_weight: 1.0
+  all_pairs_maa_weight: 0.4
+  ate_weight: 0.2
+  ba_weight: 0.3
+  pointcloud_f1_weight: 0.25
+  depth_weight: 0.25
+  visual_3d_weight: 0.3
+  split_penalty: 0.5
+  doppelganger_weight: 0.3
+  allow_self_certified_doppelganger: false
+  graph_cost_weight: 0.2
+  tool_cost: 0.0
+  accumulative_tool_coef: 0.1
+  use_accumulative_tool_reward: true
+  format_weight: 0.1
+  invalid_penalty: 0.2
+  first_call_validity_weight: 0.0
+  first_call_invalid_penalty: 1.0
+  gate_geometry_on_validity: true
+  use_ntep_rewards: false
+  ntep_intent_coef: 0.05
+  ntep_redundancy_penalty: 0.05
+
+curriculum:
+  enabled: false          # single stage: fixed 12-image scenes
+  stages:
+    - epochs: 1
+      max_images: 12
+      scenes: null
+
+training:
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 200
+  total_epochs: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  save_freq: 1
+  eval_freq: 999          # no eval during smoke
+  eval_num_scenes: 0
+  log_freq: 1
+  kl_coef: 0.03
+  kl_device: "cpu"        # only 3 GPUs in smoke; KL anchor on CPU like L40S run
+  off_support_threshold: -9.0
+  on_policy_reload: true
+  lora_staging_dir: "/dev/shm"
+
+rollout:
+  vllm_gpu: 0
+  training_gpu: 2
+  matcher_gpu: 1
+  vllm_port: 8000
+  tool_server_port: 8765
+  num_rollout_workers: 1
+  batch_size: 1
+  min_p: 0.05
+  top_k: 50
+
+data:
+  scene_info_dir: "data/megadepth/scene_info_full/scene_info"
+  image_root: "data/megadepth/megadepth_test_1500"
+  scannet_root: "data/megadepth/scannet_test_1500/scannet_test_1500"
+  # 1 MegaDepth + 1 ScanNet scene — covers both dataset paths end-to-end.
+  scannet_scene_ids: ["scene0710_00"]
+  val_scene_ids: []
+  max_images_per_scene: 12
+  min_images_per_scene: 5
+  matcher: "loftr"
+  doppelganger_dataset: "data/doppelgangers"
+
+output:
+  checkpoint_dir: "outputs/phase2_smoke/checkpoints"
+  results_dir: "outputs/phase2_smoke"
+  log_dir: "logs/phase2_smoke"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-calder-smoke"
