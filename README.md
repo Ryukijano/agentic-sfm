@@ -1,90 +1,159 @@
+<div align="center">
+
 # Agentic SfM
 
-**RL-trained multimodal agents for hard 3D reconstruction.**
+### RL-Trained Multimodal Agents for Hard 3D Reconstruction & View-Graph Orchestration
+
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#quick-start)
+[![Policy: Qwen3.5-2B](https://img.shields.io/badge/Policy-Qwen%2FQwen3.5--2B-6C47FF)](https://huggingface.co/Qwen/Qwen3.5-2B)
+[![Matchers: LoFTR · MASt3R · VGGT · MapAnything](https://img.shields.io/badge/Specialists-LoFTR%20%C2%B7%20MASt3R%20%C2%B7%20VGGT%20%C2%B7%20MapAnything-F39C12)](#pose-prior-study)
+[![Reconstruction Backend: pycolmap](https://img.shields.io/badge/3D%20Backend-pycolmap%204.x-2ECC71)](#how-it-works)
+[![HF Checkpoints & Artifacts](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-agentic--sfm--qwen35--2b-FFD21E)](https://huggingface.co/Ryukijano/agentic-sfm-qwen35-2b)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[**Overview**](#summary) · [**Architecture**](#how-it-works) · [**3D Reconstruction Losses (Math + Visual)**](#mathematical--visual-3d-reconstruction-losses) · [**Pose Priors & Routing**](#pose-prior-study) · [**OPSFT**](#opsft-style-constrained-sft) · [**Empirical Results & Audit**](#results) · [**Quick Start**](#quick-start)
+
+</div>
+
+<p align="center">
+  <img src="docs/figures/reconstruction_pipeline_architecture.png" alt="Agentic SfM Closed-Loop Architecture and 4-Pillar 3D Reconstruction Loss Stack" width="960"/>
+</p>
+
+---
 
 ## Summary
 
-Agentic SfM asks whether a small vision-language model (Qwen3.5-2B) can learn to orchestrate geometric tools (crop, match, doppelganger check, sparse reconstruction) so that structure-from-motion succeeds where a fixed matcher fails. The reward is computed from ground-truth poses, not from human labels. The central question is whether learned tool orchestration improves reconstruction over simple, equally budgeted baselines.
+**Agentic SfM** investigates whether a compact vision-language model (`Qwen/Qwen3.5-2B`, LoRA $r=32$) can learn to act as a **Photogrammetry Director**—actively constructing, diagnosing, pruning, and bridging a multi-view correspondence graph across classical and feed-forward 3D specialists (`LoFTR`, `MASt3R`, `VGGT`, `MapAnything`) so that incremental Structure-from-Motion (`pycolmap`) succeeds on low-overlap, wide-baseline, and visually symmetric ("doppelganger") scenes where fixed single-matcher pipelines fail.
 
-**Current status: mixed, with named blockers.** The pair-level RL agent does not beat plain LoFTR matching on the hard validation set (success 62% vs 88%). A completed 50-epoch scene-level hybrid run (job 8237240) trained successfully (mean reward 0.847→1.643, best in-training eval score 0.608) but the policy never sampled the exposed MASt3R or VGGT matchers — matcher choice collapsed to LoFTR at the SFT warm start, so no routing benefit can be claimed. A pose-prior benchmark on 1,170 frozen ScanNet pairs is done and shows specialist heterogeneity is large (VGGT prior AUC@10 0.631, MASt3R 0.506, LoFTR 0.240). An OPSFT-style direction-constrained SFT path is implemented and tested (exact support is ~99.998% dense under AdamW; a top-10% variant exists). Calder 8×H200 staging and the scene-disjoint experiment matrix are prepared but not yet run. No claim in this repository should be read as the agent outperforming an equally-budgeted baseline.
+Instead of relying on human preference labels or easily gamed tool-call proxies, the agent is trained with Group Relative Policy Optimization (**GRPO / S-GRPO CGI**) driven by **verifiable mathematical and visual 3D reconstruction losses** evaluated directly on the reconstructed 3D model (`sparse/0`), ground-truth camera trajectories, and RGB-D sensor geometry.
 
-## Status at a glance
+> **Scientific honesty & current status (`mixed, with named blockers`):**
+> - **Pair-level RL:** The pair-level agent does not yet beat plain full-frame LoFTR on the hard validation split (62% vs 88% success).
+> - **Scene-level hybrid GRPO (run `8237240`):** Completed 50 epochs on 3×L40S (mean reward `0.847 → 1.643`, best in-training eval score `0.608`), but starting from a LoFTR-only SFT warm start caused **matcher collapse** (0 calls to MASt3R/VGGT). Track-B anti-collapse fixes (diagnostic-conditioned mixed-specialist SFT + $\epsilon$-forced specialist exploration + monotonic correspondence union) are now implemented to address this.
+> - **Specialist heterogeneity is large (job `8235219`):** Across 1,170 frozen ScanNet pairs (30 scenes), VGGT's extrinsics head (`AUC@10 = 0.631`, `6.79°` median error) and MASt3R (`AUC@10 = 0.506`, `6.65°`) dramatically outperform LoFTR (`AUC@10 = 0.240`, `68.85°`), while LoFTR is ~20× faster (`0.062s` vs `~1.26s`).
+> - **4-Pillar Mathematical + Visual 3D Reconstruction Loss Stack:** Implemented and unit-tested (`src/agentic_sfm/rewards/reconstruction_loss.py`, [`docs/reconstruction_losses.md`](docs/reconstruction_losses.md)) to eliminate the abstention and doppelganger symmetry-fold loopholes of legacy proxy rewards.
+> - **No claim in this repository should be read as the learned agent outperforming an equally-budgeted baseline until the held-out 30-scene frozen evaluation matrix completes.**
 
-| Phase | Status | What it shows | Evidence |
+---
+
+## Status at a Glance
+
+| Phase / Component | Status | Key Finding / Capability | Evidence & Code |
 |---|---|---|---|
-| 0. Zero-shot cropping | Done | Stock model cropping does not beat direct matching. Negative result. | `results/README.md`, `results/phase0/comparison.json` |
-| Pair-level SFT | Done | Warm-start adapter that emits valid tool-call JSON. | `outputs/sft/`, `outputs/phase1_hard/warmstart/` |
-| 1. Pair-level GRPO (hard pairs) | Stopped at about step 200 (2-day time limit). Best checkpoint evaluated. Worse than LoFTR. | Success 62% vs LoFTR 88% on hard val (n=50). | `outputs/eval_pair/phase1_hard_best_8019429.json` |
-| 2. Scene-level GRPO | Training finished (50 epochs). Evaluation on 10 scenes, protocol invalid as a benchmark. | Success 30%, but two of ten scenes were training scenes and the baselines are not comparable. | `outputs/phase2/run_8073061/`, `outputs/scene_eval/run_8085187/scene_eval_results.json`, `docs/scene_eval_and_env_proposal.md` |
-| Pose-prior study | Benchmark rerun (job 8235219) completed across all 3 matchers. VGGT pose head and MASt3R both vastly beat LoFTR. | VGGT prior AUC@10 0.631 (6.79° med err), MASt3R AUC@10 0.506 (6.65°), LoFTR AUC@10 0.240 (68.85°) on 1,170 ScanNet pairs. | `outputs/bench_pose_priors/run_8235219/`, `src/agentic_sfm/pose_prior.py`, `jobs/bench_pose_priors.slurm` |
-| Hybrid scene policy | 50-epoch GRPO run 8237240 completed on 3×L40S. Reward 0.847→1.643; best in-training eval 0.608 (ep25). Matcher choice collapsed to LoFTR — MASt3R/VGGT never sampled. | Training works; routing does not emerge from a LoFTR-only SFT warm start. | `outputs/phase2_hybrid/run_8237240/`, `configs/phase2_hybrid.yaml`, `jobs/phase2_hybrid.slurm` |
-| OPSFT constrained SFT | Implemented and tested (17 dedicated tests). Direction artifacts extracted from run 8237240. | Exact support is 99.998% dense under AdamW; top-10% mask selects 3,363,841/33,638,400 elements. No constrained training results yet. | `src/agentic_sfm/opsft.py`, `scripts/run_sft_opsft.py`, `scripts/extract_update_direction.py`, `docs/opsft.md` |
-| Calder 8×H200 migration | Staging bundle built on Aire (2.4 GB, checksummed), Calder config + job + runbook committed. Not yet transferred. | One 8×H200 node: vLLM TP=2 @16k ctx, tool server, GRPO+KL, two OPSFT arms, frozen-eval GPU. | `scripts/stage_for_calder.sh`, `jobs/calder_8xh200_hybrid.slurm`, `docs/calder_h200_runbook.md` |
-| Held-out evaluation | Manifest frozen (30 ScanNet scenes). Equal-budget baselines planned in Calder matrix. | Nothing measured yet on the frozen manifest. | `data/frozen_eval_manifest.json`, `docs/scene_eval_and_env_proposal.md` |
+| **0. Zero-shot cropping** | Done | Stock VLM cropping does not beat direct full-frame matching (`8.9` vs `12.4` mean inliers). Motivates RL. | [`results/README.md`](results/README.md), `results/phase0/comparison.json` |
+| **Pair-level SFT** | Done | Warm-start LoRA adapter teaches the valid JSON tool-call contract. | `outputs/sft/`, `outputs/phase1_hard/warmstart/` |
+| **1. Pair-level GRPO** | Evaluated (step 200) | `62%` success vs LoFTR `88%` on hard val ($n=50$). Worse than plain LoFTR. | `outputs/eval_pair/phase1_hard_best_8019429.json` |
+| **2. Scene-level GRPO** | 50 epochs done | `30%` success on 10 scenes, but protocol audit found train/eval overlap and non-comparable baselines. | `outputs/phase2/run_8073061/`, [`docs/scene_eval_and_env_proposal.md`](docs/scene_eval_and_env_proposal.md) |
+| **Pose-prior benchmark** | Done (job `8235219`) | On 1,170 frozen ScanNet pairs: **VGGT prior AUC@10 `0.631`** (`6.79°`), **MASt3R `0.506`** (`6.65°`), **LoFTR `0.240`** (`68.85°`, 20× faster). | `outputs/bench_pose_priors/run_8235219/`, `src/agentic_sfm/pose_prior.py` |
+| **Hybrid scene GRPO** | Done (job `8237240`) | 50 epochs on 3×L40S; reward `0.847 → 1.643`, eval `0.608`. Exposed LoFTR-only SFT matcher collapse. | `outputs/phase2_hybrid/run_8237240/`, `configs/phase2_hybrid.yaml` |
+| **Track-B anti-collapse & MapAnything** | Implemented & tested | Diagnostic-conditioned specialist SFT (`matcher="mixed"`), $\epsilon$-forced GRPO exploration, `mapanything` backend, monotonic match union, budget scaling evaluator. | `scripts/build_scene_sft.py`, `scripts/eval_budget_scaling.py`, `tools_server/server.py` |
+| **4-Pillar 3D Reconstruction Losses** | Implemented & tested | Intrinsic BA/track/$\lambda_2$/cycle math + Extrinsic $\mathrm{Sim}(3)$ all-pairs mAA/ATE/depth/3D-$\text{F}_1$ + Visual 3-view BEV/ortho, point-splat SSIM, patch ZNCC, & 4-panel VLM loop closure. | `src/agentic_sfm/rewards/reconstruction_loss.py`, [`docs/reconstruction_losses.md`](docs/reconstruction_losses.md) |
+| **OPSFT constrained SFT** | Implemented & extracted | LoRA bf16 adaptation of arXiv:2609.36659. Exact support is `99.998%` dense under AdamW; top-10% mask selects `3.36M / 33.6M` params. | `src/agentic_sfm/opsft.py`, `scripts/run_sft_opsft.py`, [`docs/opsft.md`](docs/opsft.md) |
+| **Calder 8×H200 & Isambard 4×GH200** | Staged & ready | 40-scene ScanNet + MegaDepth curriculum, vLLM TP=2 @ 16k ctx, parallel OPSFT arms, and 30-scene frozen evaluation matrix. | `configs/phase2_calder_8xh200.yaml`, `configs/phase2_isambard_4xgh200.yaml`, [`docs/calder_h200_runbook.md`](docs/calder_h200_runbook.md) |
 
-## Motivation and core question
+---
 
-Structure-from-motion pipelines fail on hard pairs: low overlap, large viewpoint change, repeated texture, and doppelganger (near-identical, non-overlapping) views. A fixed matcher cannot change its strategy per pair. We treat the problem as a multi-turn decision: the policy chooses when to crop, which matcher to call, and when to stop. Training uses GRPO with a reward computed from ground-truth poses.
+## How It Works
 
-The core question has two parts. First, does a learned policy beat simple strategies at equal tool budget? Second, does it beat them on scenes it was not trained on? So far the answer to the first is no at the pair level, and the second has not been tested under a valid protocol.
+### Closed-Loop Agentic Architecture
 
-## How it works
+```mermaid
+flowchart LR
+    subgraph Input["Unordered Scene"]
+        IMG["N Scene Images<br/>img_0000 .. img_{N-1}"]
+    end
 
-### Architecture
+    subgraph Agent["VLM Policy (Qwen/Qwen3.5-2B + LoRA r=32)"]
+        POL["Multi-Turn JSON Tool Policy<br/>+ Visual Loop Closure"]
+    end
 
+    subgraph Server["FastAPI Tool Server (tools_server/server.py)"]
+        direction TB
+        G_TOOLS["View-Graph Tools<br/>build_initial_graph · inspect_graph<br/>verify_doppelganger · prune_edges<br/>bridge_components"]
+        M_TOOLS["Specialist Matchers<br/>LoFTR (fast 2D) · LightGlue<br/>MASt3R (3D pointmap) · VGGT (feed-forward)<br/>MapAnything (metric 3D)"]
+        COLMAP["Isolated Subprocess Worker<br/>sfm_run (pycolmap incremental_mapping)<br/>→ sparse/0 (points3D, tracks, poses)"]
+        G_TOOLS --> M_TOOLS --> COLMAP
+    end
+
+    subgraph Loss["4-Pillar 3D Reconstruction Loss & Visual Critic"]
+        direction TB
+        VIS4["render_diagnostic_4panel<br/>(BEV + 3D + Reproj Heatmap + Splat)"]
+        P1["Pillar 1: Intrinsic Math (BA, Tracks ≥3, λ₂, 3-Cycle)"]
+        P2["Pillar 2: Extrinsic 3D Math (All-Pairs mAA, ATE, Depth, 3D F1)"]
+        P3["Pillar 3: Visual 3D Model (BEV/Ortho IoU, Splat SSIM, Patch ZNCC)"]
+        P4["Pillar 4: Gated Efficiency & Doppelganger F1"]
+    end
+
+    IMG --> POL
+    POL -- "JSON tool call" --> Server
+    Server -- "structured obs" --> POL
+    COLMAP --> VIS4
+    VIS4 -- "multimodal inspect image" --> POL
+    COLMAP --> P1 & P2 & P3 & P4
+    P1 & P2 & P3 & P4 -- "GRPO / S-GRPO CGI Advantage" --> POL
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Qwen3.5-2B (policy, LoRA r=32)                                 │
-│  multi-turn JSON tool calls                                     │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ HTTP
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Tool server (FastAPI, tools_server/server.py, port 8765)       │
-│  crop · match (LoFTR / MASt3R / LightGlue / VGGT) ·             │
-│  doppelganger_check · retrieve · sfm_run · inspect              │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ correspondences + pose
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Verifiable reward                                              │
-│  pose AUC @5°/10°/20° + inlier shaping − tool cost              │
-│  + first-call validity bonus (0.5, pair and scene configs)      │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ GRPO advantage
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Custom GRPO loop (src/agentic_sfm/rl/)                         │
-│  Rollout: vLLM  ·  Policy update: LoRA training on 3 GPUs       │
-└─────────────────────────────────────────────────────────────────┘
-```
 
-Each `sfm_run` call is a child process, so a COLMAP abort does not kill the tool server. LoFTR is a frozen matcher and is not trained. The matcher backend is a *parameter* of the match/graph actions: the policy may choose `loftr`, `mast3r`, or `vggt` (VGGT additionally returns `prior_pose` from its extrinsics head and `prior_confidence`). Fallbacks to LoFTR are tagged `matcher_fallback` in the tool response and counted in the training metrics. Ground-truth pose is never given to the policy.
+Each `sfm_run` executes in a sandboxed subprocess (`tools_server/sfm_worker.py`) so COLMAP/FAISS C++ faults never crash the tool server. When `use_agent_matches=True`, COLMAP imports the **exact union of verified correspondences** gathered by the agent's specialist calls across the active view-graph edges rather than running an independent SIFT pass—directly coupling 3D reconstruction quality to the agent's routing and pruning decisions.
 
 <p align="center">
-  <img src="results/figures/agentic_sfm_phase1_architecture.png" alt="Phase 1 training architecture" width="700"/>
+  <img src="results/figures/agentic_sfm_phase1_architecture.png" alt="Phase 1 training architecture" width="760"/>
 </p>
 
-### Tool set
+### Tool Vocabulary (Pair-Level & Scene-Level)
 
-| Tool | Role |
-|---|---|
-| `crop` | Crop a region of an image. Boxes must be all-normalized or all-pixel. |
-| `match` | Dense or sparse matching between two images. LoFTR is the default. |
-| `doppelganger_check` | Flags likely doppelganger pairs. |
-| `retrieve` | Candidate pair retrieval. |
-| `sfm_run` | Runs sparse reconstruction on the matches gathered so far. Uses only cached pairs in the scene configuration. |
-| `inspect` | Reads state (images, match counts, graph). |
+| Scope | Tool | Arguments | What It Returns / Does |
+|---|---|---|---|
+| **Scene Graph** | `build_initial_graph` | `{"k_neighbors": 5, "matcher": "loftr\|mast3r\|vggt\|mapanything"}` | Retrieves DINOv2 top-$k$ candidate pairs, runs batch matching, builds `ViewGraph`, returns components, bridges, and suspicious cycles. |
+| **Scene Graph** | `inspect_graph` | `{}` | Returns topology summary: connected components, isolated images, articulation bridges, and cycle rotation residuals. |
+| **Scene Graph** | `verify_doppelganger` | `{"image_a": "img_0000", "image_b": "img_0001", "matcher": "..."}` | Combines DINOv2 appearance similarity, inlier ratio, and 3-cycle geodesic rotation residual ($\|\log(R_{wu}R_{vw}R_{uv})\|$) to flag illusory symmetry edges. |
+| **Scene Graph** | `prune_edges` | `{"pairs": [["img_0000", "img_0001"]]}` | Removes flagged doppelganger/outlier edges from the active view graph and match store before reconstruction. |
+| **Scene Graph** | `bridge_components` | `{"comp_a_id": 0, "comp_b_id": 1, "budget": 3, "matcher": "..."}` | Queries cross-component candidate pairs with a stronger 3D specialist (`vggt`/`mast3r`/`mapanything`) to merge split subgraphs. |
+| **Pair & Scene** | `crop` / `match` | `{"image_a": "...", "image_b": "...", "matcher": "..."}` | Runs pairwise matching (or sub-region crop matching) and caches verified inlier keypoints in the session store. |
+| **Reconstruction** | `sfm_run` | `{}` | Runs `pycolmap.incremental_mapping` on active graph matches; writes `sparse/0` and returns `num_registered`, `num_points3d`, `mean_reproj_error`, `num_components`. |
+| **Verification** | `inspect` / `done` | `{}` | Reads detailed model diagnostics (plus 4-panel 3D visual render) or terminates the episode for reward scoring. |
 
-The agent limits differ by setting. Pair-level configs (`configs/phase1_grpo.yaml`) allow 10 tool calls and 15 turns. Scene-level configs (`configs/phase2_scene.yaml`) allow 20 tool calls and 30 turns.
+### Multi-GPU Hardware Layouts
 
-### GPU layout (3× NVIDIA L40S)
+| Cluster Target | GPUs | Layout Across Node | Config & Slurm Launcher |
+|---|---|---|---|
+| **AIRE** | 3× NVIDIA L40S (48 GB) | `GPU 0`: vLLM rollout · `GPU 1`: LoRA trainer · `GPU 2`: Tool server | `configs/phase2_hybrid.yaml`, `jobs/phase2_hybrid.slurm` |
+| **Calder** | 8× NVIDIA H200 NVL (141 GB) | `GPU 0,1`: vLLM TP=2 (16k ctx) · `GPU 2`: Tool server · `GPU 3`: Trainable LoRA · `GPU 4`: Frozen KL anchor · `GPU 5,6`: OPSFT ablation arms · `GPU 7`: Frozen 30-scene eval | `configs/phase2_calder_8xh200.yaml`, `jobs/calder_8xh200_hybrid.slurm` |
+| **Isambard-AI** | 4× NVIDIA GH200 (96 GB) | `GPU 0`: vLLM rollout · `GPU 1`: Tool server (LoFTR+MASt3R+VGGT+MapAnything) · `GPU 2`: Trainable LoRA · `GPU 3`: Frozen KL anchor | `configs/phase2_isambard_4xgh200.yaml`, `jobs/isambard_4xgh200_hybrid.slurm` |
 
-| GPU | Role |
-|-----|------|
-| 0 | vLLM rollout server |
-| 1 | Policy training (LoRA) |
-| 2 | Matcher inference (tool server) |
+---
+
+## Mathematical & Visual 3D Reconstruction Losses
+
+A central finding of our Phase 2 audit ([`docs/scene_eval_and_env_proposal.md`](docs/scene_eval_and_env_proposal.md)) is that **tool-call syntax bonuses and registered-only camera rotation errors are easily reward-hacked**:
+1. **The Abstention Trap:** Registering only 3 easy consecutive frames yields `0.0°` pose error on the registered subset while ignoring 85% of the scene.
+2. **The Doppelganger Symmetry Fold:** An unpruned visual symmetry edge folds Wall B ($180^\circ$) onto Wall A. All 8 cameras still register (`100%` registration) and 2-view reprojection error on the bad pair looks small, yet the 3D model is geometrically and visually broken.
+
+To solve this, `src/agentic_sfm/rewards/reconstruction_loss.py` ([full specification in `docs/reconstruction_losses.md`](docs/reconstruction_losses.md)) implements a **Four-Pillar Mathematical & Visual 3D Reconstruction Loss** stack that scores the 3D model itself:
+
+<p align="center">
+  <img src="docs/figures/mathematical_vs_visual_losses_demo.png" alt="Mathematical and Visual 3D Reconstruction Losses Demo on Accurate vs Doppelganger Fold vs Abstention" width="960"/>
+</p>
+
+### The Four Pillars at a Glance
+
+| Pillar | Loss / Reward Component | Mathematical Formulation | What Failure Mode It Kills | Needs GT? |
+|---|---|---|---|---|
+| **Pillar 1: Intrinsic Math** | **Track-Conditioned Huber BA ($\mathcal{R}_{\text{BA}}$)** | $\exp\!\big(-\frac{1}{2|\mathcal{P}|}\sum_k w_k \rho_H(e_k/\sigma_{\text{px}})\big) \cdot \operatorname{clip}\!\big(\frac{\bar{\ell}_{\mathcal{T}}-2}{4},0,1\big) \cdot f_{|\mathcal{T}_k|\ge 3}$ | 2-view-only zero-redundancy triangulations & high-residual floaters | **No** (Zero-GT) |
+| **Pillar 1: Intrinsic Math** | **Fiedler $\lambda_2$ & 3-Cycle Rigidity ($\mathcal{R}_{\text{graph}}$)** | $\operatorname{clip}(\lambda_2(\mathcal{L}_{\text{norm}})/0.3, 0, 1) \cdot \exp(-\mathcal{L}_{\text{3-cycle}}/15^\circ)$ | Disconnected subgraphs ($\lambda_2=0$), hinged bridges, & inconsistent loop closures | **No** (Zero-GT) |
+| **Pillar 2: Extrinsic 3D Math** | **All-Pairs Relative Pose mAA ($\mathcal{R}_{\text{mAA}}$)** | $\frac{1}{\binom{N}{2}}\sum_{i<j}\frac{1}{3}\sum_{\tau\in\{5,10,20^\circ\}}\mathbb{1}[\max(\epsilon^R_{ij},\epsilon^t_{ij})<\tau]$ *(unregistered $\to 180^\circ$)* | **Abstention loophole** (dropping hard views costs quadratically) | Yes (GT poses) |
+| **Pillar 2: Extrinsic 3D Math** | **$\mathrm{Sim}(3)$ Camera ATE ($\mathcal{R}_{\text{ATE}}$)** | $\text{cov}\cdot\exp\!\big(-\frac{1}{|M|}\sum_{i\in M}\rho_H(\|sR_s\hat{C}_i+t_s-C^{\text{gt}}_i\|_2 / D_{\text{gt}})\big)$ | Collapsed or hinged camera trajectories with good orientations | Yes (GT poses) |
+| **Pillar 2: Extrinsic 3D Math** | **Z-Buffered Depth + Gradient ($\mathcal{L}_{\text{depth}}$)** | $\frac{1}{|\mathcal{O}|}\sum|\log(\hat{z}_{ik}/z^{\text{gt}}_{ik})| + \lambda_\nabla\sum|(\hat{z}_{ik}-\hat{z}_{ik'})-(z^{\text{gt}}_{ik}-z^{\text{gt}}_{ik'})|$ | Depth-order inversions & wall-doubling against RGB-D sensor depth | Yes (ScanNet depth) |
+| **Pillar 2: Extrinsic 3D Math** | **Voxel-Normalized 3D $\text{F}_1@\tau$ ($\mathcal{R}_{\text{3D-F1}}$)** | $\frac{2\cdot P@\tau\cdot R@\tau}{P@\tau+R@\tau}$ between $\mathcal{P}'_{\text{pred}}$ and voxelized $\mathcal{V}_{\text{gt}}$ ($\tau=10\text{cm}$) | Outlier 3D point clouds (low $P$) & missing room surfaces (low $R$) | Yes (GT 3D cloud) |
+| **Pillar 3: Visual 3D Model** | **3-View Orthographic Render ($\mathcal{R}_{\text{ortho-3D}}$)** | Mean over $\{\text{BEV}, \text{Front}, \text{Side}\}$ of $0.45\,\operatorname{IoU}(O^{\text{pred}}_v, O^{\text{gt}}_v) + 0.30(1-\ell_1^{\text{RGB}}) + 0.25(1-\ell_1^Z)$ | **Doppelganger symmetry folds** rotating walls/corridors outside the true floorplan | Yes (GT 3D cloud) |
+| **Pillar 3: Visual 3D Model** | **Differentiable Point-Splat Render ($\mathcal{R}_{\text{splat}}$)** | Front-to-back $\alpha$-composited splats $\hat{C}_i$: $\text{gate}(\hat{O}_i)\cdot(0.6\,\operatorname{SSIM}_{M_i} + 0.4(1-\ell_1))$ | Ghosted/misaligned 3D geometry when rendered back into camera views | No (Observed RGB) |
+| **Pillar 3: Visual 3D Model** | **Multi-View Patch ZNCC ($\mathcal{R}_{\text{patch-cons}}$)** | $1 - \frac{1}{|\mathcal{P}|}\sum_k\frac{1}{|\mathcal{T}_k|}\sum_{i\in\mathcal{T}_k}\big[0.5(1-\operatorname{ZNCC}(W_i,\bar{W}_k)) + 0.5\|W_i-\bar{W}_k\|_1\big]$ | Cross-view texture mismatch when a folded camera projects points onto wrong walls | **No** (Zero-GT) |
+| **Visual Loop Closure** | **4-Panel Diagnostic Render (`render_diagnostic_4panel`)** | $2\times 2$ composite: Top-Down BEV Floorplan + 3D Isometric + Reproj Heatmap + Splat View | Gives `Qwen3.5-2B` direct visual perception of its 3D model during `inspect` | **No** (Zero-GT) |
+
+<p align="center">
+  <img src="docs/figures/loss_response_curves.png" alt="Mathematical and Visual 3D Reconstruction Loss Response Surfaces" width="900"/>
+</p>
+
+---
 
 ## Results
 
@@ -92,7 +161,7 @@ Every number below comes from the file named in its subsection. Paper numbers ar
 
 Trained LoRA adapters (pair SFT, Phase 1 GRPO, scene SFT) and figures are on Hugging Face: [huggingface.co/Ryukijano/agentic-sfm-qwen35-2b](https://huggingface.co/Ryukijano/agentic-sfm-qwen35-2b).
 
-### Phase 0: zero-shot cropping
+### Phase 0: Zero-Shot Cropping
 
 Source: `results/README.md` and `results/phase0/comparison.json`.
 
@@ -128,7 +197,7 @@ Qualitative overlays (scenes 0015 and 0022):
 
 Per-pair overlays: [`results/phase0_real/visualizations/`](results/phase0_real/visualizations/).
 
-### Phase 1: pair-level RL
+### Phase 1: Pair-Level RL
 
 Source: `outputs/eval_pair/phase1_hard_best_8019429.json`. The trained checkpoint is `outputs/phase1_hard/checkpoints/best`. The policy was trained with GRPO on the hard-pair training split, starting from the SFT warm start.
 
@@ -161,7 +230,7 @@ Best-match episodes logged during early GRPO training (qualitative only; green =
 |---|---|---|
 | <img src="results/figures/train_best_match_step10.png"/> | <img src="results/figures/train_best_match_step20.png"/> | <img src="results/figures/train_best_match_step30.png"/> |
 
-### Phase 2: scene-level RL
+### Phase 2: Scene-Level RL
 
 Sources: `outputs/phase2/run_8073061/` (training) and `outputs/scene_eval/run_8085187/scene_eval_results.json` (evaluation). The best checkpoint is `outputs/phase2/run_8073061/checkpoints/best_eval`. Training completed 50 epochs.
 
@@ -219,7 +288,7 @@ Composite summary from earlier development (hard pair, good pair, sparse reconst
 
 Reward is not evidence of reconstruction quality. The first-call validity bonus is 0.5 per episode and makes up about half of the reward on several scenes (for example, 0.5 of 1.17 on scene 0015). Mean total reward of 0.997 should not be cited as a quality measure.
 
-### Pose-prior study
+### Pose-Prior Study
 
 Status: implemented, unit-tested, and benchmarked on 30 frozen ScanNet scenes (rerun job 8235219, completed Oct 11, 2026).
 
@@ -228,7 +297,7 @@ Question: can feed-forward pose models (VGGT, MASt3R) be used as matcher backend
 What exists:
 
 - `src/agentic_sfm/pose_prior.py`: converts point-map outputs to reciprocal-nearest-neighbour correspondences and A→B relative poses (pure numpy).
-- `tools_server/server.py`: `matcher="vggt"` and `matcher="mast3r"` backends, with LoFTR fallback tagged `matcher_fallback`.
+- `tools_server/server.py`: `matcher="vggt"`, `matcher="mast3r"`, and `matcher="mapanything"` backends, with LoFTR fallback tagged `matcher_fallback`.
 - `data/frozen_eval_manifest.json`: 30 ScanNet scenes from `scene0715_00` onward. `scene0718_00` is excluded (19 frames). The manifest's `sha256` field is `d62928353a2c3bff7ac0aa77b0f8b844059dc8035d23bd336228036a56bd0825`. It is a hash of the canonical JSON of all other fields, recomputable with `python scripts/freeze_scene_manifest.py --verify`. The file's byte-level sha256 is different.
 - `scripts/bench_pose_priors.py` and `jobs/bench_pose_priors.slurm`: benchmark `loftr`, `vggt`, and `mast3r` on identical per-scene pair lists (19 consecutive and 20 seeded-random pairs per scene), using GT intrinsics, IMC-style worst-of-two relative error, and AUC@5/10/20. Failures and fallbacks count as failures.
 
@@ -257,7 +326,7 @@ What this shows:
 
 Paper numbers, not reproduced here: VGGT reports AUC@30 of 85.3 on Re10K and 88.2 on CO3Dv2 without bundle adjustment (paper Table 1, arXiv 2503.11651). These are the paper's numbers on its benchmarks and are not evidence about our data.
 
-### Hybrid scene GRPO (run 8237240)
+### Hybrid Scene GRPO (run 8237240) & Track-B Anti-Collapse Routing
 
 Source: `outputs/phase2_hybrid/run_8237240/` and `/scratch/kcwp264/logs/agentic-sfm/phase2_train_8237240.log`. Config: `configs/phase2_hybrid.yaml` (all three matchers exposed; group_size 4; 50 epochs; scenes 0015+0022 only — ScanNet was disabled in this run). The job ran ~31 h on 3×L40S (gpu023) after dynamic-port allocation fixed the vLLM startup collision that killed job 8235218.
 
@@ -274,11 +343,14 @@ Training trajectory (from the log):
 Caveats:
 
 1. **The eval is not held out.** The in-training eval uses scenes 0015 and 0022, which are also the training scenes. Best-eval 0.608 is a training-set number.
-2. **Matcher collapse.** The policy issued zero MASt3R or VGGT calls across 50 epochs. The SFT warm start contained LoFTR-only trajectories, so matcher-token probability collapsed before RL; on-policy GRPO then never sampled the alternatives. `run_scene_grpo.py` now logs `scene/matcher_frac_{loftr,mast3r,vggt}` and `scene/matcher_fallback_pairs` per step/eval to make this visible.
-3. **Context overflow.** 129 episodes hit the 8,192-token vLLM cap. The Calder config raises `max_model_len` to 16,384.
+2. **Matcher collapse & Track-B Remedies.** The policy issued zero MASt3R or VGGT calls across 50 epochs because the SFT warm start contained LoFTR-only trajectories, collapsing matcher-token probability before RL. To solve this for the Calder/Isambard runs:
+   - `scripts/build_scene_sft.py` now supports `matcher="mixed"` (`select_diagnostic_specialist_matcher`), routing low-overlap/indoor pairs and `bridge_components` calls to 3D specialists (`vggt`, `mast3r`, `mapanything`) in the SFT warm start.
+   - `src/agentic_sfm/rl/scene_episode.py` and `scripts/run_scene_grpo.py` implement $\epsilon$-forced specialist exploration (`matcher_explore_eps` with decay and group-slot stratification), synchronizing rewritten assistant JSON tool calls so GRPO policy gradients reinforce explored specialist tokens.
+   - `run_scene_grpo.py` logs `scene/matcher_frac_{loftr,mast3r,vggt,mapanything}` and `scene/matcher_fallback_pairs` per step/eval.
+3. **Context overflow.** 129 episodes hit the 8,192-token vLLM cap. The Calder and Isambard configs raise `max_model_len` to 16,384.
 4. **Reward includes the +0.5 first-call bonus**; it is not a pure quality measure.
 
-### OPSFT-style constrained SFT
+### OPSFT-Style Constrained SFT
 
 Implementation of "On-Policy Parameter Update Direction Underlies Generalization in LLM Post-Training" (arXiv 2609.36659), adapted from full-parameter FP32 to **LoRA adapters under bf16** — an adaptation experiment, not a direct reproduction.
 
@@ -287,7 +359,7 @@ What exists:
 - `src/agentic_sfm/opsft.py`: `canonical_lora_name`, `extract_direction` (exact-support or global top-k |Δθ|), `save_direction`/`load_direction`, `mask_gradients_` (pre-step: zero off-support grads and grads whose descent opposes `D`), `project_parameters_` (post-step: restore off-support params to θ0 and snap back wrong-direction movement), `fingerprint_state_dict`.
 - `scripts/run_sft_opsft.py`: `OPSFTTrainer(SFTTrainer)` — loads `init_adapter`, snapshots θ0, verifies direction coverage over every trainable adapter param, and applies stage-1 masking before grad clipping and stage-2 projection after `optimizer.step()` under `no_grad`.
 - `scripts/run_sft.py` gained no-op `_pre_optim_step`/`_post_optim_step` hooks (ordinary SFT unchanged).
-- `scripts/extract_update_direction.py`, `configs/phase2_sft_opsft.yaml`, `jobs/sft_opsft.slurm`, `docs/opsft.md`.
+- `scripts/extract_update_direction.py`, `configs/phase2_sft_opsft.yaml`, `jobs/sft_opsft.slurm`, [`docs/opsft.md`](docs/opsft.md).
 
 Measured direction statistics (scene-SFT epoch-5 → hybrid run 8237240 epoch-50, 33,638,400 LoRA elements):
 
@@ -300,7 +372,9 @@ Measured direction statistics (scene-SFT epoch-5 → hybrid run 8237240 epoch-50
 
 No constrained-SFT results exist yet; both arms (from-base, continue) run inside `jobs/calder_8xh200_hybrid.slurm`.
 
-## Known problems and invalid results
+---
+
+## Known Problems and Invalid Results
 
 This section lists what must not be cited.
 
@@ -319,28 +393,39 @@ This section lists what must not be cited.
 | Phase-1 GRPO checkpoints (`outputs/phase1*/checkpoints/{best,best_eval,epoch_5,latest}`) | Untrusted | These were written byte-identical to their SFT init (a checkpoint persistence bug). Changed adapters exist only under `outputs/sgrpo_smoke/checkpoints/latest` and `outputs/phase2_hybrid/run_8237240/checkpoints/`. |
 | Hard-pair distribution figure (`results/figures/agentic_sfm_hardpairs_distribution.png`) | Provenance not checked | It may show the older build. Do not use it for pair counts. |
 
-## Evaluation protocol (next)
+---
 
-The planned protocol replaces the current scene evaluation. The full rationale is in [`docs/scene_eval_and_env_proposal.md`](docs/scene_eval_and_env_proposal.md).
+## Evaluation Protocol (Next)
+
+The planned protocol replaces the current scene evaluation. The full rationale is in [`docs/scene_eval_and_env_proposal.md`](docs/scene_eval_and_env_proposal.md) and [`docs/reconstruction_losses.md`](docs/reconstruction_losses.md).
 
 - **Held-out scenes.** ScanNet `scene0715_00` onward, frozen in `data/frozen_eval_manifest.json`. At least 30 scenes with 20 frames each. MegaDepth 0015 and 0022 are excluded from every held-out claim.
-- **Metrics.** Registration fraction, counting unregistered images as failures. Relative pose AUC@5/10/20 over all image pairs, not only registered ones. Component count and failure type. The 50%/20° gate is a secondary summary.
+- **Metrics.** Registration fraction (counting unregistered images as failures), relative pose mAA@5/10/20 over **all** $\binom{N}{2}$ image pairs, $\mathrm{Sim}(3)$ camera ATE, voxel-normalized 3D $\text{F}_1@10\text{cm}$, BEV floorplan IoU, and component/failure taxonomy. The 50%/20° gate is a secondary summary.
 - **Baselines, same `sfm_run` path with cached matches.** Consecutive-frame pairs, random pairs, top-k retrieval (k = 5 and 10), direct matching with pose error, an oracle over ground-truth-overlap pairs (heuristic on ScanNet), and the SFT-only checkpoint. All at equal tool-call budget.
 - **Statistics.** The scene is the unit. Paired scene-level differences against each baseline, with scene-level bootstrap intervals. A superiority claim requires the interval to exclude zero.
 - **Gates before new RL.** The fair oracle reconstructs at least as well as exhaustive matching. The direct baseline reports pose error. At least 30 frozen scenes. The SFT-only checkpoint is evaluated. The policy beats the consecutive-frame heuristic at equal budget, with an interval excluding zero.
 
-## Quick start
+---
+
+## Quick Start
 
 ### Environment
 
-On AIRE, source the scratch environment first, in every shell and every Slurm job:
+On **Calder (8×H200)**:
+
+```bash
+source /users/kcwp264/calder-setup/bootstrap/calder_env.sh
+export PATH=/scratch-calder/users/kcwp264/envs/miniforge/agentic-sfm/bin:$PATH
+```
+
+On **AIRE (3×L40S)**:
 
 ```bash
 source /scratch/kcwp264/.aire_scratch_env.sh
-export PATH=/scratch/kcwp264/.conda_envs/agentic-sfm/bin:$PATH   # or activate the env
+export PATH=/scratch/kcwp264/.conda_envs/agentic-sfm/bin:$PATH
 ```
 
-The project environment is `/scratch/kcwp264/.conda_envs/agentic-sfm`. Generic alternative on other machines:
+Generic installation on other machines:
 
 ```bash
 conda create -n agentic-sfm python=3.11 -y
@@ -348,9 +433,9 @@ conda activate agentic-sfm
 pip install -e ".[dev,rl]"
 ```
 
-Caches (Hugging Face, uv, W&B) belong on `$SCRATCH`, not `$HOME`.
+Caches (Hugging Face, uv, Torch, W&B) belong on scratch, not `$HOME`.
 
-### 1. Start the tool server
+### 1. Start the Tool Server
 
 ```bash
 python tools_server/server.py
@@ -359,22 +444,20 @@ python tools_server/server.py
 
 `scripts/start_tool_server.sh [PORT] [GPU_ID]` starts the same server with uvicorn on GPU 2 by default, in the background.
 
-### 2. Run the tests
+### 2. Run the Test Suite & Regenerate Loss Diagrams
 
 ```bash
-cd /scratch/kcwp264/agentic-sfm
-/scratch/kcwp264/.conda_envs/agentic-sfm/bin/python -m pytest tests/ -q
+python -m pytest tests/ -q
+python scripts/generate_loss_diagrams.py   # regenerates docs/figures/*.png
 ```
 
-The suite has 350 tests. All 350 pass.
-
-### 3. Phase 0: zero-shot evaluation
+### 3. Phase 0: Zero-Shot Evaluation
 
 ```bash
 python scripts/run_zeroshot.py --config configs/phase0_zeroshot.yaml
 ```
 
-### 4. Phase 1: SFT warm start, then GRPO
+### 4. Phase 1: SFT Warm Start, Then GRPO
 
 Stock Qwen3.5-2B needs SFT on oracle crop traces to learn the tool-call contract before GRPO.
 
@@ -387,15 +470,13 @@ sbatch jobs/phase1_sft.slurm
 
 # Point configs/phase1_grpo.yaml model.sft_adapter at the SFT checkpoint, then:
 sbatch jobs/phase1_grpo.slurm        # general GRPO
-sbatch jobs/phase1_grpo_hard.slurm   # hard-pair GRPO (variant used for the hard-pair runs; check the job file before reuse)
+sbatch jobs/phase1_grpo_hard.slurm   # hard-pair GRPO
 
 # Pair-level evaluation
 sbatch jobs/eval_pair.slurm
 ```
 
-The pair files used here are `data/hard_pairs_{train,val}.json`. The "398 pairs" build in the earlier README is stale.
-
-### 5. Phase 2: scene SFT and GRPO
+### 5. Phase 2: Scene SFT and GRPO
 
 ```bash
 sbatch jobs/phase2_sft_scene.slurm
@@ -405,15 +486,15 @@ sbatch jobs/phase2_scene.slurm
 sbatch jobs/eval_scene.slurm
 ```
 
-### 6. Pose-prior benchmark
+### 6. Pose-Prior Benchmark
 
 ```bash
 sbatch jobs/bench_pose_priors.slurm
 ```
 
-This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It has already been rerun as job 8235219 (52 minutes; the numbers in "Pose-prior study"). Do not resubmit unless the run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run` (see the script for its arguments).
+This job downloads VGGT weights to `$SCRATCH` and uses one L40S for up to 4 hours. It has already been rerun as job 8235219 (52 minutes; the numbers in "Pose-Prior Study"). Do not resubmit unless the run has failed. The output directory is `outputs/bench_pose_priors/run_<jobid>/`. Dry-run check without a GPU: `python scripts/bench_pose_priors.py --dry-run`.
 
-### 7. OPSFT constrained SFT
+### 7. OPSFT Constrained SFT
 
 ```bash
 # Extract a direction artifact from an SFT→GRPO checkpoint pair
@@ -429,96 +510,112 @@ sbatch jobs/sft_opsft.slurm
 
 See [`docs/opsft.md`](docs/opsft.md) for the mapping to the paper, the two experiment arms (from-base / continue), and known differences.
 
-### 8. Calder 8×H200 run
+### 8. Calder 8×H200 & Isambard-AI 4×GH200 Runs
 
 ```bash
-bash scripts/stage_for_calder.sh           # on Aire: build 2.4 GB bundle
-# rsync bundle to Calder (Leeds-internal), then on Calder:
-AGENTIC_SFM_ROOT=$HOME/agentic-sfm bash unpack_on_calder.sh
+# On Calder (8xH200 NVL):
 sbatch jobs/calder_8xh200_hybrid.slurm
+
+# On Isambard-AI (4xGH200):
+sbatch jobs/isambard_4xgh200_hybrid.slurm
 ```
 
 See [`docs/calder_h200_runbook.md`](docs/calder_h200_runbook.md) for the storage budget, GPU layout, and the E1–E10 experiment matrix.
 
-## Repository layout
+---
+
+## Repository Layout
 
 ```
 agentic-sfm/
 ├── src/agentic_sfm/
-│   ├── agent/              # Policy, tool-call parsing
-│   ├── data/               # Hard-pair and scene dataset utilities
-│   ├── eval/               # Evaluation: evaluate.py, scene_eval.py, viz.py
-│   ├── graph/              # View-graph utilities
-│   ├── rewards/            # Pose AUC and shaping rewards
-│   ├── rl/                 # GRPO helpers, scene episodes
-│   ├── tools/              # Tool client
+│   ├── agent/                      # Policy, tool-call parsing & execution
+│   ├── data/                       # Hard-pair and scene dataset utilities
+│   ├── eval/                       # Evaluation: evaluate.py, scene_eval.py, viz.py
+│   ├── graph/                      # ViewGraph topology, components, cycle residuals
+│   ├── rewards/
+│   │   ├── pose_rewards.py         # Pair & scene reward composition
+│   │   └── reconstruction_loss.py  # 4-Pillar Mathematical & Visual 3D Reconstruction Losses
+│   ├── rl/                         # GRPO helpers, scene episodes, S-GRPO CGI oracle
+│   ├── tools/                      # Tool client & doppelganger verifier
 │   ├── constants.py
 │   ├── geometry.py
-│   ├── opsft.py            # OPSFT direction extraction + constraint enforcement
-│   ├── pose_prior.py       # Point-map → correspondences and relative pose (pose-prior study)
-│   ├── verl_agent_loop.py  # VeRL multi-turn agent loop (experimental)
-│   └── verl_reward.py      # VeRL reward hook (experimental)
+│   ├── opsft.py                    # OPSFT direction extraction + constraint enforcement
+│   ├── pose_prior.py               # Point-map → correspondences and relative pose
+│   ├── verl_agent_loop.py          # VeRL multi-turn agent loop (experimental)
+│   └── verl_reward.py              # VeRL reward hook (experimental)
 ├── tools_server/
-│   ├── server.py           # FastAPI tool server (match, crop, sfm_run, ...)
-│   └── sfm_worker.py       # sfm_run child process
-├── configs/                # Phase configs (phase0, phase1_*, phase2_* incl. OPSFT + Calder)
-├── scripts/                # Training, evaluation, data, and benchmark entry points
-│   ├── freeze_scene_manifest.py   # builds and verifies the frozen scene manifest
-│   ├── bench_pose_priors.py       # equal-budget matcher benchmark
-│   ├── extract_update_direction.py  # OPSFT direction extraction CLI
-│   ├── run_sft_opsft.py             # constrained SFT trainer
-│   ├── stage_for_calder.sh          # Aire→Calder slim staging packager
-│   ├── calder_agentic_sfm_env.sh    # Calder H200 env helper
-│   ├── eval_scene.py, run_scene_grpo.py, run_grpo.py, run_pair_eval.py, ...
+│   ├── server.py                   # FastAPI tool server (LoFTR, MASt3R, VGGT, MapAnything, graph tools)
+│   └── sfm_worker.py               # Isolated pycolmap child process
+├── configs/                        # Phase configs (phase0, phase1_*, phase2_*, Calder 8xH200, Isambard 4xGH200)
+├── scripts/
+│   ├── generate_loss_diagrams.py   # Generates docs/figures/*.png using live loss functions
+│   ├── freeze_scene_manifest.py    # Builds and verifies the 30-scene frozen ScanNet manifest
+│   ├── bench_pose_priors.py        # Equal-budget matcher benchmark
+│   ├── eval_budget_scaling.py      # 2D tool-budget x RL compute scaling-law evaluator
+│   ├── extract_update_direction.py # OPSFT direction extraction CLI
+│   ├── run_sft_opsft.py            # Constrained SFT trainer
+│   ├── build_scene_sft.py          # Scene SFT generator with diagnostic specialist routing
+│   └── eval_scene.py, run_scene_grpo.py, run_grpo.py, run_pair_eval.py, ...
 ├── data/
-│   ├── frozen_eval_manifest.json  # 30 frozen ScanNet scenes, sha256 in file
-│   ├── hard_pairs_all.json        # 1,535 pairs (scenes 0015, 0022)
-│   ├── hard_pairs_train.json      # 1,382 pairs
-│   ├── hard_pairs_val.json        # 153 pairs
-│   └── sft_*.jsonl                # SFT traces
+│   ├── frozen_eval_manifest.json   # 30 frozen ScanNet scenes, sha256 verified
+│   ├── hard_pairs_all.json         # 1,535 pairs (scenes 0015, 0022)
+│   ├── hard_pairs_train.json       # 1,382 pairs
+│   ├── hard_pairs_val.json         # 153 pairs
+│   └── sft_*.jsonl                 # SFT traces
 ├── docs/
-│   ├── scene_eval_and_env_proposal.md   # evaluation protocol, audit, pose-prior design
-│   ├── opsft.md                          # OPSFT constrained-SFT design + commands
-│   └── calder_h200_runbook.md            # Aire→Calder migration + experiment matrix
-├── paper/main.tex          # CVPR-style paper draft (self-contained LaTeX)
-├── jobs/                   # Slurm launchers (AIRE L40S + Calder H200)
-├── tests/                  # 350 tests
-├── results/                # Bundled Phase 0 outputs and figures (see results/README.md)
-└── outputs/                # Run artifacts referenced above (eval JSON, checkpoints)
+│   ├── reconstruction_losses.md        # Mathematical & visual 3D reconstruction loss spec + Mermaid diagrams
+│   ├── scene_eval_and_env_proposal.md  # Evaluation protocol, audit, pose-prior design
+│   ├── opsft.md                        # OPSFT constrained-SFT design + commands
+│   ├── calder_h200_runbook.md          # Aire→Calder migration + E1–E10 experiment matrix
+│   └── figures/                        # Architecture, 3x4 room demo, and response-surface plots
+├── paper/main.tex                  # CVPR-style paper draft (self-contained LaTeX)
+├── jobs/                           # Slurm launchers (AIRE L40S, Calder H200, Isambard GH200)
+├── tests/                          # Unit & integration test suite
+├── results/                        # Bundled Phase 0 outputs and figures (see results/README.md)
+└── outputs/                        # Run artifacts referenced above (eval JSON, checkpoints)
 ```
+
+---
 
 ## Data
 
 - **MegaDepth.** Scenes 0015 and 0022 are on disk and are the only MegaDepth scenes with images in this setup. The pair files reference them. Pair counts are in Known problems.
-- **ScanNet.** 100 scenes under `/scratch/kcwp264/data/megadepth/scannet_test_1500/scannet_test_1500`, in standard ScanNet layout (color frames, per-frame pose files, `intrinsic/intrinsic_color.txt`). ScanNet Terms of Use apply to any download or redistribution.
+- **ScanNet.** 100 scenes under `data/megadepth/scannet_test_1500/scannet_test_1500`, in standard ScanNet layout (color frames, per-frame depth PNGs, pose files, `intrinsic/intrinsic_color.txt`). ScanNet Terms of Use apply to any download or redistribution.
 - The dataset is not shipped in this repository. The repository contains pair files, manifests, and derived outputs only.
 
-## Models and licences
+---
+
+## Models and Licences
 
 Research use of the components below is permitted under their stated terms. Commercial use is restricted for several of them. The licence notes come from project documentation in `docs/` and `results/README.md`; they were not re-checked against each upstream repository for this README.
 
 | Component | Use here | Licence (as recorded) | Constraint |
 |---|---|---|---|
-| Qwen/Qwen3.5-2B | Policy | Apache 2.0 per upstream model card (not re-checked here) | None beyond the upstream licence. The official 2B checkpoint is the only 2B SKU; there is no separate Instruct variant. |
-| VGGT | Pose-prior backend (planned) | Original weights non-commercial; code licence per repo | Non-commercial weights. |
-| MASt3R | Matcher baseline | CC BY-NC-SA | Non-commercial, share-alike. |
-| Pi3 / Pi3X | Considered as alternative prior | Weights non-commercial (exact licence not recorded in project docs) | Not used. |
-| MapAnything | Considered as commercial alternative | Code Apache-2.0; Apache-licensed weight variant exists | Use the Apache weight variant if commercial use is needed. |
-| LoFTR | Frozen matcher | Per upstream repo | Check upstream before redistribution. |
+| `Qwen/Qwen3.5-2B` | Policy | Apache 2.0 per upstream model card (not re-checked here) | None beyond the upstream licence. The official 2B checkpoint is the only 2B SKU; there is no separate Instruct variant. |
+| `VGGT` | Pose-prior & 3D specialist backend | Original weights non-commercial; code licence per repo | Non-commercial weights. |
+| `MASt3R` | 3D specialist matcher & baseline | CC BY-NC-SA | Non-commercial, share-alike. |
+| `Pi3 / Pi3X` | Considered as alternative prior | Weights non-commercial (exact licence not recorded in project docs) | Not used. |
+| `MapAnything` | Metric 3D specialist backend (`facebook/map-anything-apache`) | Code Apache-2.0; Apache-licensed weight variant exists | Use the Apache weight variant if commercial use is needed. |
+| `LoFTR` | Fast frozen 2D matcher | Per upstream repo | Check upstream before redistribution. |
 
 **D4RT is not usable here.** As of the check recorded in `docs/scene_eval_and_env_proposal.md` §8, no official code or weights are released. The project page links only the paper and blog. Unofficial reimplementations exist but are unverified. It is video-oriented, has no unordered sparse-view benchmark, and does not accept intrinsics or poses. It is not in the candidate set.
 
+---
+
 ## Roadmap
 
-Publication target: CVPR 2027 (ICCV 2027 fallback). Working thesis: **learned, budget-aware orchestration over classical and feed-forward 3D specialists**.
+Publication target: CVPR 2027 (ICCV 2027 fallback). Working thesis: **learned, budget-aware orchestration over classical and feed-forward 3D specialists driven by verifiable 3D reconstruction losses**.
 
 1. ~~Run the VGGT confidence diagnostic and rerun the matcher benchmark.~~ Done: `diagnose_vggt_conf` (job 8214266) lowered the VGGT confidence threshold to 3.0; benchmark rerun job 8235219 produced the pose-prior table above. VGGT train/test overlap with our ScanNet scenes remains unconfirmed.
-2. **Fix the matcher collapse** (the blocker for any routing claim): forced specialist exploration and/or mixed-specialist SFT trajectories; matcher-fraction telemetry already lands in `run_scene_grpo.py`.
-3. **Run the Calder 8×H200 matrix** (`jobs/calder_8xh200_hybrid.slurm`, `docs/calder_h200_runbook.md`): hybrid GRPO on the multi-domain curriculum, parallel OPSFT top-10%/exact arms, and automatic frozen-manifest eval — plus LoFTR-only and single-specialist controls at identical budget.
+2. ~~Implement Track-B anti-collapse specialist routing and 4-Pillar Mathematical + Visual 3D Reconstruction Losses.~~ Done: diagnostic-conditioned mixed-specialist SFT, $\epsilon$-forced specialist exploration, `mapanything` backend, and `src/agentic_sfm/rewards/reconstruction_loss.py` (`docs/reconstruction_losses.md`) are implemented and unit-tested.
+3. **Run the Calder 8×H200 & Isambard 4×GH200 experiment matrix** (`jobs/calder_8xh200_hybrid.slurm`, `docs/calder_h200_runbook.md`): hybrid GRPO on the multi-domain curriculum, R0–R3 reconstruction-loss ablations, parallel OPSFT top-10%/exact arms, and automatic frozen-manifest eval — plus LoFTR-only and single-specialist controls at identical budget.
 4. **Run the held-out evaluation** on the 30-scene frozen manifest with equal-budget baselines (consecutive, random, top-k retrieval, direct, GT-overlap oracle, SFT-only, each fixed specialist) and scene-level paired bootstrap intervals.
 5. **OPSFT vs GRPO head-to-head** on the frozen manifest; report whether constrained SFT preserves the RL direction's gains.
 6. Write up: `paper/main.tex` is the working draft. Correct the public project page (pair count, scene count, agent limits, Phase 1/2 status) before any public claim.
 7. Fix phase-1 checkpoint persistence so written adapters are verified non-identical to init (see Known problems).
+
+---
 
 ## Citation
 
