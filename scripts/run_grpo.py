@@ -1286,28 +1286,7 @@ class GRPOTrainer:
                 new_tok = new_logps[:n][mask].to(torch.float32)
                 old_tok = old_logps[:n][mask].to(torch.float32).detach()
 
-                # μ-GRPO off-support veto: with a negative advantage, do not
-                # keep pushing down tokens the policy already finds implausible
-                # (old_logp very negative) — that pressure is what shoves the
-                # model into narrow degenerate modes.
-                keep = None
-                if adv < 0 and self.off_support_threshold is not None:
-                    keep = old_tok >= self.off_support_threshold
-                    if int(keep.sum()) == 0:
-                        continue
-                    new_tok = new_tok[keep]
-                    old_tok = old_tok[keep]
-
-                ratio = torch.exp(new_tok - old_tok)
-                clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high)
-                adv_tensor = torch.tensor(adv, device=ratio.device, dtype=ratio.dtype)
-                loss = -torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor).mean()
-
-                # KL(pi_theta || pi_SFT) per token (k3 estimator, >= 0). Anchors
-                # the policy to the distribution that writes clean tool JSON so
-                # RL cannot drift into degenerate/repetitive modes. The same
-                # veto subset is applied to the reference tokens so all three
-                # sequences stay aligned.
+                ref_full = None
                 if ref_results is not None:
                     ref_logps, ref_mask = ref_results[i]
                     if ref_logps.ndim > 0 and ref_mask.numel() > 0:
@@ -1317,19 +1296,26 @@ class GRPOTrainer:
                             .to(device=new_tok.device, dtype=torch.float32)
                             .detach()
                         )
-                        if keep is not None:
-                            ref_full = ref_full[: keep.shape[0]][keep]
-                        k = min(new_tok.shape[0], ref_full.shape[0])
-                        if k > 0:
-                            kl = torch.exp(ref_full[:k] - new_tok[:k]) - (ref_full[:k] - new_tok[:k]) - 1.0
-                            loss = loss + self.kl_coef * kl.mean()
 
-                # Scale by 1/grad_accum for gradient accumulation
-                loss = loss / self.grad_accum
+                from agentic_sfm.kernels import fused_grpo_kl_loss
+
+                loss, ok = fused_grpo_kl_loss(
+                    new_tok,
+                    old_tok,
+                    ref_full,
+                    advantage=float(adv),
+                    clip_low=self.clip_low,
+                    clip_high=self.clip_high,
+                    kl_coef=self.kl_coef if ref_full is not None else 0.0,
+                    off_support_threshold=self.off_support_threshold,
+                    grad_accum=self.grad_accum,
+                )
+                if not ok:
+                    continue
                 loss.backward()
 
                 total_loss += float(loss.detach().item())
-                del new_logps, new_mask, ratio, clipped_ratio, loss
+                del new_logps, new_mask, loss
                 valid_count += 1
             except Exception as e:
                 logger.warning(f"Policy gradient failed for episode {i}: {e}")

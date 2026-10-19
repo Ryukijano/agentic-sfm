@@ -52,6 +52,13 @@ from agentic_sfm.eval.scene_eval import (
     _rotation_gauge,
     _umeyama,
 )
+from agentic_sfm.kernels import (
+    fast_all_pairs_pose_maa,
+    fast_chamfer_min_dists,
+    fast_gaussian_splat_compositor,
+    fast_multiview_patch_zncc,
+    fast_orthographic_rasterize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -308,43 +315,12 @@ def compute_all_pairs_pose_maa(
     Pairs where either image is unregistered receive 180° rotation and
     translation error, so abstaining on difficult views cannot inflate AUC.
     """
-    all_ids = sorted(gt_poses.keys())
-    n_total = max(int(num_total_images or len(all_ids)), len(all_ids))
-    if n_total < 2:
-        return {"all_pairs_maa": 0.0, "maa_5": 0.0, "maa_10": 0.0, "maa_20": 0.0}
-
-    total_pairs = n_total * (n_total - 1) // 2
-    pass_counts = {float(t): 0 for t in thresholds}
-
-    for idx_a, i in enumerate(all_ids):
-        for j in all_ids[idx_a + 1 :]:
-            if i not in pred_poses or j not in pred_poses:
-                continue
-            Mp_i, Mp_j = pred_poses[i], pred_poses[j]
-            Mg_i, Mg_j = gt_poses[i], gt_poses[j]
-
-            R_rel_p = Mp_j[:3, :3] @ Mp_i[:3, :3].T
-            R_rel_g = Mg_j[:3, :3] @ Mg_i[:3, :3].T
-            rot_err = _rot_geodesic_deg(R_rel_p, R_rel_g)
-
-            # Relative translation in camera j's frame: t_{j<-i} = t_j - R_{j<-i} t_i
-            t_rel_p = Mp_j[:3, 3] - R_rel_p @ Mp_i[:3, 3]
-            t_rel_g = Mg_j[:3, 3] - R_rel_g @ Mg_i[:3, 3]
-            trans_err = _direction_err_deg(t_rel_p, t_rel_g)
-
-            err = max(rot_err, trans_err)
-            for t in thresholds:
-                if err < t:
-                    pass_counts[float(t)] += 1
-
-    per_t = {float(t): pass_counts[float(t)] / max(total_pairs, 1) for t in thresholds}
-    maa = float(np.mean(list(per_t.values())))
-    return {
-        "all_pairs_maa": maa,
-        "maa_5": per_t.get(5.0, 0.0),
-        "maa_10": per_t.get(10.0, 0.0),
-        "maa_20": per_t.get(20.0, 0.0),
-    }
+    return fast_all_pairs_pose_maa(
+        pred_poses,
+        gt_poses,
+        num_total_images=num_total_images,
+        thresholds=thresholds,
+    )
 
 
 def align_poses_and_points_sim3(
@@ -472,11 +448,8 @@ def compute_pointcloud_f1(
     if len(G_vox) == 0:
         G_vox = G
 
-    tree_gt = cKDTree(G)
-    tree_pred = cKDTree(P)
-
-    d_p2g, _ = tree_gt.query(P, k=1)
-    d_g2p, _ = tree_pred.query(G_vox, k=1)
+    d_p2g, _ = fast_chamfer_min_dists(P, G)
+    _, d_g2p = fast_chamfer_min_dists(P, G_vox)
 
     acc = float(np.mean(np.minimum(d_p2g, max_dist)))
     comp = float(np.mean(np.minimum(d_g2p, max_dist)))
@@ -633,61 +606,15 @@ def _rasterize_orthographic_view(
 
     Returns ``(occupancy_mask (H,W) bool, depth_norm (H,W) float, rgb (H,W,3) float)``.
     """
-    H = W = int(grid_size)
-    occ = np.zeros((H, W), dtype=bool)
-    depth_buf = np.full((H, W), np.inf, dtype=np.float64)
-    rgb_buf = np.zeros((H, W, 3), dtype=np.float64)
-
-    if len(points) == 0:
-        return occ, np.zeros((H, W), dtype=np.float64), rgb_buf
-
-    au, av, az = axes
-    span = np.maximum(bounds_max - bounds_min, 1e-6)
-    u_norm = (points[:, au] - bounds_min[au]) / span[au]
-    v_norm = (points[:, av] - bounds_min[av]) / span[av]
-    z_norm = (points[:, az] - bounds_min[az]) / span[az]
-
-    in_box = (
-        (u_norm >= 0.0) & (u_norm <= 1.0)
-        & (v_norm >= 0.0) & (v_norm <= 1.0)
-        & np.isfinite(z_norm)
+    return fast_orthographic_rasterize(
+        points,
+        colors,
+        bounds_min,
+        bounds_max,
+        axes,
+        grid_size=grid_size,
+        dilation_radius=dilation_radius,
     )
-    if not np.any(in_box):
-        return occ, np.zeros((H, W), dtype=np.float64), rgb_buf
-
-    u_px = np.clip((u_norm[in_box] * (W - 1)).astype(np.int64), 0, W - 1)
-    v_px = np.clip((v_norm[in_box] * (H - 1)).astype(np.int64), 0, H - 1)
-    z_val = np.clip(z_norm[in_box], 0.0, 1.0)
-    cols = (
-        np.clip(colors[in_box], 0.0, 1.0)
-        if len(colors) == len(points)
-        else np.ones((len(u_px), 3), dtype=np.float64) * 0.7
-    )
-
-    # Sort back-to-front so nearest points overwrite in a single vectorized pass
-    order = np.argsort(-z_val)
-    u_px, v_px, z_val, cols = u_px[order], v_px[order], z_val[order], cols[order]
-    occ[v_px, u_px] = True
-    depth_buf[v_px, u_px] = z_val
-    rgb_buf[v_px, u_px] = cols
-
-    if dilation_radius > 0 and occ.any():
-        struct = np.ones((2 * dilation_radius + 1, 2 * dilation_radius + 1), dtype=bool)
-        occ_dil = binary_dilation(occ, structure=struct)
-        # Propagate nearest valid RGB/depth into dilated neighborhood via small shifts
-        for dy in range(-dilation_radius, dilation_radius + 1):
-            for dx in range(-dilation_radius, dilation_radius + 1):
-                if dx == 0 and dy == 0:
-                    continue
-                shifted_occ = np.roll(np.roll(occ, dy, axis=0), dx, axis=1)
-                fill = shifted_occ & ~occ
-                if fill.any():
-                    rgb_buf[fill] = np.roll(np.roll(rgb_buf, dy, axis=0), dx, axis=1)[fill]
-                    depth_buf[fill] = np.roll(np.roll(depth_buf, dy, axis=0), dx, axis=1)[fill]
-        occ = occ_dil
-
-    depth_out = np.where(occ, depth_buf, 0.0)
-    return occ, depth_out, rgb_buf
 
 
 def compute_orthographic_3d_render_loss(
@@ -848,40 +775,15 @@ def render_pointcloud_splat(
     z_ord = z[order]
     cols_ord = cols[order]
 
-    r = max(int(splat_radius_px), 0)
-    sigma = max(r * 0.75, 0.8)
-    transmittance = np.ones((H, W), dtype=np.float64)
-
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            weight = math.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma)) * 0.85
-            vy = np.clip(v_px + dy, 0, H - 1)
-            ux = np.clip(u_px + dx, 0, W - 1)
-            # First hit at each pixel (closest depth) dominates
-            layer_alpha = np.zeros((H, W), dtype=np.float64)
-            layer_rgb = np.zeros((H, W, 3), dtype=np.float64)
-            layer_z = np.zeros((H, W), dtype=np.float64)
-            # Reverse order so front-most overwrites
-            rev = slice(None, None, -1)
-            layer_alpha[vy[rev], ux[rev]] = weight
-            layer_rgb[vy[rev], ux[rev]] = cols_ord[rev]
-            layer_z[vy[rev], ux[rev]] = z_ord[rev]
-
-            contrib = transmittance * layer_alpha
-            rgb_out += contrib[..., None] * layer_rgb
-            depth_out += contrib * layer_z
-            transmittance *= 1.0 - layer_alpha
-
-    opacity_out = 1.0 - transmittance
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rgb_out = np.where(opacity_out[..., None] > 1e-6, rgb_out / opacity_out[..., None], 0.0)
-        depth_out = np.where(opacity_out > 1e-6, depth_out / opacity_out, 0.0)
-
-    return {
-        "rgb": np.clip(rgb_out, 0.0, 1.0),
-        "opacity": np.clip(opacity_out, 0.0, 1.0),
-        "depth": depth_out,
-    }
+    return fast_gaussian_splat_compositor(
+        u_px,
+        v_px,
+        z_ord,
+        cols_ord,
+        height=H,
+        width=W,
+        splat_radius_px=splat_radius_px,
+    )
 
 
 def compute_splat_render_loss(
@@ -1048,57 +950,13 @@ def compute_multiview_patch_consistency(
             "num_consistent_points": 0,
         }
 
-    r = max(int(patch_radius), 1)
-    # Pre-project all points into each loaded view
-    proj_uv: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    for idx, img in loaded_imgs.items():
-        H, W = img.shape[:2]
-        M = poses[idx]
-        K_mat = Ks[idx]
-        p_cam = (M[:3, :3] @ pts.T).T + M[:3, 3]
-        z = p_cam[:, 2]
-        u = np.round(K_mat[0, 0] * p_cam[:, 0] / np.maximum(z, 1e-6) + K_mat[0, 2]).astype(np.int64)
-        v = np.round(K_mat[1, 1] * p_cam[:, 1] / np.maximum(z, 1e-6) + K_mat[1, 2]).astype(np.int64)
-        valid = (z > 0.1) & (u >= r) & (u < W - r) & (v >= r) & (v < H - r)
-        proj_uv[idx] = (u, v, valid)
-
-    point_losses = []
-    for p_idx in range(len(pts)):
-        patches = []
-        for idx, img in loaded_imgs.items():
-            u, v, valid = proj_uv[idx]
-            if valid[p_idx]:
-                ui, vi = u[p_idx], v[p_idx]
-                patches.append(img[vi - r : vi + r + 1, ui - r : ui + r + 1])
-        if len(patches) < 2:
-            continue
-        stack = np.stack(patches, axis=0)  # (V, 2r+1, 2r+1, 3)
-        mean_patch = np.mean(stack, axis=0, keepdims=True)
-        l1 = float(np.mean(np.abs(stack - mean_patch)))
-
-        # ZNCC against mean patch
-        s_flat = stack.reshape(len(patches), -1)
-        m_flat = mean_patch.reshape(1, -1)
-        s_zero = s_flat - s_flat.mean(axis=1, keepdims=True)
-        m_zero = m_flat - m_flat.mean(axis=1, keepdims=True)
-        denom = np.linalg.norm(s_zero, axis=1) * np.linalg.norm(m_zero, axis=1)
-        zncc = np.where(denom > 1e-6, (s_zero * m_zero).sum(axis=1) / denom, 1.0)
-        zncc_loss = float(np.mean(0.5 * (1.0 - np.clip(zncc, -1.0, 1.0))))
-        point_losses.append(0.5 * l1 + 0.5 * zncc_loss)
-
-    if not point_losses:
-        return {
-            "patch_reproj_loss": 1.0,
-            "patch_consistency_reward": 0.0,
-            "num_consistent_points": 0,
-        }
-
-    loss = float(np.mean(point_losses))
-    return {
-        "patch_reproj_loss": loss,
-        "patch_consistency_reward": float(np.clip(1.0 - loss, 0.0, 1.0)),
-        "num_consistent_points": len(point_losses),
-    }
+    return fast_multiview_patch_zncc(
+        pts,
+        loaded_imgs,
+        poses,
+        Ks,
+        patch_radius=patch_radius,
+    )
 
 
 # ---------------------------------------------------------------------------

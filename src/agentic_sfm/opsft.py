@@ -225,28 +225,15 @@ def mask_gradients_(
     canonical name is absent from ``mask`` (or with ``.grad is None``) are
     left untouched. Returns counts of zeroed entries.
     """
-    stats = {"zeroed_outside": 0, "zeroed_opposite": 0,
-             "n_trainable": 0, "n_constrained": 0}
-    for name, p in named_params:
-        if p.grad is None:
-            continue
-        stats["n_trainable"] += 1
-        cname = canonical_lora_name(name, adapter_name)
-        m = mask.get(cname)
-        if m is None:
-            continue
-        stats["n_constrained"] += 1
-        d = sign[cname].to(device=p.grad.device)
-        m = m.to(device=p.grad.device)
-        g = p.grad
-        gf = g.float()
-        outside = ~m
-        opposite = m & (g != 0) & (d != 0) & (gf * d.float() > 0)
-        stats["zeroed_outside"] += int(outside.sum())
-        stats["zeroed_opposite"] += int(opposite.sum())
-        zero = outside | opposite
-        g[zero] = 0
-    return stats
+    from agentic_sfm.kernels import fused_opsft_mask_gradients_
+
+    return fused_opsft_mask_gradients_(
+        named_params,
+        mask,
+        sign,
+        canonical_name_fn=canonical_lora_name,
+        adapter_name=adapter_name,
+    )
 
 
 def project_parameters_(
@@ -262,25 +249,14 @@ def project_parameters_(
     Caller must wrap in ``torch.no_grad()``. Params absent from ``mask``
     are untouched. Returns restore counts.
     """
-    stats = {"restored_outside": 0, "restored_wrong": 0, "n_constrained": 0}
-    for name, p in named_params:
-        cname = canonical_lora_name(name, adapter_name)
-        m = mask.get(cname)
-        if m is None:
-            continue
-        t0 = theta0.get(cname)
-        if t0 is None:
-            logger.warning("theta0 missing entry for %s; skipping", cname)
-            continue
-        stats["n_constrained"] += 1
-        m = m.to(device=p.device)
-        d = sign[cname].to(device=p.device).float()
-        t0 = t0.to(device=p.device, dtype=p.dtype)
-        delta = (p - t0).float()
-        outside = ~m
-        wrong = m & (d != 0) & (delta * d < 0)
-        stats["restored_outside"] += int(outside.sum())
-        stats["restored_wrong"] += int(wrong.sum())
-        restore = outside | wrong
-        p[restore] = t0[restore]
-    return stats
+    from agentic_sfm.kernels import fused_opsft_project_parameters_
+
+    return fused_opsft_project_parameters_(
+        named_params,
+        theta0,
+        mask,
+        sign,
+        canonical_name_fn=canonical_lora_name,
+        adapter_name=adapter_name,
+        logger=logger,
+    )
