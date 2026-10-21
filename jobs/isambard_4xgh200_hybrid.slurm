@@ -44,6 +44,7 @@ echo "Start: $(date -Iseconds)"
 
 export SFM_OUTPUT_ROOT="/dev/shm/${USER}/asfm_sfm_${SLURM_JOB_ID:-0}"
 export LORA_STAGING_DIR="/dev/shm/${USER}/asfm_lora_${SLURM_JOB_ID:-0}"
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=1  # required for /v1/load_lora_adapter (otherwise 404)
 mkdir -p "${SFM_OUTPUT_ROOT}" "${LORA_STAGING_DIR}"
 
 VLLM_PORT=$((39000 + ${SLURM_JOB_ID:-0} % 10000))

@@ -63,7 +63,10 @@ _mast3r_repo="${MAST3R_REPO:-$CALDER_SCRATCH/src/mast3r}"
 if [[ ! -d "${_mast3r_repo}" && -d /scratch/kcwp264/src/mast3r ]]; then
   _mast3r_repo=/scratch/kcwp264/src/mast3r   # Aire fallback (testing)
 fi
-export PYTHONPATH="${AGENTIC_SFM_ROOT}/src:${_mast3r_repo}:${_mast3r_repo}/dust3r:${PYTHONPATH:-}"
+# VGGT is pip-installed editable from an Aire path (/mnt/scratch/...) that does not exist
+# on Calder; put the Calder checkout first so `import vggt.models.vggt` resolves.
+_vggt_repo="${VGGT_REPO:-${CALDER_SCRATCH}/repos/src/vggt}"
+export PYTHONPATH="${AGENTIC_SFM_ROOT}/src:${_vggt_repo}:${_mast3r_repo}:${_mast3r_repo}/dust3r:${PYTHONPATH:-}"
 
 # vLLM 0.28 ships flashinfer-python with flashinfer-cubin; skip version check.
 export FLASHINFER_DISABLE_VERSION_CHECK=1

@@ -31,7 +31,10 @@ echo "Node: ${SLURM_NODELIST}"
 echo "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
 echo "Start: $(date)"
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Slurm runs a spooled copy of this script, so BASH_SOURCE points at
+# /var/spool/slurm; resolve the repo from the submit dir (or an override).
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?submit from the repo root}}"
+[[ -f "${PROJECT_ROOT}/scripts/calder_agentic_sfm_env.sh" ]] || { echo "ERROR: ${PROJECT_ROOT} is not the agentic-sfm repo root"; exit 1; }
 CONFIG="${PROJECT_ROOT}/configs/phase2_calder_smoke.yaml"
 OUTPUT_DIR="${PROJECT_ROOT}/outputs/phase2_smoke/run_${SLURM_JOB_ID}"
 SCENE_SFT="${PROJECT_ROOT}/outputs/scene_sft_graph_retry2/checkpoints/epoch_5"
@@ -39,6 +42,7 @@ LOG_DIR="${PROJECT_ROOT}/logs/agentic-sfm"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
 source "${PROJECT_ROOT}/scripts/calder_agentic_sfm_env.sh"
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=1  # required for /v1/load_lora_adapter (otherwise 404)
 
 FLASH="${CALDER_FLASH:-/dev/shm/${USER}}"
 export SFM_OUTPUT_ROOT="${FLASH}/asfm_sfm_smoke_${SLURM_JOB_ID}"

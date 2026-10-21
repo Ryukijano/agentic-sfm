@@ -1,0 +1,43 @@
+# Phase 2a (mixed-specialist, 2 domains): scene-level SFT warmup — replaces the LoFTR-only
+# warm start that caused matcher collapse (job 8237240). Data: build_scene_sft.py --matcher mixed.
+# LoRA fine-tuning of Qwen3.5-2B on oracle scene trajectories (scene tool
+# grammar: retrieve -> match/crop_and_match -> doppelganger_check -> sfm_run
+# -> inspect -> done). Runs BEFORE phase2_scene GRPO — same role as
+# phase1_sft.yaml played for pair-level training.
+#
+# Data: scripts/build_scene_sft.py -> data/scene_sft_train.jsonl
+# Train: python scripts/run_sft.py --config configs/phase2_sft_scene.yaml
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  max_new_tokens: 512
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "gate_proj", "up_proj", "down_proj"]
+
+training:
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  total_epochs: 5
+  batch_size: 1
+  gradient_accumulation_steps: 8  # effective batch size = 8
+  max_grad_norm: 1.0
+  save_freq: 1
+
+data:
+  sft_data: "data/scene_sft_mixed_train.jsonl"
+  # 401,408 px = <=512 vision tokens/image at patch16+merge2; 8 image slots
+  # -> ~4k vision tokens per example (was ~8k at 1,003,520 px).
+  max_image_pixels: 401408
+
+output:
+  checkpoint_dir: "outputs/scene_sft_mixed/checkpoints"
+  results_dir: "outputs/scene_sft_mixed"
+  log_dir: "logs/scene_sft_mixed"
+  wandb_project: "agentic-sfm"
+  wandb_entity: null
+  wandb_run_name: "phase2-scene-graph-sft-qwen35-2b-retry2"
+  wandb_enabled: true

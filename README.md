@@ -11,7 +11,7 @@
 [![HF Checkpoints & Artifacts](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-agentic--sfm--qwen35--2b-FFD21E)](https://huggingface.co/Ryukijano/agentic-sfm-qwen35-2b)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**Overview**](#summary) · [**Architecture**](#how-it-works) · [**3D Reconstruction Losses (Math + Visual)**](#mathematical--visual-3d-reconstruction-losses) · [**Pose Priors & Routing**](#pose-prior-study) · [**OPSFT**](#opsft-style-constrained-sft) · [**Empirical Results & Audit**](#results) · [**Quick Start**](#quick-start)
+[**Overview**](#summary) · [**Method & Vision**](#method-vision-and-current-evidence-living-section) · [**Architecture**](#how-it-works) · [**3D Reconstruction Losses (Math + Visual)**](#mathematical--visual-3d-reconstruction-losses) · [**Pose Priors & Routing**](#pose-prior-study) · [**OPSFT**](#opsft-style-constrained-sft) · [**Empirical Results & Audit**](#results) · [**Quick Start**](#quick-start)
 
 </div>
 
@@ -50,6 +50,65 @@ Instead of relying on human preference labels or easily gamed tool-call proxies,
 | **4-Pillar 3D Reconstruction Losses** | Implemented & tested | Intrinsic BA/track/$\lambda_2$/cycle math + Extrinsic $\mathrm{Sim}(3)$ all-pairs mAA/ATE/depth/3D-$\text{F}_1$ + Visual 3-view BEV/ortho, point-splat SSIM, patch ZNCC, & 4-panel VLM loop closure. | `src/agentic_sfm/rewards/reconstruction_loss.py`, [`docs/reconstruction_losses.md`](docs/reconstruction_losses.md) |
 | **OPSFT constrained SFT** | Implemented & extracted | LoRA bf16 adaptation of arXiv:2609.36659. Exact support is `99.998%` dense under AdamW; top-10% mask selects `3.36M / 33.6M` params. | `src/agentic_sfm/opsft.py`, `scripts/run_sft_opsft.py`, [`docs/opsft.md`](docs/opsft.md) |
 | **Calder 8×H200 & Isambard 4×GH200** | Staged & ready | 40-scene ScanNet + MegaDepth curriculum, vLLM TP=2 @ 16k ctx, parallel OPSFT arms, and 30-scene frozen evaluation matrix. | `configs/phase2_calder_8xh200.yaml`, `configs/phase2_isambard_4xgh200.yaml`, [`docs/calder_h200_runbook.md`](docs/calder_h200_runbook.md) |
+
+---
+
+## Method, Vision and Current Evidence (living section)
+
+*Last updated 2026-10-21. This section is the source of truth for where the idea stands; update it whenever a result changes the plan.*
+
+### Vision
+
+A small VLM that acts as a **photogrammetry director**: it decides which image pairs to match, with which specialist, when to crop, when to distrust an edge (doppelgängers), and when to stop, so that SfM succeeds on scenes where a fixed pipeline fails. Training is RL with **verifiable** rewards computed on the reconstruction itself (poses, coverage, 3D geometry), never on tool-call syntax.
+
+The idea only survives if a learned policy beats strong **fixed** baselines at equal budget. The project is therefore organised around falsifying it cheaply before spending more RL compute.
+
+### Method (current)
+
+1. **Tool server** (`tools_server/server.py`): LoFTR, MASt3R, VGGT, MapAnything matchers/pose priors, view-graph tools, and a sandboxed `pycolmap` `sfm_run` that imports the agent's cached matches.
+2. **Policy**: `Qwen/Qwen3.5-2B` + LoRA (r=32), multi-turn JSON tool calls.
+3. **Warm start**: small SFT only to teach the tool-call contract (`jobs/calder_scene_sft_mixed.slurm`). Latest run (job `229846`, Calder 1xH200, 2h53m): 5 epochs / 500 steps / 800 valid samples per epoch, epoch-mean loss 0.0053 to 0.0035, flat from epoch 3. Adapters: `outputs/scene_sft_mixed/checkpoints/epoch_{1..5}` (LoRA-B tensors verified non-zero). Loss that low on templated targets says little about task quality; there is no held-out eval yet.
+4. **RL**: GRPO / S-GRPO with the 4-pillar reconstruction reward (below). Smoke-tested on Calder (job `229523`), but see the blocker in "Known issues".
+5. **Evaluation protocol**: 30 frozen ScanNet scenes (`data/frozen_eval_manifest.json`), scene as the unit, scene-level bootstrap intervals, unregistered images counted as failures.
+
+### What we have learned so far
+
+| Finding | Evidence | Consequence |
+|---|---|---|
+| The pair-level agent does not beat plain LoFTR on hard pairs (62% vs 88% success) | `outputs/eval_pair/phase1_hard_best_8019429.json` | No evidence yet that RL learned more than the tool-call format |
+| Reward rising is not quality: the 0.5 first-call validity bonus is about half of typical reward | Phase 2 audit | Remove the bonus before any new RL run |
+| Feed-forward pose (VGGT head, MASt3R) dominates LoFTR on indoor ScanNet pairs | Pose-prior study (below) | The fixed baseline "always VGGT (+ BA)" is the bar to beat |
+| **Pair-level matcher routing has almost no headroom.** Best single tool, true AUC@10: 0.340 (VGGT head). Per-scene oracle router: 0.343. Per-pair oracle router (a loose, noise-selecting ceiling): 0.416, about +5 points of success | Oracle-router analysis of `outputs/bench_pose_priors/run_8235219`, independently recomputed from the raw JSON | A VLM matcher-router is not justified at pair level; the open question is scene-level decisions (which pairs to match, bridging, pruning) |
+| The "AUC" columns in the pose-prior table below are success rates (fraction of pairs under the threshold), not AUCs | `np.mean(errs <= t)` in `scripts/bench_pose_priors.py` | Corrected table below; do not cite the old numbers as AUC |
+
+### Active experiment: scene-level oracle study
+
+Question: at scene level, how much better is the per-scene best of several fixed strategies than the best single strategy? If the gap is small, a learned scene-level policy has little to gain.
+
+- Driver `scripts/run_scene_oracle.py`, job `jobs/calder_scene_oracle.slurm` (3-task array, one per matcher, 1xH200 each, no agent and no vLLM).
+- Strategies: `window1`, `window2` (match each frame with its next 1 or 2), `knn` (DINOv2 top-5), `exhaustive`; matchers: LoFTR, MASt3R, VGGT; 30 scenes, 20 images each, through the same cached-match `sfm_run` path.
+- Metric: `allpairs_succ_T` = pairs with rotation and translation-direction error under T degrees over **all** C(N,2) pairs, so abstention is penalised.
+- Analysis: `python scripts/analyze_scene_oracle.py outputs/scene_oracle` reports best single combo, per-scene oracle, and a scene-bootstrap 95% CI of the oracle gain (upward-biased: a max over noisy arms).
+- Validity guards: the driver aborts if a MASt3R/VGGT call silently falls back to LoFTR, and the analysis refuses to run on rows with fallbacks. A first launch was cancelled because VGGT was importing from a non-existent Aire path and every VGGT match was LoFTR.
+- Known confound: knn/exhaustive import only edges with at least 15 inliers into COLMAP; window strategies import every matched pair.
+- Status: running (job `230690`); results will be added here.
+
+### Decision gates
+
+Only restart RL if the evidence supports it:
+
+1. The scene-level oracle gap over the best fixed strategy is large and its bootstrap interval excludes zero.
+2. The deciding signal is something a VLM can see (appearance, symmetry, crop content), not only numbers a small router could use.
+3. The policy beats "always VGGT then bundle adjustment" and the consecutive-frame heuristic at equal compute on the 30 frozen scenes.
+4. A shuffled-label reward control does not improve held-out metrics.
+
+If gate 1 fails, change direction (for example, focus on doppelgänger and coverage failures, or drop the routing framing).
+
+### Known issues
+
+- **vLLM runtime LoRA loading on Calder/Isambard.** The Calder smoke run logged `HTTP 404` on `/v1/load_lora_adapter`, so rollouts stayed on the base model. The Calder and Isambard job scripts passed `--enable-lora` but did not export `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1` (the AIRE scripts do). The export is now added; it is untested on a real run.
+- **Aire-only paths:** the frozen manifest and several jobs reference `/scratch/kcwp264` and `/mnt/scratch`; override with `--scannet-root` or use the Calder jobs. VGGT's editable install points at an Aire path, so `scripts/calder_agentic_sfm_env.sh` puts the Calder checkout on `PYTHONPATH`.
+- The held-out claim is weak: the 8 ScanNet scenes used in Phase 2 are development data, and VGGT's possible ScanNet training overlap is unconfirmed.
 
 ---
 
@@ -309,7 +368,9 @@ Job status: rerun benchmark job 8235219 completed in 52 minutes on one L40S. Out
 
 Setup: 30 frozen ScanNet scenes, 39 identical pairs per scene (19 consecutive, 20 seeded-random), 1,170 pairs per matcher. Pair error is the worst of rotation and translation-direction error, in degrees. Pairs with no pose count as failures in every AUC, so the AUC denominator is always 1,170.
 
-| Pose source | AUC@5 | AUC@10 | AUC@20 | Pairs with a pose | Median error | Median latency |
+> **Correction (2026-10-21):** the "AUC" columns in this table are success rates, the fraction of pairs with error at or below the threshold (`np.mean(errs <= t)`), not areas under the recall curve. Independently recomputed true AUC@5/10/20 (failed pairs = 180 degrees): LoFTR 0.054 / 0.125 / 0.215, MASt3R 0.162 / 0.302 / 0.426, VGGT RANSAC 0.052 / 0.107 / 0.165, VGGT extrinsics head 0.157 / 0.340 / 0.528. The VGGT head still leads at AUC@10 and AUC@20; MASt3R is slightly ahead at AUC@5.
+
+| Pose source | Success@5 | Success@10 | Success@20 | Pairs with a pose | Median error | Median latency |
 |---|---|---|---|---|---|---|
 | LoFTR, RANSAC essential matrix | 0.137 | 0.240 | 0.349 | 1,170 / 1,170 | 68.85° | 0.062s |
 | VGGT, RANSAC on correspondences ($t=3.0$) | 0.120 | 0.191 | 0.244 | 484 / 1,170 | 11.70° (on valid pairs) | 1.280s |
