@@ -153,6 +153,8 @@ def main() -> int:
     ap.add_argument("--knn-k", type=int, default=5)
     ap.add_argument("--strategies", nargs="+", default=["window1", "window2", "knn", "exhaustive"])
     ap.add_argument("--tool-server-url", default="http://127.0.0.1:8765")
+    ap.add_argument("--http-timeout", type=float, default=1800.0,
+                    help="Tool-server request timeout; exhaustive build_initial_graph is one long call")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--sfm-output-base", default="sfm_runs", help="output_dir_base passed to sfm_run")
     args = ap.parse_args()
@@ -180,7 +182,7 @@ def main() -> int:
                 continue  # retry failed runs on resume
             done.add((r["scene_id"], r["strategy"]))
 
-    client = ToolClient(base_url=args.tool_server_url)
+    client = ToolClient(base_url=args.tool_server_url, timeout=args.http_timeout)
     base = args.sfm_output_base
 
     for sc in scenes:
